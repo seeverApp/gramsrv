@@ -11,8 +11,9 @@ import (
 )
 
 var (
-	ErrContactIDInvalid = errors.New("contact id invalid")
-	ErrContactNameEmpty = errors.New("contact name empty")
+	ErrContactIDInvalid  = errors.New("contact id invalid")
+	ErrContactNameEmpty  = errors.New("contact name empty")
+	ErrContactReqMissing = errors.New("contact request missing")
 )
 
 const maxSearchLimit = 50
@@ -108,6 +109,54 @@ func (s *Service) AddContact(ctx context.Context, userID int64, input domain.Con
 	contact, err := s.contacts.Upsert(ctx, userID, input)
 	if err != nil {
 		return domain.Contact{}, err
+	}
+	return contact, nil
+}
+
+// AcceptContact shares the current user's phone/profile with an existing one-way contact.
+func (s *Service) AcceptContact(ctx context.Context, userID, contactUserID int64) (domain.Contact, error) {
+	if s == nil || s.contacts == nil || s.users == nil || userID == 0 || contactUserID == 0 || contactUserID == userID {
+		return domain.Contact{}, ErrContactIDInvalid
+	}
+	ownerContact, found, err := s.contacts.Get(ctx, userID, contactUserID)
+	if err != nil {
+		return domain.Contact{}, err
+	}
+	if !found {
+		return domain.Contact{}, ErrContactReqMissing
+	}
+	self, found, err := s.users.ByID(ctx, userID)
+	if err != nil {
+		return domain.Contact{}, err
+	}
+	if !found {
+		return domain.Contact{}, ErrContactIDInvalid
+	}
+	target, found, err := s.users.ByID(ctx, contactUserID)
+	if err != nil {
+		return domain.Contact{}, err
+	}
+	if !found {
+		return domain.Contact{}, ErrContactIDInvalid
+	}
+	if ownerContact.Mutual {
+		return ownerContact, nil
+	}
+	_, err = s.contacts.Upsert(ctx, contactUserID, domain.ContactInput{
+		ContactUserID: userID,
+		Phone:         self.Phone,
+		FirstName:     self.FirstName,
+		LastName:      self.LastName,
+	})
+	if err != nil {
+		return domain.Contact{}, err
+	}
+	contact, found, err := s.contacts.Get(ctx, userID, target.ID)
+	if err != nil {
+		return domain.Contact{}, err
+	}
+	if !found {
+		return domain.Contact{}, ErrContactReqMissing
 	}
 	return contact, nil
 }
@@ -225,7 +274,7 @@ func (s *Service) GetPeerSettings(ctx context.Context, userID int64, peer domain
 	if s == nil || s.contacts == nil || userID == 0 || peer.Type != domain.PeerTypeUser || peer.ID == 0 || peer.ID == userID {
 		return domain.PeerSettings{}, nil
 	}
-	_, found, err := s.contacts.Get(ctx, userID, peer.ID)
+	contact, found, err := s.contacts.Get(ctx, userID, peer.ID)
 	if err != nil {
 		return domain.PeerSettings{}, err
 	}
@@ -236,7 +285,7 @@ func (s *Service) GetPeerSettings(ctx context.Context, userID int64, peer domain
 	return domain.PeerSettings{
 		AddContact:   !found,
 		BlockContact: !blocked,
-		ShareContact: found,
+		ShareContact: found && !contact.Mutual,
 	}, nil
 }
 

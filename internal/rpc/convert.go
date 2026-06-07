@@ -231,7 +231,7 @@ func tgMessagesDialogs(viewerUserID int64, list domain.DialogList) tg.MessagesDi
 			messages = append(messages, item)
 		}
 	}
-	users := tgUsers(list.Users)
+	users := tgUsersForViewer(viewerUserID, list.Users)
 	chats := tgChannelsForDialogs(viewerUserID, list.Channels, list.Dialogs)
 	if list.Count > len(dialogs) {
 		return &tg.MessagesDialogsSlice{
@@ -250,14 +250,14 @@ func tgMessagesDialogs(viewerUserID int64, list domain.DialogList) tg.MessagesDi
 	}
 }
 
-func tgMessagesMessages(list domain.MessageList) tg.MessagesMessagesClass {
+func tgMessagesMessages(viewerUserID int64, list domain.MessageList) tg.MessagesMessagesClass {
 	messages := make([]tg.MessageClass, 0, len(list.Messages))
 	for _, msg := range list.Messages {
 		if item := tgMessage(msg); item != nil {
 			messages = append(messages, item)
 		}
 	}
-	users := tgUsers(list.Users)
+	users := tgUsersForViewer(viewerUserID, list.Users)
 	if list.Count > len(messages) {
 		return &tg.MessagesMessagesSlice{
 			Count:    list.Count,
@@ -274,6 +274,18 @@ func tgMessagesMessages(list domain.MessageList) tg.MessagesMessagesClass {
 func tgUsers(users []domain.User) []tg.UserClass {
 	out := make([]tg.UserClass, 0, len(users))
 	for _, u := range users {
+		out = append(out, tgUser(u))
+	}
+	return out
+}
+
+func tgUsersForViewer(viewerUserID int64, users []domain.User) []tg.UserClass {
+	out := make([]tg.UserClass, 0, len(users))
+	for _, u := range users {
+		if viewerUserID != 0 && u.ID == viewerUserID {
+			out = append(out, tgSelfUser(u))
+			continue
+		}
 		out = append(out, tgUser(u))
 	}
 	return out
@@ -303,7 +315,11 @@ func tgPeerDialogs(viewerUserID int64, list domain.DialogList, st domain.UpdateS
 		}
 	}
 	for _, u := range list.Users {
-		out.Users = append(out.Users, tgUser(u))
+		if viewerUserID != 0 && u.ID == viewerUserID {
+			out.Users = append(out.Users, tgSelfUser(u))
+		} else {
+			out.Users = append(out.Users, tgUser(u))
+		}
 	}
 	out.Chats = append(out.Chats, tgChannelsForDialogs(viewerUserID, list.Channels, list.Dialogs)...)
 	return out

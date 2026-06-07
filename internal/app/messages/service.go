@@ -3,6 +3,7 @@ package messages
 import (
 	"context"
 
+	"telesrv/internal/app/userprojection"
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 )
@@ -11,11 +12,24 @@ import (
 type Service struct {
 	messages store.MessageStore
 	dialogs  store.DialogStore
+	contacts store.ContactStore
+}
+
+// Option adjusts optional message service dependencies.
+type Option func(*Service)
+
+// WithContactStore enables viewer-specific user projection for message history.
+func WithContactStore(c store.ContactStore) Option {
+	return func(s *Service) { s.contacts = c }
 }
 
 // NewService 创建 messages 服务。
-func NewService(messages store.MessageStore, dialogs store.DialogStore) *Service {
-	return &Service{messages: messages, dialogs: dialogs}
+func NewService(messages store.MessageStore, dialogs store.DialogStore, opts ...Option) *Service {
+	s := &Service{messages: messages, dialogs: dialogs}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // SendPrivateText 发送一条私聊文本消息。
@@ -45,7 +59,11 @@ func (s *Service) GetMessages(ctx context.Context, userID int64, ids []int) (dom
 	if s == nil || s.messages == nil || userID == 0 || len(ids) == 0 {
 		return domain.MessageList{}, nil
 	}
-	return s.messages.GetByIDs(ctx, userID, ids)
+	list, err := s.messages.GetByIDs(ctx, userID, ids)
+	if err != nil {
+		return domain.MessageList{}, err
+	}
+	return s.projectMessageUsers(ctx, userID, list)
 }
 
 // GetHistory 返回当前账号某个 peer 的历史消息。
@@ -176,5 +194,18 @@ func (s *Service) list(ctx context.Context, userID int64, filter domain.MessageF
 	if s == nil || s.messages == nil || userID == 0 {
 		return domain.MessageList{}, nil
 	}
-	return s.messages.ListByUser(ctx, userID, filter)
+	list, err := s.messages.ListByUser(ctx, userID, filter)
+	if err != nil {
+		return domain.MessageList{}, err
+	}
+	return s.projectMessageUsers(ctx, userID, list)
+}
+
+func (s *Service) projectMessageUsers(ctx context.Context, userID int64, list domain.MessageList) (domain.MessageList, error) {
+	users, err := userprojection.ForViewer(ctx, s.contacts, userID, list.Users)
+	if err != nil {
+		return domain.MessageList{}, err
+	}
+	list.Users = users
+	return list, nil
 }

@@ -352,7 +352,7 @@ func (r *Router) registerMessages(d *tg.ServerDispatcher) {
 		if filter.Hash != 0 && list.Hash == filter.Hash {
 			return &tg.MessagesMessagesNotModified{Count: list.Count}, nil
 		}
-		return tgMessagesMessages(r.withMessageListPresence(list)), nil
+		return tgMessagesMessages(userID, r.withMessageListPresence(list)), nil
 	})
 	d.OnMessagesReadHistory(func(ctx context.Context, req *tg.MessagesReadHistoryRequest) (*tg.MessagesAffectedMessages, error) {
 		id, _ := AuthKeyIDFrom(ctx)
@@ -463,7 +463,7 @@ func (r *Router) registerMessages(d *tg.ServerDispatcher) {
 		if filter.Hash != 0 && list.Hash == filter.Hash {
 			return &tg.MessagesMessagesNotModified{Count: list.Count}, nil
 		}
-		return tgMessagesMessages(r.withMessageListPresence(list)), nil
+		return tgMessagesMessages(userID, r.withMessageListPresence(list)), nil
 	})
 	d.OnMessagesSearchGlobal(r.onMessagesSearchGlobal)
 	d.OnMessagesGetSearchResultsCalendar(r.onMessagesGetSearchResultsCalendar)
@@ -3792,7 +3792,7 @@ func (r *Router) onMessagesSearchGlobal(ctx context.Context, req *tg.MessagesSea
 		}
 	}
 	if req.UsersOnly || r.deps.Channels == nil {
-		return tgMessagesMessages(r.withMessageListPresence(limitMessageList(private, limit))), nil
+		return tgMessagesMessages(userID, r.withMessageListPresence(limitMessageList(private, limit))), nil
 	}
 	channelHistory, err := r.deps.Channels.SearchJoinedMessages(ctx, userID, domain.ChannelGlobalSearchRequest{
 		Query:           query,

@@ -30,6 +30,7 @@ func (r *Router) registerContacts(d *tg.ServerDispatcher) {
 	d.OnContactsGetStatuses(r.onContactsGetStatuses)
 	d.OnContactsImportContacts(r.onContactsImportContacts)
 	d.OnContactsAddContact(r.onContactsAddContact)
+	d.OnContactsAcceptContact(r.onContactsAcceptContact)
 	d.OnContactsDeleteContacts(r.onContactsDeleteContacts)
 	d.OnContactsBlock(r.onContactsBlock)
 	d.OnContactsUnblock(r.onContactsUnblock)
@@ -263,8 +264,18 @@ func (r *Router) onContactsImportContacts(ctx context.Context, input []tg.InputP
 	}
 	out.RetryContacts = append(out.RetryContacts, res.RetryContacts...)
 	for _, contact := range res.Contacts {
-		if err := r.recordPeerSettings(ctx, userID, domain.Peer{Type: domain.PeerTypeUser, ID: contact.User.ID}, domain.PeerSettings{ShareContact: true}); err != nil {
+		peer := domain.Peer{Type: domain.PeerTypeUser, ID: contact.User.ID}
+		settings, err := r.deps.Contacts.GetPeerSettings(ctx, userID, peer)
+		if err != nil {
 			return nil, internalErr()
+		}
+		if err := r.recordPeerSettings(ctx, userID, peer, settings); err != nil {
+			return nil, internalErr()
+		}
+		if contact.Mutual {
+			if err := r.recordAcceptedContactTargetUpdates(ctx, userID, contact.User.ID); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if err := r.recordContactsReset(ctx, userID); err != nil {
@@ -305,14 +316,85 @@ func (r *Router) onContactsAddContact(ctx context.Context, req *tg.ContactsAddCo
 	if err != nil {
 		return nil, contactErr(err)
 	}
-	updates := r.contactPeerSettingsUpdates(ctx, userID, contact.User, domain.PeerSettings{ShareContact: true}, true)
+	peerUser := contact.User
+	peerUser.Contact = true
+	peerUser.Mutual = contact.Mutual || contact.User.Mutual
+	if contact.Phone != "" {
+		peerUser.Phone = contact.Phone
+	}
+	if contact.FirstName != "" || contact.LastName != "" {
+		peerUser.FirstName = contact.FirstName
+		peerUser.LastName = contact.LastName
+	}
+	peer := domain.Peer{Type: domain.PeerTypeUser, ID: contact.User.ID}
+	settings, err := r.deps.Contacts.GetPeerSettings(ctx, userID, peer)
+	if err != nil {
+		return nil, internalErr()
+	}
+	updates := r.contactPeerSettingsUpdates(ctx, userID, peerUser, settings, true)
 	updates.Updates = append(updates.Updates, &tg.UpdateContactsReset{})
-	if err := r.recordPeerSettings(ctx, userID, domain.Peer{Type: domain.PeerTypeUser, ID: contact.User.ID}, domain.PeerSettings{ShareContact: true}); err != nil {
+	if err := r.recordPeerSettings(ctx, userID, peer, settings); err != nil {
 		return nil, internalErr()
 	}
 	if err := r.recordContactsReset(ctx, userID); err != nil {
 		return nil, internalErr()
 	}
+	if contact.Mutual {
+		if err := r.recordAcceptedContactTargetUpdates(ctx, userID, contact.User.ID); err != nil {
+			return nil, err
+		}
+	}
+	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, updates)
+	return updates, nil
+}
+
+func (r *Router) onContactsAcceptContact(ctx context.Context, id tg.InputUserClass) (tg.UpdatesClass, error) {
+	if r.deps.Contacts == nil {
+		return &tg.Updates{Date: int(r.clock.Now().Unix())}, nil
+	}
+	userID, _, err := r.currentUserID(ctx)
+	if err != nil {
+		return nil, internalErr()
+	}
+	target, found, err := r.userFromInput(ctx, userID, id)
+	if err != nil {
+		return nil, contactErr(err)
+	}
+	if !found || target.ID == userID {
+		return nil, contactIDInvalidErr()
+	}
+	contact, err := r.deps.Contacts.AcceptContact(ctx, userID, target.ID)
+	if err != nil {
+		return nil, contactErr(err)
+	}
+	peer := domain.Peer{Type: domain.PeerTypeUser, ID: target.ID}
+	settings, err := r.deps.Contacts.GetPeerSettings(ctx, userID, peer)
+	if err != nil {
+		return nil, internalErr()
+	}
+	peerUser := contact.User
+	peerUser.Contact = true
+	peerUser.Mutual = contact.Mutual || contact.User.Mutual
+	if contact.Phone != "" {
+		peerUser.Phone = contact.Phone
+	}
+	if contact.FirstName != "" || contact.LastName != "" {
+		peerUser.FirstName = contact.FirstName
+		peerUser.LastName = contact.LastName
+	}
+	updates := r.contactPeerSettingsUpdates(ctx, userID, peerUser, settings, true)
+	updates.Updates = append(updates.Updates, &tg.UpdateContactsReset{})
+	if err := r.recordPeerSettings(ctx, userID, peer, settings); err != nil {
+		return nil, internalErr()
+	}
+	if err := r.recordContactsReset(ctx, userID); err != nil {
+		return nil, internalErr()
+	}
+
+	if err := r.recordAcceptedContactTargetUpdates(ctx, userID, target.ID); err != nil {
+		return nil, err
+	}
+
 	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, updates)
 	return updates, nil
 }
@@ -562,6 +644,38 @@ func (r *Router) contactPeerSettingsUpdates(ctx context.Context, userID int64, p
 	}
 }
 
+func (r *Router) recordAcceptedContactTargetUpdates(ctx context.Context, userID, targetUserID int64) error {
+	if targetUserID == 0 || targetUserID == userID {
+		return nil
+	}
+	peer := domain.Peer{Type: domain.PeerTypeUser, ID: userID}
+	settings, err := r.deps.Contacts.GetPeerSettings(ctx, targetUserID, peer)
+	if err != nil {
+		return internalErr()
+	}
+	var zeroAuthKeyID [8]byte
+	if err := r.recordPeerSettingsForUser(ctx, zeroAuthKeyID, targetUserID, peer, settings, 0); err != nil {
+		return internalErr()
+	}
+	if err := r.recordContactsResetForUser(ctx, zeroAuthKeyID, targetUserID, 0); err != nil {
+		return internalErr()
+	}
+	peerUser := domain.User{ID: userID}
+	if r.deps.Users != nil {
+		u, found, err := r.deps.Users.ByID(ctx, targetUserID, userID)
+		if err != nil {
+			return internalErr()
+		}
+		if found {
+			peerUser = u
+		}
+	}
+	updates := r.contactPeerSettingsUpdates(ctx, targetUserID, peerUser, settings, true)
+	updates.Updates = append(updates.Updates, &tg.UpdateContactsReset{})
+	r.pushUserUpdatesIfNoReliableDispatch(ctx, targetUserID, updates)
+	return nil
+}
+
 func (r *Router) pushContactsReset(ctx context.Context, userID int64) {
 	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, &tg.Updates{
 		Updates: []tg.UpdateClass{&tg.UpdateContactsReset{}},
@@ -571,22 +685,30 @@ func (r *Router) pushContactsReset(ctx context.Context, userID int64) {
 }
 
 func (r *Router) recordContactsReset(ctx context.Context, userID int64) error {
+	authKeyID, _ := AuthKeyIDFrom(ctx)
+	sessionID, _ := SessionIDFrom(ctx)
+	return r.recordContactsResetForUser(ctx, authKeyID, userID, sessionID)
+}
+
+func (r *Router) recordContactsResetForUser(ctx context.Context, authKeyID [8]byte, userID int64, excludeSessionID int64) error {
 	if r.deps.Updates == nil || userID == 0 {
 		return nil
 	}
-	authKeyID, _ := AuthKeyIDFrom(ctx)
-	sessionID, _ := SessionIDFrom(ctx)
-	_, _, err := r.deps.Updates.RecordContactsReset(ctx, authKeyID, userID, sessionID)
+	_, _, err := r.deps.Updates.RecordContactsReset(ctx, authKeyID, userID, excludeSessionID)
 	return err
 }
 
 func (r *Router) recordPeerSettings(ctx context.Context, userID int64, peer domain.Peer, settings domain.PeerSettings) error {
+	authKeyID, _ := AuthKeyIDFrom(ctx)
+	sessionID, _ := SessionIDFrom(ctx)
+	return r.recordPeerSettingsForUser(ctx, authKeyID, userID, peer, settings, sessionID)
+}
+
+func (r *Router) recordPeerSettingsForUser(ctx context.Context, authKeyID [8]byte, userID int64, peer domain.Peer, settings domain.PeerSettings, excludeSessionID int64) error {
 	if r.deps.Updates == nil || userID == 0 {
 		return nil
 	}
-	authKeyID, _ := AuthKeyIDFrom(ctx)
-	sessionID, _ := SessionIDFrom(ctx)
-	_, _, err := r.deps.Updates.RecordPeerSettings(ctx, authKeyID, userID, peer, settings, sessionID)
+	_, _, err := r.deps.Updates.RecordPeerSettings(ctx, authKeyID, userID, peer, settings, excludeSessionID)
 	return err
 }
 
@@ -628,6 +750,8 @@ func contactErr(err error) error {
 		return contactNameEmptyErr()
 	case errors.Is(err, contacts.ErrContactIDInvalid):
 		return contactIDInvalidErr()
+	case errors.Is(err, contacts.ErrContactReqMissing):
+		return contactReqMissingErr()
 	default:
 		return internalErr()
 	}

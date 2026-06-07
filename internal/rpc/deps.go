@@ -133,6 +133,7 @@ type ContactsService interface {
 	GetContacts(ctx context.Context, userID int64, hash int64) (domain.ContactList, bool, error)
 	ContactIDs(ctx context.Context, userID int64, hash int64) ([]int, bool, error)
 	AddContact(ctx context.Context, userID int64, input domain.ContactInput) (domain.Contact, error)
+	AcceptContact(ctx context.Context, userID, contactUserID int64) (domain.Contact, error)
 	ImportContacts(ctx context.Context, userID int64, inputs []domain.ContactInput) (domain.ImportContactsResult, error)
 	Search(ctx context.Context, userID int64, query string, limit int) (domain.UserSearchResult, error)
 	DeleteContacts(ctx context.Context, userID int64, contactUserIDs []int64) (int, error)

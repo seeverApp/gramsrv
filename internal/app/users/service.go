@@ -6,6 +6,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"telesrv/internal/app/userprojection"
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 )
@@ -20,8 +21,9 @@ type ProfilePhotoProvider interface {
 
 // Service 提供用户查询。
 type Service struct {
-	users  store.UserStore
-	photos ProfilePhotoProvider
+	users    store.UserStore
+	contacts store.ContactStore
+	photos   ProfilePhotoProvider
 }
 
 // Option 调整用户服务可选依赖。
@@ -30,6 +32,11 @@ type Option func(*Service)
 // WithPhotoProvider 注入头像富化能力（缺省则用户不带头像）。
 func WithPhotoProvider(p ProfilePhotoProvider) Option {
 	return func(s *Service) { s.photos = p }
+}
+
+// WithContactStore enables viewer-specific contact name/phone projection.
+func WithContactStore(c store.ContactStore) Option {
+	return func(s *Service) { s.contacts = c }
 }
 
 const (
@@ -85,7 +92,12 @@ func (s *Service) ByID(ctx context.Context, currentUserID, userID int64) (domain
 	if !found {
 		return u, false, nil
 	}
-	return s.enrichOne(ctx, u), true, nil
+	u = s.enrichOne(ctx, u)
+	u, err = userprojection.One(ctx, s.contacts, currentUserID, u)
+	if err != nil {
+		return domain.User{}, false, err
+	}
+	return u, true, nil
 }
 
 // ByIDs 批量返回指定用户。调用方必须已登录；缺失用户不会出现在结果中。
@@ -115,7 +127,8 @@ func (s *Service) ByIDs(ctx context.Context, currentUserID int64, userIDs []int6
 	if err != nil {
 		return nil, err
 	}
-	return s.enrich(ctx, users), nil
+	users = s.enrich(ctx, users)
+	return userprojection.ForViewer(ctx, s.contacts, currentUserID, users)
 }
 
 // enrich 批量把当前头像富化到用户列表（best-effort：失败不影响用户查询）。
@@ -248,7 +261,12 @@ func (s *Service) ResolveUsername(ctx context.Context, currentUserID int64, user
 	if err != nil || !found {
 		return u, found, err
 	}
-	return s.enrichOne(ctx, u), true, nil
+	u = s.enrichOne(ctx, u)
+	u, err = userprojection.One(ctx, s.contacts, currentUserID, u)
+	if err != nil {
+		return domain.User{}, false, err
+	}
+	return u, true, nil
 }
 
 // ResolvePhone 解析手机号到用户；当前阶段默认允许手机号深链解析，隐私规则后续接 account privacy。
@@ -264,7 +282,12 @@ func (s *Service) ResolvePhone(ctx context.Context, currentUserID int64, phone s
 	if err != nil || !found {
 		return u, found, err
 	}
-	return s.enrichOne(ctx, u), true, nil
+	u = s.enrichOne(ctx, u)
+	u, err = userprojection.One(ctx, s.contacts, currentUserID, u)
+	if err != nil {
+		return domain.User{}, false, err
+	}
+	return u, true, nil
 }
 
 func normalizeUsername(username string) string {

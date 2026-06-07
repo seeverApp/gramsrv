@@ -117,6 +117,48 @@ func TestServiceByIDDoesNotReloadSelf(t *testing.T) {
 	}
 }
 
+func TestServiceProjectsUsersForViewerContacts(t *testing.T) {
+	ctx := context.Background()
+	userStore := memory.NewUserStore()
+	contacts := memory.NewContactStore()
+	owner, err := userStore.Create(ctx, domain.User{AccessHash: 1, Phone: "15550000001", FirstName: "Owner"})
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	friend, err := userStore.Create(ctx, domain.User{AccessHash: 2, Phone: "15550000002", FirstName: "Public", LastName: "Name"})
+	if err != nil {
+		t.Fatalf("create friend: %v", err)
+	}
+	stranger, err := userStore.Create(ctx, domain.User{AccessHash: 3, Phone: "15550000003", FirstName: "Stranger"})
+	if err != nil {
+		t.Fatalf("create stranger: %v", err)
+	}
+	if _, err := contacts.Upsert(ctx, owner.ID, domain.ContactInput{
+		ContactUserID: friend.ID,
+		Phone:         "15550000002",
+		FirstName:     "Remark",
+		LastName:      "Friend",
+	}); err != nil {
+		t.Fatalf("upsert contact: %v", err)
+	}
+	svc := NewService(userStore, WithContactStore(contacts))
+
+	contactUser, found, err := svc.ByID(ctx, owner.ID, friend.ID)
+	if err != nil || !found {
+		t.Fatalf("ByID contact found=%v err=%v", found, err)
+	}
+	if !contactUser.Contact || contactUser.FirstName != "Remark" || contactUser.LastName != "Friend" || contactUser.Phone != "15550000002" {
+		t.Fatalf("projected contact = %+v, want contact remark and phone", contactUser)
+	}
+	nonContact, found, err := svc.ByID(ctx, owner.ID, stranger.ID)
+	if err != nil || !found {
+		t.Fatalf("ByID non-contact found=%v err=%v", found, err)
+	}
+	if nonContact.Contact || nonContact.Phone != "" || nonContact.FirstName != "Stranger" {
+		t.Fatalf("projected non-contact = %+v, want name with hidden phone", nonContact)
+	}
+}
+
 type countingUserStore struct {
 	*memory.UserStore
 	byIDCalls int

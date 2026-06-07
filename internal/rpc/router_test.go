@@ -8030,6 +8030,73 @@ func TestContactsStatusesAndContactsUsePresence(t *testing.T) {
 	}
 }
 
+func TestContactsAcceptContactReturnsSettingsAndReset(t *testing.T) {
+	ctx := context.Background()
+	userStore := memory.NewUserStore()
+	contactsStore := memory.NewContactStore()
+	alice, err := userStore.Create(ctx, domain.User{AccessHash: 11, Phone: "1001", FirstName: "Alice", LastName: "A"})
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	bob, err := userStore.Create(ctx, domain.User{AccessHash: 22, Phone: "1002", FirstName: "Bob", LastName: "B"})
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	contactsSvc := appcontacts.NewService(contactsStore, userStore)
+	if _, err := contactsSvc.AddContact(ctx, alice.ID, domain.ContactInput{
+		ContactUserID: bob.ID,
+		Phone:         bob.Phone,
+		FirstName:     "Bobby",
+		LastName:      "Remark",
+	}); err != nil {
+		t.Fatalf("alice add bob: %v", err)
+	}
+	updatesSvc := &captureUpdates{state: domain.UpdateState{Pts: 10, Date: 1700000400}}
+	r := New(Config{}, Deps{
+		Contacts: contactsSvc,
+		Users:    appusers.NewService(userStore, appusers.WithContactStore(contactsStore)),
+		Updates:  updatesSvc,
+	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000400, 0)})
+
+	out, err := r.onContactsAcceptContact(WithUserID(ctx, alice.ID), &tg.InputUser{UserID: bob.ID, AccessHash: bob.AccessHash})
+	if err != nil {
+		t.Fatalf("contacts.acceptContact: %v", err)
+	}
+	got, ok := out.(*tg.Updates)
+	if !ok {
+		t.Fatalf("updates = %T, want *tg.Updates", out)
+	}
+	if len(got.Updates) != 2 {
+		t.Fatalf("updates = %+v, want peer settings + contacts reset", got.Updates)
+	}
+	settings, ok := got.Updates[0].(*tg.UpdatePeerSettings)
+	if !ok {
+		t.Fatalf("update[0] = %T, want UpdatePeerSettings", got.Updates[0])
+	}
+	if settings.Settings.ShareContact || settings.Settings.AddContact {
+		t.Fatalf("peer settings = %+v, want share/add false", settings.Settings)
+	}
+	if _, ok := got.Updates[1].(*tg.UpdateContactsReset); !ok {
+		t.Fatalf("update[1] = %T, want UpdateContactsReset", got.Updates[1])
+	}
+	if len(updatesSvc.events) != 4 {
+		t.Fatalf("recorded events = %+v, want current peer/reset and target peer/reset", updatesSvc.events)
+	}
+	if updatesSvc.events[0].UserID != alice.ID || updatesSvc.events[0].Settings.ShareContact {
+		t.Fatalf("current peer settings event = %+v, want alice share=false", updatesSvc.events[0])
+	}
+	if updatesSvc.events[2].UserID != bob.ID || updatesSvc.events[2].Settings.ShareContact {
+		t.Fatalf("target peer settings event = %+v, want bob share=false", updatesSvc.events[2])
+	}
+	reverse, found, err := contactsStore.Get(ctx, bob.ID, alice.ID)
+	if err != nil || !found {
+		t.Fatalf("bob contact alice found=%v err=%v", found, err)
+	}
+	if reverse.Phone != alice.Phone || !reverse.Mutual {
+		t.Fatalf("bob contact alice = %+v, want shared phone and mutual", reverse)
+	}
+}
+
 func TestContactsStatusesUsesOnlineSessionFallback(t *testing.T) {
 	ctx := context.Background()
 	alice := domain.User{ID: 1000000001, AccessHash: 11, FirstName: "Alice"}

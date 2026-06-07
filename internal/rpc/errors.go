@@ -126,6 +126,8 @@ func contactIDInvalidErr() error { return tgerr.New(400, "CONTACT_ID_INVALID") }
 
 func contactNameEmptyErr() error { return tgerr.New(400, "CONTACT_NAME_EMPTY") }
 
+func contactReqMissingErr() error { return tgerr.New(400, "CONTACT_REQ_MISSING") }
+
 // messageEmptyErr 表示发送空文本。
 func messageEmptyErr() error { return tgerr.New(400, "MESSAGE_EMPTY") }
 

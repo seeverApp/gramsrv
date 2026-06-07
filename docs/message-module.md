@@ -217,7 +217,7 @@ go test ./internal/loadtest/ -run TestMessageSendBaseline -v -count=1 -timeout 3
 - active session 缓存 `auth_key_id + user_id`；router 额外按业务 auth_key 缓存 `user_id`，并用 singleflight 合并启动期并发 miss，避免同一永久 auth_key 派生的多个 temp session 重复查授权表。
 - `update_states` 主键是 `(auth_key_id, user_id)`；同设备退出登录或换账号只清 auth_key 设备状态，不删除账号级 `user_update_events`。
 - 一个账号多设备共享 `user_update_events`，各设备通过自己的 `auth_key_id + user_id` 状态和 `updates.getDifference` 补偿。
-- 联系人备注、dialog pinned/order/manual unread、peer settings 都是 owner 视角数据；写业务表后同步写账号级 durable update event，并把投递任务写入 `dispatch_outbox`，避免“只在线 push、离线设备永远不知道”的状态漂移。
+- 联系人备注、联系人 mutual/shareContact 状态、dialog pinned/order/manual unread、peer settings 都是 owner 视角数据；写业务表后同步写账号级 durable update event，并把投递任务写入 `dispatch_outbox`，避免“只在线 push、离线设备永远不知道”的状态漂移。
 
 ## ACK / Global Sequence Note
 
