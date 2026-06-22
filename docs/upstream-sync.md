@@ -6,9 +6,9 @@ confirmed source checkpoint.
 
 ## Current Checkpoint
 
-- Last synced source commit: `53904e72f7c3b96e6ae5e24196d0e551fa8aebce`
-- Last synced target commit: `294e994`
-- Sync date: 2026-06-19
+- Last synced source commit: `70978db98c3af3fe72100fa6646780c7a5a13daa`
+- Last synced target commit: `3642e37`
+- Sync date: 2026-06-22
 - Source path used locally: `D:\work\waikuai\telegram\telesrv`
 - Target path used locally: `D:\work\waikuai\telegram\gramsrv-public`
 
@@ -26,10 +26,12 @@ confirmed source checkpoint.
 | 2026-06-16 | `06b6ae2bb2f90bd7cc1d6a8404a82aff507e6821` | `b435784` | synced | Added Android legacy startup compatibility for MTProto exchange replay/acks and allowlisted legacy `langpack.getLanguages` handling. |
 | 2026-06-19 | `3e6321d99607160d0d77bc63977619d5e1d28516` | `82dd299` | synced | Updated account authorization and Android startup/langpack compatibility notes. |
 | 2026-06-19 | `53904e72f7c3b96e6ae5e24196d0e551fa8aebce` | `294e994` | synced | Added Android login startup compatibility for `auth.initPasskeyLogin`, legacy `langpack.getLangPack`/`langpack.getStrings` adapters, and `destroy_session` no-ack handling. |
+| 2026-06-22 | `d718593156cc7310105007f37645948c17637e0a` | `b4e47c8` | synced | Added Android startup and messaging compatibility stubs/adapters, including legacy `account.registerDevice`, legacy `updates.getDifference`, empty startup surfaces, and related router coverage. |
+| 2026-06-22 | `70978db98c3af3fe72100fa6646780c7a5a13daa` | `3642e37` | synced | Fixed Android channel pinned-message search by carrying pinned state from channel metadata through history/getMessages projections. |
 
 ## Next Sync
 
-Start the next batch from source commits after `53904e72f7c3b96e6ae5e24196d0e551fa8aebce`.
+Start the next batch from source commits after `70978db98c3af3fe72100fa6646780c7a5a13daa`.
 At the time this log was created, newer `telesrv` commits existed after that point and were
 intentionally left out because the latest batch was scoped to the next two commits after
-`06b6ae2bb2f90bd7cc1d6a8404a82aff507e6821`.
+`53904e72f7c3b96e6ae5e24196d0e551fa8aebce`.
