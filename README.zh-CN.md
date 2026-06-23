@@ -8,6 +8,15 @@
 
 `gramsrv` 是独立的非官方项目，与 Telegram 官方及其团队没有关联，也未获得其背书或赞助。
 
+## 演示视频
+
+<p align="center">
+  <video src="docs/assets/telesrv-demo-split-60s.mp4" controls muted playsinline width="100%"></video>
+</p>
+
+如果当前浏览器里的 GitHub Markdown 预览没有显示内联播放器，可以直接打开
+[60 秒 Desktop 与 Android 同屏演示](docs/assets/telesrv-demo-split-60s.mp4)。
+
 ## 亮点
 
 - **一个 server 程序即可运行。** PostgreSQL 与 Redis 准备好后，Go server 进程会编排 RSA key 准备、数据库 migration、语言包 seed、MTProto edge、RPC router、updates、media/files 和可靠投递 worker。

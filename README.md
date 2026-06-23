@@ -11,6 +11,15 @@ experiments, and ongoing tracking of newer Telegram client behavior.
 `gramsrv` is independent and unofficial. It is not affiliated with, endorsed by,
 or sponsored by Telegram or the official Telegram team.
 
+## Demo Video
+
+<p align="center">
+  <video src="docs/assets/telesrv-demo-split-60s.mp4" controls muted playsinline width="100%"></video>
+</p>
+
+If the GitHub Markdown preview does not show the inline player in your browser,
+open the [60-second Desktop and Android demo](docs/assets/telesrv-demo-split-60s.mp4).
+
 ## Highlights
 
 - **One server program to run.** After PostgreSQL and Redis are ready, the Go
