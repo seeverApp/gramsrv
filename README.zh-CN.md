@@ -4,8 +4,6 @@
 
 [官网](https://telesrv.net) · [讨论群组](https://t.me/telesrv_chat) · [频道](https://t.me/telesrv) · [English README](README.md)
 
-![gramsrv Desktop 与 Android 多设备预览](docs/assets/readme-hero.png)
-
 `gramsrv` 是独立的非官方项目，与 Telegram 官方及其团队没有关联，也未获得其背书或赞助。
 
 ## 演示视频
@@ -29,12 +27,6 @@
 - **生产边界明确。** 大规模公开频道、多 DC / 文件 DC / CDN、Bot API、payments、stories、Premium 商业逻辑、生产风控和生产对象存储不属于当前公开版本范围。
 
 下载、公开说明和当前体验入口见 [telesrv.net](https://telesrv.net)。问题交流、兼容反馈和开发讨论可以加入 [t.me/telesrv_chat](https://t.me/telesrv_chat)。
-
-## 截图
-
-| Telegram Desktop | Android |
-|---|---|
-| <img src="docs/assets/tdesktop1.png" alt="Telegram Desktop connected to gramsrv" width="520"> | <img src="docs/assets/android1.png" alt="Android client connected to gramsrv" width="260"> |
 
 ## 持续维护与版本追踪
 

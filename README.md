@@ -6,8 +6,6 @@ experiments, and ongoing tracking of newer Telegram client behavior.
 
 [Website](https://telesrv.net) · [Discussion group](https://t.me/telesrv_chat) · [Channel](https://t.me/telesrv) · [中文 README](README.zh-CN.md)
 
-![gramsrv multi-device Desktop and Android preview](docs/assets/readme-hero.png)
-
 `gramsrv` is independent and unofficial. It is not affiliated with, endorsed by,
 or sponsored by Telegram or the official Telegram team.
 
@@ -51,12 +49,6 @@ open the [60-second Desktop and Android demo](docs/assets/telesrv-demo-split-60s
 For downloads, public information, and the current hosted experience entry,
 visit [telesrv.net](https://telesrv.net). For questions, compatibility reports,
 and development discussion, join [t.me/telesrv_chat](https://t.me/telesrv_chat).
-
-## Screenshots
-
-| Telegram Desktop | Android |
-|---|---|
-| <img src="docs/assets/tdesktop1.png" alt="Telegram Desktop connected to gramsrv" width="520"> | <img src="docs/assets/android1.png" alt="Android client connected to gramsrv" width="260"> |
 
 ## Maintenance and Version Tracking
 
