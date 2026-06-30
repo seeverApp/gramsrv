@@ -9,6 +9,75 @@ import (
 	"context"
 )
 
+const countMessagesByUser = `-- name: CountMessagesByUser :one
+SELECT count(*)::int AS total_count
+FROM message_boxes m
+WHERE m.owner_user_id = $1::bigint
+  AND NOT m.deleted
+  AND (
+    NOT $2::boolean
+    OR (m.peer_type = $3::text AND m.peer_id = $4::bigint)
+  )
+  AND (
+    $5::text = ''
+    OR m.body ILIKE ('%' || $5::text || '%')
+  )
+  AND ($6::int <= 0 OR m.box_id < $6::int)
+  AND ($7::int <= 0 OR m.box_id > $7::int)
+  AND (NOT $8::boolean OR m.pinned)
+  AND (
+    NOT $9::boolean
+    OR (
+      m.media->>'kind' = 'document'
+      AND EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(COALESCE(m.media #> '{document,attributes}', '[]'::jsonb)) AS attr
+        WHERE attr->>'kind' = 'audio'
+          AND COALESCE((attr->>'voice')::boolean, false) = false
+      )
+    )
+  )
+  AND (
+    $10::text = ''
+    OR (m.saved_peer_type = $10::text AND m.saved_peer_id = $11::bigint)
+  )
+`
+
+type CountMessagesByUserParams struct {
+	OwnerUserID   int64
+	HasPeer       bool
+	PeerType      string
+	PeerID        int64
+	Query         string
+	MaxID         int32
+	MinID         int32
+	PinnedOnly    bool
+	MusicOnly     bool
+	SavedPeerType string
+	SavedPeerID   int64
+}
+
+// ListMessagesByUser total CTE 的独立化:相同 base 过滤(不含分页 anchor),
+// 仅 NeedTotalCount 时发,避免热路径(getHistory 恒不需 total)次次规划 count 子树。
+func (q *Queries) CountMessagesByUser(ctx context.Context, arg CountMessagesByUserParams) (int32, error) {
+	row := q.db.QueryRow(ctx, countMessagesByUser,
+		arg.OwnerUserID,
+		arg.HasPeer,
+		arg.PeerType,
+		arg.PeerID,
+		arg.Query,
+		arg.MaxID,
+		arg.MinID,
+		arg.PinnedOnly,
+		arg.MusicOnly,
+		arg.SavedPeerType,
+		arg.SavedPeerID,
+	)
+	var total_count int32
+	err := row.Scan(&total_count)
+	return total_count, err
+}
+
 const createMessage = `-- name: CreateMessage :one
 WITH pm AS (
   INSERT INTO private_messages (
@@ -156,6 +225,8 @@ INSERT INTO message_boxes (
   peer_id,
   from_user_id,
   message_date,
+  ttl_period,
+  expires_at,
   outgoing,
   body,
   entities,
@@ -165,6 +236,7 @@ INSERT INTO message_boxes (
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities,
   quote_offset,
@@ -172,29 +244,53 @@ INSERT INTO message_boxes (
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
   pts,
   media,
   media_unread,
-  reaction_unread
+  reaction_unread,
+  reply_markup,
+  rich_message,
+  via_bot_id,
+  grouped_id,
+  effect
 ) VALUES (
-  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb,
-  $12::boolean,
-  $13::boolean,
-  $14::int,
-  $15::text,
-  $16::bigint,
-  $17::int,
-  $18::text,
-  $19::jsonb,
+  $1, $2, $3, $4, $5, $6, $7, $8,
+  $11::int,
+  $12::int,
+  $9, $10, $13::jsonb,
+  $14::boolean,
+  $15::boolean,
+  $16::int,
+  $17::text,
+  $18::bigint,
+  $19::int,
   $20::int,
   $21::text,
-  $22::bigint,
-  $23::text,
-  $24::int,
-  $25::int,
-  $26::jsonb,
-  $27::boolean,
-  $28::boolean
+  $22::jsonb,
+  $23::int,
+  $24::text,
+  $25::bigint,
+  $26::text,
+  $27::int,
+  $28::text,
+  $29::bigint,
+  $30::int,
+  $31::text,
+  $32::bigint,
+  $33::int,
+  $34::jsonb,
+  $35::boolean,
+  $36::boolean,
+  $37::jsonb,
+  $38::jsonb,
+  $39::bigint,
+  $40::bigint,
+  $41::bigint
 )
 RETURNING
   box_id,
@@ -204,6 +300,8 @@ RETURNING
   peer_id,
   from_user_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   outgoing,
   body,
@@ -214,6 +312,7 @@ RETURNING
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities::text AS quote_entities_json,
   quote_offset,
@@ -221,72 +320,110 @@ RETURNING
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
   pts,
   media::text AS media_json,
   media_unread,
-  reaction_unread
+  reaction_unread,
+  pinned,
+  via_bot_id,
+  grouped_id,
+  effect,
+  reply_markup::text AS reply_markup_json,
+  rich_message::text AS rich_message_json
 `
 
 type CreateMessageBoxParams struct {
-	OwnerUserID       int64
-	BoxID             int32
-	PrivateMessageID  int64
-	MessageSenderID   int64
-	PeerType          string
-	PeerID            int64
-	FromUserID        int64
-	MessageDate       int32
-	Outgoing          bool
-	Body              string
-	EntitiesJson      []byte
-	Silent            bool
-	Noforwards        bool
-	ReplyToMsgID      int32
-	ReplyToPeerType   string
-	ReplyToPeerID     int64
-	ReplyToTopID      int32
-	QuoteText         string
-	QuoteEntitiesJson []byte
-	QuoteOffset       int32
-	FwdFromPeerType   string
-	FwdFromPeerID     int64
-	FwdFromName       string
-	FwdDate           int32
-	Pts               int32
-	MediaJson         []byte
-	MediaUnread       bool
-	ReactionUnread    bool
+	OwnerUserID          int64
+	BoxID                int32
+	PrivateMessageID     int64
+	MessageSenderID      int64
+	PeerType             string
+	PeerID               int64
+	FromUserID           int64
+	MessageDate          int32
+	Outgoing             bool
+	Body                 string
+	TtlPeriod            int32
+	ExpiresAt            int32
+	EntitiesJson         []byte
+	Silent               bool
+	Noforwards           bool
+	ReplyToMsgID         int32
+	ReplyToPeerType      string
+	ReplyToPeerID        int64
+	ReplyToTopID         int32
+	ReplyToStoryID       int32
+	QuoteText            string
+	QuoteEntitiesJson    []byte
+	QuoteOffset          int32
+	FwdFromPeerType      string
+	FwdFromPeerID        int64
+	FwdFromName          string
+	FwdDate              int32
+	FwdSavedFromPeerType string
+	FwdSavedFromPeerID   int64
+	FwdSavedFromMsgID    int32
+	SavedPeerType        string
+	SavedPeerID          int64
+	Pts                  int32
+	MediaJson            []byte
+	MediaUnread          bool
+	ReactionUnread       bool
+	ReplyMarkupJson      []byte
+	RichMessageJson      []byte
+	ViaBotID             int64
+	GroupedID            int64
+	Effect               int64
 }
 
 type CreateMessageBoxRow struct {
-	BoxID             int32
-	PrivateMessageID  int64
-	OwnerUserID       int64
-	PeerType          string
-	PeerID            int64
-	FromUserID        int64
-	MessageDate       int32
-	EditDate          int32
-	Outgoing          bool
-	Body              string
-	EntitiesJson      string
-	Silent            bool
-	Noforwards        bool
-	ReplyToMsgID      int32
-	ReplyToPeerType   string
-	ReplyToPeerID     int64
-	ReplyToTopID      int32
-	QuoteText         string
-	QuoteEntitiesJson string
-	QuoteOffset       int32
-	FwdFromPeerType   string
-	FwdFromPeerID     int64
-	FwdFromName       string
-	FwdDate           int32
-	Pts               int32
-	MediaJson         string
-	MediaUnread       bool
-	ReactionUnread    bool
+	BoxID                int32
+	PrivateMessageID     int64
+	OwnerUserID          int64
+	PeerType             string
+	PeerID               int64
+	FromUserID           int64
+	MessageDate          int32
+	TtlPeriod            int32
+	ExpiresAt            int32
+	EditDate             int32
+	Outgoing             bool
+	Body                 string
+	EntitiesJson         string
+	Silent               bool
+	Noforwards           bool
+	ReplyToMsgID         int32
+	ReplyToPeerType      string
+	ReplyToPeerID        int64
+	ReplyToTopID         int32
+	ReplyToStoryID       int32
+	QuoteText            string
+	QuoteEntitiesJson    string
+	QuoteOffset          int32
+	FwdFromPeerType      string
+	FwdFromPeerID        int64
+	FwdFromName          string
+	FwdDate              int32
+	FwdSavedFromPeerType string
+	FwdSavedFromPeerID   int64
+	FwdSavedFromMsgID    int32
+	SavedPeerType        string
+	SavedPeerID          int64
+	Pts                  int32
+	MediaJson            string
+	MediaUnread          bool
+	ReactionUnread       bool
+	Pinned               bool
+	ViaBotID             int64
+	GroupedID            int64
+	Effect               int64
+	ReplyMarkupJson      string
+	RichMessageJson      string
 }
 
 func (q *Queries) CreateMessageBox(ctx context.Context, arg CreateMessageBoxParams) (CreateMessageBoxRow, error) {
@@ -301,6 +438,8 @@ func (q *Queries) CreateMessageBox(ctx context.Context, arg CreateMessageBoxPara
 		arg.MessageDate,
 		arg.Outgoing,
 		arg.Body,
+		arg.TtlPeriod,
+		arg.ExpiresAt,
 		arg.EntitiesJson,
 		arg.Silent,
 		arg.Noforwards,
@@ -308,6 +447,7 @@ func (q *Queries) CreateMessageBox(ctx context.Context, arg CreateMessageBoxPara
 		arg.ReplyToPeerType,
 		arg.ReplyToPeerID,
 		arg.ReplyToTopID,
+		arg.ReplyToStoryID,
 		arg.QuoteText,
 		arg.QuoteEntitiesJson,
 		arg.QuoteOffset,
@@ -315,10 +455,20 @@ func (q *Queries) CreateMessageBox(ctx context.Context, arg CreateMessageBoxPara
 		arg.FwdFromPeerID,
 		arg.FwdFromName,
 		arg.FwdDate,
+		arg.FwdSavedFromPeerType,
+		arg.FwdSavedFromPeerID,
+		arg.FwdSavedFromMsgID,
+		arg.SavedPeerType,
+		arg.SavedPeerID,
 		arg.Pts,
 		arg.MediaJson,
 		arg.MediaUnread,
 		arg.ReactionUnread,
+		arg.ReplyMarkupJson,
+		arg.RichMessageJson,
+		arg.ViaBotID,
+		arg.GroupedID,
+		arg.Effect,
 	)
 	var i CreateMessageBoxRow
 	err := row.Scan(
@@ -329,6 +479,8 @@ func (q *Queries) CreateMessageBox(ctx context.Context, arg CreateMessageBoxPara
 		&i.PeerID,
 		&i.FromUserID,
 		&i.MessageDate,
+		&i.TtlPeriod,
+		&i.ExpiresAt,
 		&i.EditDate,
 		&i.Outgoing,
 		&i.Body,
@@ -339,6 +491,7 @@ func (q *Queries) CreateMessageBox(ctx context.Context, arg CreateMessageBoxPara
 		&i.ReplyToPeerType,
 		&i.ReplyToPeerID,
 		&i.ReplyToTopID,
+		&i.ReplyToStoryID,
 		&i.QuoteText,
 		&i.QuoteEntitiesJson,
 		&i.QuoteOffset,
@@ -346,10 +499,21 @@ func (q *Queries) CreateMessageBox(ctx context.Context, arg CreateMessageBoxPara
 		&i.FwdFromPeerID,
 		&i.FwdFromName,
 		&i.FwdDate,
+		&i.FwdSavedFromPeerType,
+		&i.FwdSavedFromPeerID,
+		&i.FwdSavedFromMsgID,
+		&i.SavedPeerType,
+		&i.SavedPeerID,
 		&i.Pts,
 		&i.MediaJson,
 		&i.MediaUnread,
 		&i.ReactionUnread,
+		&i.Pinned,
+		&i.ViaBotID,
+		&i.GroupedID,
+		&i.Effect,
+		&i.ReplyMarkupJson,
+		&i.RichMessageJson,
 	)
 	return i, err
 }
@@ -360,6 +524,8 @@ INSERT INTO private_messages (
   recipient_user_id,
   random_id,
   message_date,
+  ttl_period,
+  expires_at,
   body,
   entities,
   silent,
@@ -368,6 +534,7 @@ INSERT INTO private_messages (
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities,
   quote_offset,
@@ -375,23 +542,34 @@ INSERT INTO private_messages (
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
-  media
+  media,
+  reply_markup,
+  rich_message,
+  via_bot_id,
+  grouped_id,
+  effect
 ) VALUES (
-  $1, $2, $3, $4, $5, $6::jsonb,
-  $7::boolean,
-  $8::boolean,
-  $9::int,
-  $10::text,
-  $11::bigint,
-  $12::int,
-  $13::text,
-  $14::jsonb,
+  $1, $2, $3, $4, $6::int, $7::int, $5, $8::jsonb,
+  $9::boolean,
+  $10::boolean,
+  $11::int,
+  $12::text,
+  $13::bigint,
+  $14::int,
   $15::int,
   $16::text,
-  $17::bigint,
-  $18::text,
-  $19::int,
-  $20::jsonb
+  $17::jsonb,
+  $18::int,
+  $19::text,
+  $20::bigint,
+  $21::text,
+  $22::int,
+  $23::jsonb,
+  $24::jsonb,
+  $25::jsonb,
+  $26::bigint,
+  $27::bigint,
+  $28::bigint
 )
 ON CONFLICT (sender_user_id, random_id) WHERE random_id <> 0 DO NOTHING
 RETURNING
@@ -400,6 +578,8 @@ RETURNING
   recipient_user_id,
   random_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   body,
   entities::text AS entities_json
@@ -411,6 +591,8 @@ type CreatePrivateMessageParams struct {
 	RandomID          int64
 	MessageDate       int32
 	Body              string
+	TtlPeriod         int32
+	ExpiresAt         int32
 	EntitiesJson      []byte
 	Silent            bool
 	Noforwards        bool
@@ -418,6 +600,7 @@ type CreatePrivateMessageParams struct {
 	ReplyToPeerType   string
 	ReplyToPeerID     int64
 	ReplyToTopID      int32
+	ReplyToStoryID    int32
 	QuoteText         string
 	QuoteEntitiesJson []byte
 	QuoteOffset       int32
@@ -426,6 +609,11 @@ type CreatePrivateMessageParams struct {
 	FwdFromName       string
 	FwdDate           int32
 	MediaJson         []byte
+	ReplyMarkupJson   []byte
+	RichMessageJson   []byte
+	ViaBotID          int64
+	GroupedID         int64
+	Effect            int64
 }
 
 type CreatePrivateMessageRow struct {
@@ -434,6 +622,8 @@ type CreatePrivateMessageRow struct {
 	RecipientUserID int64
 	RandomID        int64
 	MessageDate     int32
+	TtlPeriod       int32
+	ExpiresAt       int32
 	EditDate        int32
 	Body            string
 	EntitiesJson    string
@@ -446,6 +636,8 @@ func (q *Queries) CreatePrivateMessage(ctx context.Context, arg CreatePrivateMes
 		arg.RandomID,
 		arg.MessageDate,
 		arg.Body,
+		arg.TtlPeriod,
+		arg.ExpiresAt,
 		arg.EntitiesJson,
 		arg.Silent,
 		arg.Noforwards,
@@ -453,6 +645,7 @@ func (q *Queries) CreatePrivateMessage(ctx context.Context, arg CreatePrivateMes
 		arg.ReplyToPeerType,
 		arg.ReplyToPeerID,
 		arg.ReplyToTopID,
+		arg.ReplyToStoryID,
 		arg.QuoteText,
 		arg.QuoteEntitiesJson,
 		arg.QuoteOffset,
@@ -461,6 +654,11 @@ func (q *Queries) CreatePrivateMessage(ctx context.Context, arg CreatePrivateMes
 		arg.FwdFromName,
 		arg.FwdDate,
 		arg.MediaJson,
+		arg.ReplyMarkupJson,
+		arg.RichMessageJson,
+		arg.ViaBotID,
+		arg.GroupedID,
+		arg.Effect,
 	)
 	var i CreatePrivateMessageRow
 	err := row.Scan(
@@ -469,6 +667,8 @@ func (q *Queries) CreatePrivateMessage(ctx context.Context, arg CreatePrivateMes
 		&i.RecipientUserID,
 		&i.RandomID,
 		&i.MessageDate,
+		&i.TtlPeriod,
+		&i.ExpiresAt,
 		&i.EditDate,
 		&i.Body,
 		&i.EntitiesJson,
@@ -629,9 +829,11 @@ WITH target AS (
     AND m.peer_type = $2::text
     AND m.peer_id = $3::bigint
     AND ($4::int <= 0 OR m.box_id <= $4::int)
+    AND ($5::int <= 0 OR m.message_date >= $5::int)
+    AND ($6::int <= 0 OR m.message_date <= $6::int)
     AND NOT m.deleted
   ORDER BY m.box_id DESC
-  LIMIT $5::int
+  LIMIT $7::int
   FOR UPDATE SKIP LOCKED
 ),
 updated AS (
@@ -664,6 +866,8 @@ type DeleteMessageBoxesByPeerBatchParams struct {
 	PeerType    string
 	PeerID      int64
 	MaxID       int32
+	MinDate     int32
+	MaxDate     int32
 	LimitCount  int32
 }
 
@@ -682,6 +886,8 @@ func (q *Queries) DeleteMessageBoxesByPeerBatch(ctx context.Context, arg DeleteM
 		arg.PeerType,
 		arg.PeerID,
 		arg.MaxID,
+		arg.MinDate,
+		arg.MaxDate,
 		arg.LimitCount,
 	)
 	if err != nil {
@@ -713,19 +919,24 @@ const deleteMessageBoxesByPrivateMessages = `-- name: DeleteMessageBoxesByPrivat
 WITH requested AS (
   SELECT
     ($1::bigint[])[i] AS message_sender_id,
-    ($2::bigint[])[i] AS private_message_id
+    ($2::bigint[])[i] AS private_message_id,
+    ($3::bigint[])[i] AS owner_user_id
   FROM generate_subscripts($2::bigint[], 1) AS g(i)
   WHERE i <= cardinality($1::bigint[])
+    AND i <= cardinality($3::bigint[])
 ),
 deduped AS (
-  SELECT DISTINCT message_sender_id, private_message_id
+  SELECT DISTINCT message_sender_id, private_message_id, owner_user_id
   FROM requested
+  WHERE owner_user_id <> 0
 ),
 updated AS (
   UPDATE message_boxes m
   SET deleted = true
   FROM deduped d
-  WHERE m.message_sender_id = d.message_sender_id
+  WHERE m.owner_user_id = ANY($3::bigint[])
+    AND m.owner_user_id = d.owner_user_id
+    AND m.message_sender_id = d.message_sender_id
     AND m.private_message_id = d.private_message_id
     AND NOT m.deleted
   RETURNING
@@ -750,6 +961,7 @@ ORDER BY owner_user_id ASC, box_id ASC
 type DeleteMessageBoxesByPrivateMessagesParams struct {
 	MessageSenderIds  []int64
 	PrivateMessageIds []int64
+	OwnerUserIds      []int64
 }
 
 type DeleteMessageBoxesByPrivateMessagesRow struct {
@@ -762,7 +974,7 @@ type DeleteMessageBoxesByPrivateMessagesRow struct {
 }
 
 func (q *Queries) DeleteMessageBoxesByPrivateMessages(ctx context.Context, arg DeleteMessageBoxesByPrivateMessagesParams) ([]DeleteMessageBoxesByPrivateMessagesRow, error) {
-	rows, err := q.db.Query(ctx, deleteMessageBoxesByPrivateMessages, arg.MessageSenderIds, arg.PrivateMessageIds)
+	rows, err := q.db.Query(ctx, deleteMessageBoxesByPrivateMessages, arg.MessageSenderIds, arg.PrivateMessageIds, arg.OwnerUserIds)
 	if err != nil {
 		return nil, err
 	}
@@ -841,6 +1053,8 @@ SELECT
   peer_id,
   from_user_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   outgoing,
   body,
@@ -851,6 +1065,7 @@ SELECT
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities::text AS quote_entities_json,
   quote_offset,
@@ -858,10 +1073,21 @@ SELECT
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
   pts,
   media::text AS media_json,
   media_unread,
-  reaction_unread
+  reaction_unread,
+  pinned,
+  via_bot_id,
+  grouped_id,
+  effect,
+  reply_markup::text AS reply_markup_json,
+  rich_message::text AS rich_message_json
 FROM message_boxes
 WHERE owner_user_id = $1
   AND private_message_id = $2
@@ -874,34 +1100,48 @@ type GetMessageBoxByPrivateMessageParams struct {
 }
 
 type GetMessageBoxByPrivateMessageRow struct {
-	BoxID             int32
-	PrivateMessageID  int64
-	OwnerUserID       int64
-	PeerType          string
-	PeerID            int64
-	FromUserID        int64
-	MessageDate       int32
-	EditDate          int32
-	Outgoing          bool
-	Body              string
-	EntitiesJson      string
-	Silent            bool
-	Noforwards        bool
-	ReplyToMsgID      int32
-	ReplyToPeerType   string
-	ReplyToPeerID     int64
-	ReplyToTopID      int32
-	QuoteText         string
-	QuoteEntitiesJson string
-	QuoteOffset       int32
-	FwdFromPeerType   string
-	FwdFromPeerID     int64
-	FwdFromName       string
-	FwdDate           int32
-	Pts               int32
-	MediaJson         string
-	MediaUnread       bool
-	ReactionUnread    bool
+	BoxID                int32
+	PrivateMessageID     int64
+	OwnerUserID          int64
+	PeerType             string
+	PeerID               int64
+	FromUserID           int64
+	MessageDate          int32
+	TtlPeriod            int32
+	ExpiresAt            int32
+	EditDate             int32
+	Outgoing             bool
+	Body                 string
+	EntitiesJson         string
+	Silent               bool
+	Noforwards           bool
+	ReplyToMsgID         int32
+	ReplyToPeerType      string
+	ReplyToPeerID        int64
+	ReplyToTopID         int32
+	ReplyToStoryID       int32
+	QuoteText            string
+	QuoteEntitiesJson    string
+	QuoteOffset          int32
+	FwdFromPeerType      string
+	FwdFromPeerID        int64
+	FwdFromName          string
+	FwdDate              int32
+	FwdSavedFromPeerType string
+	FwdSavedFromPeerID   int64
+	FwdSavedFromMsgID    int32
+	SavedPeerType        string
+	SavedPeerID          int64
+	Pts                  int32
+	MediaJson            string
+	MediaUnread          bool
+	ReactionUnread       bool
+	Pinned               bool
+	ViaBotID             int64
+	GroupedID            int64
+	Effect               int64
+	ReplyMarkupJson      string
+	RichMessageJson      string
 }
 
 func (q *Queries) GetMessageBoxByPrivateMessage(ctx context.Context, arg GetMessageBoxByPrivateMessageParams) (GetMessageBoxByPrivateMessageRow, error) {
@@ -915,6 +1155,8 @@ func (q *Queries) GetMessageBoxByPrivateMessage(ctx context.Context, arg GetMess
 		&i.PeerID,
 		&i.FromUserID,
 		&i.MessageDate,
+		&i.TtlPeriod,
+		&i.ExpiresAt,
 		&i.EditDate,
 		&i.Outgoing,
 		&i.Body,
@@ -925,6 +1167,7 @@ func (q *Queries) GetMessageBoxByPrivateMessage(ctx context.Context, arg GetMess
 		&i.ReplyToPeerType,
 		&i.ReplyToPeerID,
 		&i.ReplyToTopID,
+		&i.ReplyToStoryID,
 		&i.QuoteText,
 		&i.QuoteEntitiesJson,
 		&i.QuoteOffset,
@@ -932,10 +1175,21 @@ func (q *Queries) GetMessageBoxByPrivateMessage(ctx context.Context, arg GetMess
 		&i.FwdFromPeerID,
 		&i.FwdFromName,
 		&i.FwdDate,
+		&i.FwdSavedFromPeerType,
+		&i.FwdSavedFromPeerID,
+		&i.FwdSavedFromMsgID,
+		&i.SavedPeerType,
+		&i.SavedPeerID,
 		&i.Pts,
 		&i.MediaJson,
 		&i.MediaUnread,
 		&i.ReactionUnread,
+		&i.Pinned,
+		&i.ViaBotID,
+		&i.GroupedID,
+		&i.Effect,
+		&i.ReplyMarkupJson,
+		&i.RichMessageJson,
 	)
 	return i, err
 }
@@ -950,6 +1204,8 @@ SELECT
   peer_id,
   from_user_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   outgoing,
   body,
@@ -960,6 +1216,7 @@ SELECT
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities::text AS quote_entities_json,
   quote_offset,
@@ -967,10 +1224,21 @@ SELECT
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
   pts,
   media::text AS media_json,
   media_unread,
-  reaction_unread
+  reaction_unread,
+  pinned,
+  via_bot_id,
+  grouped_id,
+  effect,
+  reply_markup::text AS reply_markup_json,
+  rich_message::text AS rich_message_json
 FROM message_boxes
 WHERE owner_user_id = $1::bigint
   AND box_id = $2::int
@@ -989,35 +1257,49 @@ type GetMessageBoxForEditParams struct {
 }
 
 type GetMessageBoxForEditRow struct {
-	BoxID             int32
-	PrivateMessageID  int64
-	OwnerUserID       int64
-	MessageSenderID   int64
-	PeerType          string
-	PeerID            int64
-	FromUserID        int64
-	MessageDate       int32
-	EditDate          int32
-	Outgoing          bool
-	Body              string
-	EntitiesJson      string
-	Silent            bool
-	Noforwards        bool
-	ReplyToMsgID      int32
-	ReplyToPeerType   string
-	ReplyToPeerID     int64
-	ReplyToTopID      int32
-	QuoteText         string
-	QuoteEntitiesJson string
-	QuoteOffset       int32
-	FwdFromPeerType   string
-	FwdFromPeerID     int64
-	FwdFromName       string
-	FwdDate           int32
-	Pts               int32
-	MediaJson         string
-	MediaUnread       bool
-	ReactionUnread    bool
+	BoxID                int32
+	PrivateMessageID     int64
+	OwnerUserID          int64
+	MessageSenderID      int64
+	PeerType             string
+	PeerID               int64
+	FromUserID           int64
+	MessageDate          int32
+	TtlPeriod            int32
+	ExpiresAt            int32
+	EditDate             int32
+	Outgoing             bool
+	Body                 string
+	EntitiesJson         string
+	Silent               bool
+	Noforwards           bool
+	ReplyToMsgID         int32
+	ReplyToPeerType      string
+	ReplyToPeerID        int64
+	ReplyToTopID         int32
+	ReplyToStoryID       int32
+	QuoteText            string
+	QuoteEntitiesJson    string
+	QuoteOffset          int32
+	FwdFromPeerType      string
+	FwdFromPeerID        int64
+	FwdFromName          string
+	FwdDate              int32
+	FwdSavedFromPeerType string
+	FwdSavedFromPeerID   int64
+	FwdSavedFromMsgID    int32
+	SavedPeerType        string
+	SavedPeerID          int64
+	Pts                  int32
+	MediaJson            string
+	MediaUnread          bool
+	ReactionUnread       bool
+	Pinned               bool
+	ViaBotID             int64
+	GroupedID            int64
+	Effect               int64
+	ReplyMarkupJson      string
+	RichMessageJson      string
 }
 
 func (q *Queries) GetMessageBoxForEdit(ctx context.Context, arg GetMessageBoxForEditParams) (GetMessageBoxForEditRow, error) {
@@ -1037,6 +1319,8 @@ func (q *Queries) GetMessageBoxForEdit(ctx context.Context, arg GetMessageBoxFor
 		&i.PeerID,
 		&i.FromUserID,
 		&i.MessageDate,
+		&i.TtlPeriod,
+		&i.ExpiresAt,
 		&i.EditDate,
 		&i.Outgoing,
 		&i.Body,
@@ -1047,6 +1331,7 @@ func (q *Queries) GetMessageBoxForEdit(ctx context.Context, arg GetMessageBoxFor
 		&i.ReplyToPeerType,
 		&i.ReplyToPeerID,
 		&i.ReplyToTopID,
+		&i.ReplyToStoryID,
 		&i.QuoteText,
 		&i.QuoteEntitiesJson,
 		&i.QuoteOffset,
@@ -1054,10 +1339,71 @@ func (q *Queries) GetMessageBoxForEdit(ctx context.Context, arg GetMessageBoxFor
 		&i.FwdFromPeerID,
 		&i.FwdFromName,
 		&i.FwdDate,
+		&i.FwdSavedFromPeerType,
+		&i.FwdSavedFromPeerID,
+		&i.FwdSavedFromMsgID,
+		&i.SavedPeerType,
+		&i.SavedPeerID,
 		&i.Pts,
 		&i.MediaJson,
 		&i.MediaUnread,
 		&i.ReactionUnread,
+		&i.Pinned,
+		&i.ViaBotID,
+		&i.GroupedID,
+		&i.Effect,
+		&i.ReplyMarkupJson,
+		&i.RichMessageJson,
+	)
+	return i, err
+}
+
+const getMessageBoxForPin = `-- name: GetMessageBoxForPin :one
+SELECT
+  box_id,
+  private_message_id,
+  message_sender_id,
+  pinned,
+  media::text AS media_json
+FROM message_boxes
+WHERE owner_user_id = $1::bigint
+  AND peer_type = $2::text
+  AND peer_id = $3::bigint
+  AND box_id = $4::int
+  AND NOT deleted
+LIMIT 1
+FOR UPDATE
+`
+
+type GetMessageBoxForPinParams struct {
+	OwnerUserID int64
+	PeerType    string
+	PeerID      int64
+	BoxID       int32
+}
+
+type GetMessageBoxForPinRow struct {
+	BoxID            int32
+	PrivateMessageID int64
+	MessageSenderID  int64
+	Pinned           bool
+	MediaJson        string
+}
+
+func (q *Queries) GetMessageBoxForPin(ctx context.Context, arg GetMessageBoxForPinParams) (GetMessageBoxForPinRow, error) {
+	row := q.db.QueryRow(ctx, getMessageBoxForPin,
+		arg.OwnerUserID,
+		arg.PeerType,
+		arg.PeerID,
+		arg.BoxID,
+	)
+	var i GetMessageBoxForPinRow
+	err := row.Scan(
+		&i.BoxID,
+		&i.PrivateMessageID,
+		&i.MessageSenderID,
+		&i.Pinned,
+		&i.MediaJson,
 	)
 	return i, err
 }
@@ -1111,6 +1457,8 @@ SELECT
   m.peer_id,
   m.from_user_id,
   m.message_date,
+  m.ttl_period,
+  m.expires_at,
   m.edit_date,
   m.outgoing,
   m.body,
@@ -1121,6 +1469,7 @@ SELECT
   m.reply_to_peer_type,
   m.reply_to_peer_id,
   m.reply_to_top_id,
+  m.reply_to_story_id,
   m.quote_text,
   m.quote_entities::text AS quote_entities_json,
   m.quote_offset,
@@ -1128,10 +1477,21 @@ SELECT
   m.fwd_from_peer_id,
   m.fwd_from_name,
   m.fwd_date,
+  m.fwd_saved_from_peer_type,
+  m.fwd_saved_from_peer_id,
+  m.fwd_saved_from_msg_id,
+  m.saved_peer_type,
+  m.saved_peer_id,
   m.pts,
   m.media::text AS media_json,
   m.media_unread,
   m.reaction_unread,
+  m.pinned,
+  m.via_bot_id,
+  m.grouped_id,
+  m.effect,
+  m.reply_markup::text AS reply_markup_json,
+  m.rich_message::text AS rich_message_json,
   COALESCE(peer_u.id, 0)::bigint AS peer_user_id,
   COALESCE(peer_u.access_hash, 0)::bigint AS peer_access_hash,
   COALESCE(peer_u.phone, '')::text AS peer_phone,
@@ -1141,6 +1501,11 @@ SELECT
   COALESCE(peer_u.country_code, '')::text AS peer_country_code,
   COALESCE(peer_u.verified, false)::boolean AS peer_verified,
   COALESCE(peer_u.support, false)::boolean AS peer_support,
+  COALESCE(peer_u.is_bot, false)::boolean AS peer_is_bot,
+  COALESCE(peer_u.bot_info_version, 0)::int AS peer_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM peer_u.premium_expires_at), 0)::bigint AS peer_premium_until,
+  COALESCE(peer_u.emoji_status_document_id, 0)::bigint AS peer_emoji_status_document_id,
+  COALESCE(peer_u.emoji_status_until, 0)::bigint AS peer_emoji_status_until,
   COALESCE(peer_u.last_seen_at, 0)::bigint AS peer_last_seen_at,
   COALESCE(from_u.id, 0)::bigint AS from_user_user_id,
   COALESCE(from_u.access_hash, 0)::bigint AS from_user_access_hash,
@@ -1151,6 +1516,11 @@ SELECT
   COALESCE(from_u.country_code, '')::text AS from_user_country_code,
   COALESCE(from_u.verified, false)::boolean AS from_user_verified,
   COALESCE(from_u.support, false)::boolean AS from_user_support,
+  COALESCE(from_u.is_bot, false)::boolean AS from_user_is_bot,
+  COALESCE(from_u.bot_info_version, 0)::int AS from_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM from_u.premium_expires_at), 0)::bigint AS from_user_premium_until,
+  COALESCE(from_u.emoji_status_document_id, 0)::bigint AS from_user_emoji_status_document_id,
+  COALESCE(from_u.emoji_status_until, 0)::bigint AS from_user_emoji_status_until,
   COALESCE(from_u.last_seen_at, 0)::bigint AS from_user_last_seen_at
 FROM unnest($1::int[]) WITH ORDINALITY AS wanted(box_id, ord)
 JOIN message_boxes m
@@ -1168,55 +1538,79 @@ type GetMessageBoxesByIDsParams struct {
 }
 
 type GetMessageBoxesByIDsRow struct {
-	RequestedBoxID      interface{}
-	BoxID               int32
-	PrivateMessageID    int64
-	OwnerUserID         int64
-	PeerType            string
-	PeerID              int64
-	FromUserID          int64
-	MessageDate         int32
-	EditDate            int32
-	Outgoing            bool
-	Body                string
-	EntitiesJson        string
-	Silent              bool
-	Noforwards          bool
-	ReplyToMsgID        int32
-	ReplyToPeerType     string
-	ReplyToPeerID       int64
-	ReplyToTopID        int32
-	QuoteText           string
-	QuoteEntitiesJson   string
-	QuoteOffset         int32
-	FwdFromPeerType     string
-	FwdFromPeerID       int64
-	FwdFromName         string
-	FwdDate             int32
-	Pts                 int32
-	MediaJson           string
-	MediaUnread         bool
-	ReactionUnread      bool
-	PeerUserID          int64
-	PeerAccessHash      int64
-	PeerPhone           string
-	PeerFirstName       string
-	PeerLastName        string
-	PeerUsername        string
-	PeerCountryCode     string
-	PeerVerified        bool
-	PeerSupport         bool
-	PeerLastSeenAt      int64
-	FromUserUserID      int64
-	FromUserAccessHash  int64
-	FromUserPhone       string
-	FromUserFirstName   string
-	FromUserLastName    string
-	FromUserUsername    string
-	FromUserCountryCode string
-	FromUserVerified    bool
-	FromUserSupport     bool
-	FromUserLastSeenAt  int64
+	RequestedBoxID                interface{}
+	BoxID                         int32
+	PrivateMessageID              int64
+	OwnerUserID                   int64
+	PeerType                      string
+	PeerID                        int64
+	FromUserID                    int64
+	MessageDate                   int32
+	TtlPeriod                     int32
+	ExpiresAt                     int32
+	EditDate                      int32
+	Outgoing                      bool
+	Body                          string
+	EntitiesJson                  string
+	Silent                        bool
+	Noforwards                    bool
+	ReplyToMsgID                  int32
+	ReplyToPeerType               string
+	ReplyToPeerID                 int64
+	ReplyToTopID                  int32
+	ReplyToStoryID                int32
+	QuoteText                     string
+	QuoteEntitiesJson             string
+	QuoteOffset                   int32
+	FwdFromPeerType               string
+	FwdFromPeerID                 int64
+	FwdFromName                   string
+	FwdDate                       int32
+	FwdSavedFromPeerType          string
+	FwdSavedFromPeerID            int64
+	FwdSavedFromMsgID             int32
+	SavedPeerType                 string
+	SavedPeerID                   int64
+	Pts                           int32
+	MediaJson                     string
+	MediaUnread                   bool
+	ReactionUnread                bool
+	Pinned                        bool
+	ViaBotID                      int64
+	GroupedID                     int64
+	Effect                        int64
+	ReplyMarkupJson               string
+	RichMessageJson               string
+	PeerUserID                    int64
+	PeerAccessHash                int64
+	PeerPhone                     string
+	PeerFirstName                 string
+	PeerLastName                  string
+	PeerUsername                  string
+	PeerCountryCode               string
+	PeerVerified                  bool
+	PeerSupport                   bool
+	PeerIsBot                     bool
+	PeerBotInfoVersion            int32
+	PeerPremiumUntil              int64
+	PeerEmojiStatusDocumentID     int64
+	PeerEmojiStatusUntil          int64
+	PeerLastSeenAt                int64
+	FromUserUserID                int64
+	FromUserAccessHash            int64
+	FromUserPhone                 string
+	FromUserFirstName             string
+	FromUserLastName              string
+	FromUserUsername              string
+	FromUserCountryCode           string
+	FromUserVerified              bool
+	FromUserSupport               bool
+	FromUserIsBot                 bool
+	FromUserBotInfoVersion        int32
+	FromUserPremiumUntil          int64
+	FromUserEmojiStatusDocumentID int64
+	FromUserEmojiStatusUntil      int64
+	FromUserLastSeenAt            int64
 }
 
 func (q *Queries) GetMessageBoxesByIDs(ctx context.Context, arg GetMessageBoxesByIDsParams) ([]GetMessageBoxesByIDsRow, error) {
@@ -1237,6 +1631,8 @@ func (q *Queries) GetMessageBoxesByIDs(ctx context.Context, arg GetMessageBoxesB
 			&i.PeerID,
 			&i.FromUserID,
 			&i.MessageDate,
+			&i.TtlPeriod,
+			&i.ExpiresAt,
 			&i.EditDate,
 			&i.Outgoing,
 			&i.Body,
@@ -1247,6 +1643,7 @@ func (q *Queries) GetMessageBoxesByIDs(ctx context.Context, arg GetMessageBoxesB
 			&i.ReplyToPeerType,
 			&i.ReplyToPeerID,
 			&i.ReplyToTopID,
+			&i.ReplyToStoryID,
 			&i.QuoteText,
 			&i.QuoteEntitiesJson,
 			&i.QuoteOffset,
@@ -1254,10 +1651,21 @@ func (q *Queries) GetMessageBoxesByIDs(ctx context.Context, arg GetMessageBoxesB
 			&i.FwdFromPeerID,
 			&i.FwdFromName,
 			&i.FwdDate,
+			&i.FwdSavedFromPeerType,
+			&i.FwdSavedFromPeerID,
+			&i.FwdSavedFromMsgID,
+			&i.SavedPeerType,
+			&i.SavedPeerID,
 			&i.Pts,
 			&i.MediaJson,
 			&i.MediaUnread,
 			&i.ReactionUnread,
+			&i.Pinned,
+			&i.ViaBotID,
+			&i.GroupedID,
+			&i.Effect,
+			&i.ReplyMarkupJson,
+			&i.RichMessageJson,
 			&i.PeerUserID,
 			&i.PeerAccessHash,
 			&i.PeerPhone,
@@ -1267,6 +1675,11 @@ func (q *Queries) GetMessageBoxesByIDs(ctx context.Context, arg GetMessageBoxesB
 			&i.PeerCountryCode,
 			&i.PeerVerified,
 			&i.PeerSupport,
+			&i.PeerIsBot,
+			&i.PeerBotInfoVersion,
+			&i.PeerPremiumUntil,
+			&i.PeerEmojiStatusDocumentID,
+			&i.PeerEmojiStatusUntil,
 			&i.PeerLastSeenAt,
 			&i.FromUserUserID,
 			&i.FromUserAccessHash,
@@ -1277,6 +1690,11 @@ func (q *Queries) GetMessageBoxesByIDs(ctx context.Context, arg GetMessageBoxesB
 			&i.FromUserCountryCode,
 			&i.FromUserVerified,
 			&i.FromUserSupport,
+			&i.FromUserIsBot,
+			&i.FromUserBotInfoVersion,
+			&i.FromUserPremiumUntil,
+			&i.FromUserEmojiStatusDocumentID,
+			&i.FromUserEmojiStatusUntil,
 			&i.FromUserLastSeenAt,
 		); err != nil {
 			return nil, err
@@ -1306,6 +1724,8 @@ SELECT
   m.peer_id,
   m.from_user_id,
   m.message_date,
+  m.ttl_period,
+  m.expires_at,
   m.edit_date,
   m.outgoing,
   m.body,
@@ -1316,6 +1736,7 @@ SELECT
   m.reply_to_peer_type,
   m.reply_to_peer_id,
   m.reply_to_top_id,
+  m.reply_to_story_id,
   m.quote_text,
   m.quote_entities::text AS quote_entities_json,
   m.quote_offset,
@@ -1323,10 +1744,18 @@ SELECT
   m.fwd_from_peer_id,
   m.fwd_from_name,
   m.fwd_date,
+  m.fwd_saved_from_peer_type,
+  m.fwd_saved_from_peer_id,
+  m.fwd_saved_from_msg_id,
+  m.saved_peer_type,
+  m.saved_peer_id,
   m.pts,
   m.media::text AS media_json,
   m.media_unread,
-  m.reaction_unread
+  m.reaction_unread,
+  m.pinned,
+  m.via_bot_id,
+  m.grouped_id
 FROM requested r
 JOIN message_boxes m
   ON m.owner_user_id = $1::bigint
@@ -1345,36 +1774,47 @@ type GetMessageBoxesForForwardParams struct {
 }
 
 type GetMessageBoxesForForwardRow struct {
-	Ord               int32
-	BoxID             int32
-	PrivateMessageID  int64
-	OwnerUserID       int64
-	MessageSenderID   int64
-	PeerType          string
-	PeerID            int64
-	FromUserID        int64
-	MessageDate       int32
-	EditDate          int32
-	Outgoing          bool
-	Body              string
-	EntitiesJson      string
-	Silent            bool
-	Noforwards        bool
-	ReplyToMsgID      int32
-	ReplyToPeerType   string
-	ReplyToPeerID     int64
-	ReplyToTopID      int32
-	QuoteText         string
-	QuoteEntitiesJson string
-	QuoteOffset       int32
-	FwdFromPeerType   string
-	FwdFromPeerID     int64
-	FwdFromName       string
-	FwdDate           int32
-	Pts               int32
-	MediaJson         string
-	MediaUnread       bool
-	ReactionUnread    bool
+	Ord                  int32
+	BoxID                int32
+	PrivateMessageID     int64
+	OwnerUserID          int64
+	MessageSenderID      int64
+	PeerType             string
+	PeerID               int64
+	FromUserID           int64
+	MessageDate          int32
+	TtlPeriod            int32
+	ExpiresAt            int32
+	EditDate             int32
+	Outgoing             bool
+	Body                 string
+	EntitiesJson         string
+	Silent               bool
+	Noforwards           bool
+	ReplyToMsgID         int32
+	ReplyToPeerType      string
+	ReplyToPeerID        int64
+	ReplyToTopID         int32
+	ReplyToStoryID       int32
+	QuoteText            string
+	QuoteEntitiesJson    string
+	QuoteOffset          int32
+	FwdFromPeerType      string
+	FwdFromPeerID        int64
+	FwdFromName          string
+	FwdDate              int32
+	FwdSavedFromPeerType string
+	FwdSavedFromPeerID   int64
+	FwdSavedFromMsgID    int32
+	SavedPeerType        string
+	SavedPeerID          int64
+	Pts                  int32
+	MediaJson            string
+	MediaUnread          bool
+	ReactionUnread       bool
+	Pinned               bool
+	ViaBotID             int64
+	GroupedID            int64
 }
 
 func (q *Queries) GetMessageBoxesForForward(ctx context.Context, arg GetMessageBoxesForForwardParams) ([]GetMessageBoxesForForwardRow, error) {
@@ -1401,6 +1841,8 @@ func (q *Queries) GetMessageBoxesForForward(ctx context.Context, arg GetMessageB
 			&i.PeerID,
 			&i.FromUserID,
 			&i.MessageDate,
+			&i.TtlPeriod,
+			&i.ExpiresAt,
 			&i.EditDate,
 			&i.Outgoing,
 			&i.Body,
@@ -1411,6 +1853,7 @@ func (q *Queries) GetMessageBoxesForForward(ctx context.Context, arg GetMessageB
 			&i.ReplyToPeerType,
 			&i.ReplyToPeerID,
 			&i.ReplyToTopID,
+			&i.ReplyToStoryID,
 			&i.QuoteText,
 			&i.QuoteEntitiesJson,
 			&i.QuoteOffset,
@@ -1418,10 +1861,18 @@ func (q *Queries) GetMessageBoxesForForward(ctx context.Context, arg GetMessageB
 			&i.FwdFromPeerID,
 			&i.FwdFromName,
 			&i.FwdDate,
+			&i.FwdSavedFromPeerType,
+			&i.FwdSavedFromPeerID,
+			&i.FwdSavedFromMsgID,
+			&i.SavedPeerType,
+			&i.SavedPeerID,
 			&i.Pts,
 			&i.MediaJson,
 			&i.MediaUnread,
 			&i.ReactionUnread,
+			&i.Pinned,
+			&i.ViaBotID,
+			&i.GroupedID,
 		); err != nil {
 			return nil, err
 		}
@@ -1500,6 +1951,8 @@ SELECT
   recipient_user_id,
   random_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   body,
   entities::text AS entities_json
@@ -1520,6 +1973,8 @@ type GetPrivateMessageByRandomIDRow struct {
 	RecipientUserID int64
 	RandomID        int64
 	MessageDate     int32
+	TtlPeriod       int32
+	ExpiresAt       int32
 	EditDate        int32
 	Body            string
 	EntitiesJson    string
@@ -1534,6 +1989,8 @@ func (q *Queries) GetPrivateMessageByRandomID(ctx context.Context, arg GetPrivat
 		&i.RecipientUserID,
 		&i.RandomID,
 		&i.MessageDate,
+		&i.TtlPeriod,
+		&i.ExpiresAt,
 		&i.EditDate,
 		&i.Body,
 		&i.EntitiesJson,
@@ -1549,6 +2006,8 @@ SELECT EXISTS (
     AND m.peer_type = $2::text
     AND m.peer_id = $3::bigint
     AND ($4::int <= 0 OR m.box_id <= $4::int)
+    AND ($5::int <= 0 OR m.message_date >= $5::int)
+    AND ($6::int <= 0 OR m.message_date <= $6::int)
     AND NOT m.deleted
   LIMIT 1
 )::boolean AS more
@@ -1559,6 +2018,8 @@ type HasDeletableMessageBoxByPeerParams struct {
 	PeerType    string
 	PeerID      int64
 	MaxID       int32
+	MinDate     int32
+	MaxDate     int32
 }
 
 func (q *Queries) HasDeletableMessageBoxByPeer(ctx context.Context, arg HasDeletableMessageBoxByPeerParams) (bool, error) {
@@ -1567,7 +2028,35 @@ func (q *Queries) HasDeletableMessageBoxByPeer(ctx context.Context, arg HasDelet
 		arg.PeerType,
 		arg.PeerID,
 		arg.MaxID,
+		arg.MinDate,
+		arg.MaxDate,
 	)
+	var more bool
+	err := row.Scan(&more)
+	return more, err
+}
+
+const hasPinnedMessageBoxByPeer = `-- name: HasPinnedMessageBoxByPeer :one
+SELECT EXISTS (
+  SELECT 1
+  FROM message_boxes m
+  WHERE m.owner_user_id = $1::bigint
+    AND m.peer_type = $2::text
+    AND m.peer_id = $3::bigint
+    AND m.pinned
+    AND NOT m.deleted
+  LIMIT 1
+)::boolean AS more
+`
+
+type HasPinnedMessageBoxByPeerParams struct {
+	OwnerUserID int64
+	PeerType    string
+	PeerID      int64
+}
+
+func (q *Queries) HasPinnedMessageBoxByPeer(ctx context.Context, arg HasPinnedMessageBoxByPeerParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasPinnedMessageBoxByPeer, arg.OwnerUserID, arg.PeerType, arg.PeerID)
 	var more bool
 	err := row.Scan(&more)
 	return more, err
@@ -1630,6 +2119,328 @@ func (q *Queries) LatestIncomingReadReceiptCandidate(ctx context.Context, arg La
 	return i, err
 }
 
+const listMessagesBackward = `-- name: ListMessagesBackward :many
+SELECT
+  m.box_id,
+  m.private_message_id,
+  m.owner_user_id,
+  m.peer_type,
+  m.peer_id,
+  m.from_user_id,
+  m.message_date,
+  m.ttl_period,
+  m.expires_at,
+  m.edit_date,
+  m.outgoing,
+  m.body,
+  m.entities::text AS entities_json,
+  m.silent,
+  m.noforwards,
+  m.reply_to_msg_id,
+  m.reply_to_peer_type,
+  m.reply_to_peer_id,
+  m.reply_to_top_id,
+  m.reply_to_story_id,
+  m.quote_text,
+  m.quote_entities::text AS quote_entities_json,
+  m.quote_offset,
+  m.fwd_from_peer_type,
+  m.fwd_from_peer_id,
+  m.fwd_from_name,
+  m.fwd_date,
+  m.fwd_saved_from_peer_type,
+  m.fwd_saved_from_peer_id,
+  m.fwd_saved_from_msg_id,
+  m.saved_peer_type,
+  m.saved_peer_id,
+  m.pts,
+  m.media::text AS media_json,
+  m.media_unread,
+  m.reaction_unread,
+  m.pinned,
+  m.via_bot_id,
+  m.grouped_id,
+  m.effect,
+  m.reply_markup::text AS reply_markup_json,
+  m.rich_message::text AS rich_message_json,
+  COALESCE(peer_u.id, 0)::bigint AS peer_user_id,
+  COALESCE(peer_u.access_hash, 0)::bigint AS peer_access_hash,
+  COALESCE(peer_u.phone, '')::text AS peer_phone,
+  COALESCE(peer_u.first_name, '')::text AS peer_first_name,
+  COALESCE(peer_u.last_name, '')::text AS peer_last_name,
+  COALESCE(peer_u.username, '')::text AS peer_username,
+  COALESCE(peer_u.country_code, '')::text AS peer_country_code,
+  COALESCE(peer_u.verified, false)::boolean AS peer_verified,
+  COALESCE(peer_u.support, false)::boolean AS peer_support,
+  COALESCE(peer_u.is_bot, false)::boolean AS peer_is_bot,
+  COALESCE(peer_u.bot_info_version, 0)::int AS peer_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM peer_u.premium_expires_at), 0)::bigint AS peer_premium_until,
+  COALESCE(peer_u.emoji_status_document_id, 0)::bigint AS peer_emoji_status_document_id,
+  COALESCE(peer_u.emoji_status_until, 0)::bigint AS peer_emoji_status_until,
+  COALESCE(peer_u.last_seen_at, 0)::bigint AS peer_last_seen_at,
+  COALESCE(from_u.id, 0)::bigint AS from_user_user_id,
+  COALESCE(from_u.access_hash, 0)::bigint AS from_user_access_hash,
+  COALESCE(from_u.phone, '')::text AS from_user_phone,
+  COALESCE(from_u.first_name, '')::text AS from_user_first_name,
+  COALESCE(from_u.last_name, '')::text AS from_user_last_name,
+  COALESCE(from_u.username, '')::text AS from_user_username,
+  COALESCE(from_u.country_code, '')::text AS from_user_country_code,
+  COALESCE(from_u.verified, false)::boolean AS from_user_verified,
+  COALESCE(from_u.support, false)::boolean AS from_user_support,
+  COALESCE(from_u.is_bot, false)::boolean AS from_user_is_bot,
+  COALESCE(from_u.bot_info_version, 0)::int AS from_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM from_u.premium_expires_at), 0)::bigint AS from_user_premium_until,
+  COALESCE(from_u.emoji_status_document_id, 0)::bigint AS from_user_emoji_status_document_id,
+  COALESCE(from_u.emoji_status_until, 0)::bigint AS from_user_emoji_status_until,
+  COALESCE(from_u.last_seen_at, 0)::bigint AS from_user_last_seen_at
+FROM message_boxes m
+LEFT JOIN users peer_u ON m.peer_type = 'user' AND peer_u.id = m.peer_id
+LEFT JOIN users from_u ON from_u.id = m.from_user_id
+WHERE m.owner_user_id = $1::bigint
+  AND NOT m.deleted
+  AND (
+    NOT $2::boolean
+    OR (m.peer_type = $3::text AND m.peer_id = $4::bigint)
+  )
+  AND (
+    $5::text = ''
+    OR m.body ILIKE ('%' || $5::text || '%')
+  )
+  AND ($6::int <= 0 OR m.box_id < $6::int)
+  AND ($7::int <= 0 OR m.box_id > $7::int)
+  AND (NOT $8::boolean OR m.pinned)
+  AND (
+    NOT $9::boolean
+    OR (
+      m.media->>'kind' = 'document'
+      AND EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(COALESCE(m.media #> '{document,attributes}', '[]'::jsonb)) AS attr
+        WHERE attr->>'kind' = 'audio'
+          AND COALESCE((attr->>'voice')::boolean, false) = false
+      )
+    )
+  )
+  AND (
+    $10::text = ''
+    OR (m.saved_peer_type = $10::text AND m.saved_peer_id = $11::bigint)
+  )
+  AND (
+    ($12::int > 0 AND m.message_date < $12::int)
+    OR ($12::int <= 0 AND ($13::int <= 0 OR m.box_id < $13::int))
+  )
+ORDER BY m.box_id DESC
+OFFSET GREATEST($14::int, 0)
+LIMIT $15::int
+`
+
+type ListMessagesBackwardParams struct {
+	OwnerUserID   int64
+	HasPeer       bool
+	PeerType      string
+	PeerID        int64
+	Query         string
+	MaxID         int32
+	MinID         int32
+	PinnedOnly    bool
+	MusicOnly     bool
+	SavedPeerType string
+	SavedPeerID   int64
+	OffsetDate    int32
+	OffsetID      int32
+	RowOffset     int32
+	LimitCount    int32
+}
+
+type ListMessagesBackwardRow struct {
+	BoxID                         int32
+	PrivateMessageID              int64
+	OwnerUserID                   int64
+	PeerType                      string
+	PeerID                        int64
+	FromUserID                    int64
+	MessageDate                   int32
+	TtlPeriod                     int32
+	ExpiresAt                     int32
+	EditDate                      int32
+	Outgoing                      bool
+	Body                          string
+	EntitiesJson                  string
+	Silent                        bool
+	Noforwards                    bool
+	ReplyToMsgID                  int32
+	ReplyToPeerType               string
+	ReplyToPeerID                 int64
+	ReplyToTopID                  int32
+	ReplyToStoryID                int32
+	QuoteText                     string
+	QuoteEntitiesJson             string
+	QuoteOffset                   int32
+	FwdFromPeerType               string
+	FwdFromPeerID                 int64
+	FwdFromName                   string
+	FwdDate                       int32
+	FwdSavedFromPeerType          string
+	FwdSavedFromPeerID            int64
+	FwdSavedFromMsgID             int32
+	SavedPeerType                 string
+	SavedPeerID                   int64
+	Pts                           int32
+	MediaJson                     string
+	MediaUnread                   bool
+	ReactionUnread                bool
+	Pinned                        bool
+	ViaBotID                      int64
+	GroupedID                     int64
+	Effect                        int64
+	ReplyMarkupJson               string
+	RichMessageJson               string
+	PeerUserID                    int64
+	PeerAccessHash                int64
+	PeerPhone                     string
+	PeerFirstName                 string
+	PeerLastName                  string
+	PeerUsername                  string
+	PeerCountryCode               string
+	PeerVerified                  bool
+	PeerSupport                   bool
+	PeerIsBot                     bool
+	PeerBotInfoVersion            int32
+	PeerPremiumUntil              int64
+	PeerEmojiStatusDocumentID     int64
+	PeerEmojiStatusUntil          int64
+	PeerLastSeenAt                int64
+	FromUserUserID                int64
+	FromUserAccessHash            int64
+	FromUserPhone                 string
+	FromUserFirstName             string
+	FromUserLastName              string
+	FromUserUsername              string
+	FromUserCountryCode           string
+	FromUserVerified              bool
+	FromUserSupport               bool
+	FromUserIsBot                 bool
+	FromUserBotInfoVersion        int32
+	FromUserPremiumUntil          int64
+	FromUserEmojiStatusDocumentID int64
+	FromUserEmojiStatusUntil      int64
+	FromUserLastSeenAt            int64
+}
+
+// backward 热路径(add_offset>=0:初始加载/上滑翻页)的扁平静态查询。
+// 与 ListMessagesByUser 的 backward 分支逐位等价(相同 base 过滤 + 相同 anchor +
+// ORDER BY box_id DESC + OFFSET GREATEST(add_offset,0) + LIMIT),但只规划单次
+// index scan + 2 LEFT JOIN,避免大 CTE 把 4 个分支+total 全树规划。total 走
+// 独立 CountMessagesByUser,仅 NeedTotalCount 时发。
+func (q *Queries) ListMessagesBackward(ctx context.Context, arg ListMessagesBackwardParams) ([]ListMessagesBackwardRow, error) {
+	rows, err := q.db.Query(ctx, listMessagesBackward,
+		arg.OwnerUserID,
+		arg.HasPeer,
+		arg.PeerType,
+		arg.PeerID,
+		arg.Query,
+		arg.MaxID,
+		arg.MinID,
+		arg.PinnedOnly,
+		arg.MusicOnly,
+		arg.SavedPeerType,
+		arg.SavedPeerID,
+		arg.OffsetDate,
+		arg.OffsetID,
+		arg.RowOffset,
+		arg.LimitCount,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListMessagesBackwardRow
+	for rows.Next() {
+		var i ListMessagesBackwardRow
+		if err := rows.Scan(
+			&i.BoxID,
+			&i.PrivateMessageID,
+			&i.OwnerUserID,
+			&i.PeerType,
+			&i.PeerID,
+			&i.FromUserID,
+			&i.MessageDate,
+			&i.TtlPeriod,
+			&i.ExpiresAt,
+			&i.EditDate,
+			&i.Outgoing,
+			&i.Body,
+			&i.EntitiesJson,
+			&i.Silent,
+			&i.Noforwards,
+			&i.ReplyToMsgID,
+			&i.ReplyToPeerType,
+			&i.ReplyToPeerID,
+			&i.ReplyToTopID,
+			&i.ReplyToStoryID,
+			&i.QuoteText,
+			&i.QuoteEntitiesJson,
+			&i.QuoteOffset,
+			&i.FwdFromPeerType,
+			&i.FwdFromPeerID,
+			&i.FwdFromName,
+			&i.FwdDate,
+			&i.FwdSavedFromPeerType,
+			&i.FwdSavedFromPeerID,
+			&i.FwdSavedFromMsgID,
+			&i.SavedPeerType,
+			&i.SavedPeerID,
+			&i.Pts,
+			&i.MediaJson,
+			&i.MediaUnread,
+			&i.ReactionUnread,
+			&i.Pinned,
+			&i.ViaBotID,
+			&i.GroupedID,
+			&i.Effect,
+			&i.ReplyMarkupJson,
+			&i.RichMessageJson,
+			&i.PeerUserID,
+			&i.PeerAccessHash,
+			&i.PeerPhone,
+			&i.PeerFirstName,
+			&i.PeerLastName,
+			&i.PeerUsername,
+			&i.PeerCountryCode,
+			&i.PeerVerified,
+			&i.PeerSupport,
+			&i.PeerIsBot,
+			&i.PeerBotInfoVersion,
+			&i.PeerPremiumUntil,
+			&i.PeerEmojiStatusDocumentID,
+			&i.PeerEmojiStatusUntil,
+			&i.PeerLastSeenAt,
+			&i.FromUserUserID,
+			&i.FromUserAccessHash,
+			&i.FromUserPhone,
+			&i.FromUserFirstName,
+			&i.FromUserLastName,
+			&i.FromUserUsername,
+			&i.FromUserCountryCode,
+			&i.FromUserVerified,
+			&i.FromUserSupport,
+			&i.FromUserIsBot,
+			&i.FromUserBotInfoVersion,
+			&i.FromUserPremiumUntil,
+			&i.FromUserEmojiStatusDocumentID,
+			&i.FromUserEmojiStatusUntil,
+			&i.FromUserLastSeenAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listMessagesByUser = `-- name: ListMessagesByUser :many
 WITH load_params AS (
   SELECT
@@ -1652,6 +2463,8 @@ base AS NOT MATERIALIZED (
     m.peer_id,
     m.from_user_id,
     m.message_date,
+    m.ttl_period,
+    m.expires_at,
     m.edit_date,
     m.outgoing,
     m.body,
@@ -1662,6 +2475,7 @@ base AS NOT MATERIALIZED (
     m.reply_to_peer_type,
     m.reply_to_peer_id,
     m.reply_to_top_id,
+    m.reply_to_story_id,
     m.quote_text,
     m.quote_entities::text AS quote_entities_json,
     m.quote_offset,
@@ -1669,10 +2483,21 @@ base AS NOT MATERIALIZED (
     m.fwd_from_peer_id,
     m.fwd_from_name,
     m.fwd_date,
+    m.fwd_saved_from_peer_type,
+    m.fwd_saved_from_peer_id,
+    m.fwd_saved_from_msg_id,
+    m.saved_peer_type,
+    m.saved_peer_id,
     m.pts,
     m.media::text AS media_json,
     m.media_unread,
     m.reaction_unread,
+    m.pinned,
+    m.via_bot_id,
+    m.grouped_id,
+    m.effect,
+    m.reply_markup::text AS reply_markup_json,
+    m.rich_message::text AS rich_message_json,
     COALESCE(peer_u.id, 0)::bigint AS peer_user_id,
     COALESCE(peer_u.access_hash, 0)::bigint AS peer_access_hash,
     COALESCE(peer_u.phone, '')::text AS peer_phone,
@@ -1682,6 +2507,11 @@ base AS NOT MATERIALIZED (
     COALESCE(peer_u.country_code, '')::text AS peer_country_code,
     COALESCE(peer_u.verified, false)::boolean AS peer_verified,
     COALESCE(peer_u.support, false)::boolean AS peer_support,
+    COALESCE(peer_u.is_bot, false)::boolean AS peer_is_bot,
+    COALESCE(peer_u.bot_info_version, 0)::int AS peer_bot_info_version,
+    COALESCE(EXTRACT(EPOCH FROM peer_u.premium_expires_at), 0)::bigint AS peer_premium_until,
+    COALESCE(peer_u.emoji_status_document_id, 0)::bigint AS peer_emoji_status_document_id,
+    COALESCE(peer_u.emoji_status_until, 0)::bigint AS peer_emoji_status_until,
     COALESCE(peer_u.last_seen_at, 0)::bigint AS peer_last_seen_at,
     COALESCE(from_u.id, 0)::bigint AS from_user_user_id,
     COALESCE(from_u.access_hash, 0)::bigint AS from_user_access_hash,
@@ -1692,6 +2522,11 @@ base AS NOT MATERIALIZED (
     COALESCE(from_u.country_code, '')::text AS from_user_country_code,
     COALESCE(from_u.verified, false)::boolean AS from_user_verified,
     COALESCE(from_u.support, false)::boolean AS from_user_support,
+    COALESCE(from_u.is_bot, false)::boolean AS from_user_is_bot,
+    COALESCE(from_u.bot_info_version, 0)::int AS from_user_bot_info_version,
+    COALESCE(EXTRACT(EPOCH FROM from_u.premium_expires_at), 0)::bigint AS from_user_premium_until,
+    COALESCE(from_u.emoji_status_document_id, 0)::bigint AS from_user_emoji_status_document_id,
+    COALESCE(from_u.emoji_status_until, 0)::bigint AS from_user_emoji_status_until,
     COALESCE(from_u.last_seen_at, 0)::bigint AS from_user_last_seen_at
   FROM message_boxes m
   LEFT JOIN users peer_u ON m.peer_type = 'user' AND peer_u.id = m.peer_id
@@ -1708,14 +2543,31 @@ base AS NOT MATERIALIZED (
     )
     AND ($10::int <= 0 OR m.box_id < $10::int)
     AND ($11::int <= 0 OR m.box_id > $11::int)
+    AND (NOT $12::boolean OR m.pinned)
+    AND (
+      NOT $13::boolean
+      OR (
+        m.media->>'kind' = 'document'
+        AND EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements(COALESCE(m.media #> '{document,attributes}', '[]'::jsonb)) AS attr
+          WHERE attr->>'kind' = 'audio'
+            AND COALESCE((attr->>'voice')::boolean, false) = false
+        )
+      )
+    )
+    AND (
+      $14::text = ''
+      OR (m.saved_peer_type = $14::text AND m.saved_peer_id = $15::bigint)
+    )
 ),
 total AS (
   SELECT count(*)::int AS total_count
   FROM base
-  WHERE $12::boolean
+  WHERE $16::boolean
 ),
 backward AS (
-  SELECT b.box_id, b.private_message_id, b.owner_user_id, b.peer_type, b.peer_id, b.from_user_id, b.message_date, b.edit_date, b.outgoing, b.body, b.entities_json, b.silent, b.noforwards, b.reply_to_msg_id, b.reply_to_peer_type, b.reply_to_peer_id, b.reply_to_top_id, b.quote_text, b.quote_entities_json, b.quote_offset, b.fwd_from_peer_type, b.fwd_from_peer_id, b.fwd_from_name, b.fwd_date, b.pts, b.media_json, b.media_unread, b.reaction_unread, b.peer_user_id, b.peer_access_hash, b.peer_phone, b.peer_first_name, b.peer_last_name, b.peer_username, b.peer_country_code, b.peer_verified, b.peer_support, b.peer_last_seen_at, b.from_user_user_id, b.from_user_access_hash, b.from_user_phone, b.from_user_first_name, b.from_user_last_name, b.from_user_username, b.from_user_country_code, b.from_user_verified, b.from_user_support, b.from_user_last_seen_at
+  SELECT b.box_id, b.private_message_id, b.owner_user_id, b.peer_type, b.peer_id, b.from_user_id, b.message_date, b.ttl_period, b.expires_at, b.edit_date, b.outgoing, b.body, b.entities_json, b.silent, b.noforwards, b.reply_to_msg_id, b.reply_to_peer_type, b.reply_to_peer_id, b.reply_to_top_id, b.reply_to_story_id, b.quote_text, b.quote_entities_json, b.quote_offset, b.fwd_from_peer_type, b.fwd_from_peer_id, b.fwd_from_name, b.fwd_date, b.fwd_saved_from_peer_type, b.fwd_saved_from_peer_id, b.fwd_saved_from_msg_id, b.saved_peer_type, b.saved_peer_id, b.pts, b.media_json, b.media_unread, b.reaction_unread, b.pinned, b.via_bot_id, b.grouped_id, b.effect, b.reply_markup_json, b.rich_message_json, b.peer_user_id, b.peer_access_hash, b.peer_phone, b.peer_first_name, b.peer_last_name, b.peer_username, b.peer_country_code, b.peer_verified, b.peer_support, b.peer_is_bot, b.peer_bot_info_version, b.peer_premium_until, b.peer_emoji_status_document_id, b.peer_emoji_status_until, b.peer_last_seen_at, b.from_user_user_id, b.from_user_access_hash, b.from_user_phone, b.from_user_first_name, b.from_user_last_name, b.from_user_username, b.from_user_country_code, b.from_user_verified, b.from_user_support, b.from_user_is_bot, b.from_user_bot_info_version, b.from_user_premium_until, b.from_user_emoji_status_document_id, b.from_user_emoji_status_until, b.from_user_last_seen_at
   FROM base b
   CROSS JOIN load_params p
   WHERE p.load_type = 'backward'
@@ -1728,9 +2580,9 @@ backward AS (
   LIMIT (SELECT limit_count FROM load_params)
 ),
 around_forward AS (
-  SELECT f.box_id, f.private_message_id, f.owner_user_id, f.peer_type, f.peer_id, f.from_user_id, f.message_date, f.edit_date, f.outgoing, f.body, f.entities_json, f.silent, f.noforwards, f.reply_to_msg_id, f.reply_to_peer_type, f.reply_to_peer_id, f.reply_to_top_id, f.quote_text, f.quote_entities_json, f.quote_offset, f.fwd_from_peer_type, f.fwd_from_peer_id, f.fwd_from_name, f.fwd_date, f.pts, f.media_json, f.media_unread, f.reaction_unread, f.peer_user_id, f.peer_access_hash, f.peer_phone, f.peer_first_name, f.peer_last_name, f.peer_username, f.peer_country_code, f.peer_verified, f.peer_support, f.peer_last_seen_at, f.from_user_user_id, f.from_user_access_hash, f.from_user_phone, f.from_user_first_name, f.from_user_last_name, f.from_user_username, f.from_user_country_code, f.from_user_verified, f.from_user_support, f.from_user_last_seen_at
+  SELECT f.box_id, f.private_message_id, f.owner_user_id, f.peer_type, f.peer_id, f.from_user_id, f.message_date, f.ttl_period, f.expires_at, f.edit_date, f.outgoing, f.body, f.entities_json, f.silent, f.noforwards, f.reply_to_msg_id, f.reply_to_peer_type, f.reply_to_peer_id, f.reply_to_top_id, f.reply_to_story_id, f.quote_text, f.quote_entities_json, f.quote_offset, f.fwd_from_peer_type, f.fwd_from_peer_id, f.fwd_from_name, f.fwd_date, f.fwd_saved_from_peer_type, f.fwd_saved_from_peer_id, f.fwd_saved_from_msg_id, f.saved_peer_type, f.saved_peer_id, f.pts, f.media_json, f.media_unread, f.reaction_unread, f.pinned, f.via_bot_id, f.grouped_id, f.effect, f.reply_markup_json, f.rich_message_json, f.peer_user_id, f.peer_access_hash, f.peer_phone, f.peer_first_name, f.peer_last_name, f.peer_username, f.peer_country_code, f.peer_verified, f.peer_support, f.peer_is_bot, f.peer_bot_info_version, f.peer_premium_until, f.peer_emoji_status_document_id, f.peer_emoji_status_until, f.peer_last_seen_at, f.from_user_user_id, f.from_user_access_hash, f.from_user_phone, f.from_user_first_name, f.from_user_last_name, f.from_user_username, f.from_user_country_code, f.from_user_verified, f.from_user_support, f.from_user_is_bot, f.from_user_bot_info_version, f.from_user_premium_until, f.from_user_emoji_status_document_id, f.from_user_emoji_status_until, f.from_user_last_seen_at
   FROM (
-    SELECT b.box_id, b.private_message_id, b.owner_user_id, b.peer_type, b.peer_id, b.from_user_id, b.message_date, b.edit_date, b.outgoing, b.body, b.entities_json, b.silent, b.noforwards, b.reply_to_msg_id, b.reply_to_peer_type, b.reply_to_peer_id, b.reply_to_top_id, b.quote_text, b.quote_entities_json, b.quote_offset, b.fwd_from_peer_type, b.fwd_from_peer_id, b.fwd_from_name, b.fwd_date, b.pts, b.media_json, b.media_unread, b.reaction_unread, b.peer_user_id, b.peer_access_hash, b.peer_phone, b.peer_first_name, b.peer_last_name, b.peer_username, b.peer_country_code, b.peer_verified, b.peer_support, b.peer_last_seen_at, b.from_user_user_id, b.from_user_access_hash, b.from_user_phone, b.from_user_first_name, b.from_user_last_name, b.from_user_username, b.from_user_country_code, b.from_user_verified, b.from_user_support, b.from_user_last_seen_at
+    SELECT b.box_id, b.private_message_id, b.owner_user_id, b.peer_type, b.peer_id, b.from_user_id, b.message_date, b.ttl_period, b.expires_at, b.edit_date, b.outgoing, b.body, b.entities_json, b.silent, b.noforwards, b.reply_to_msg_id, b.reply_to_peer_type, b.reply_to_peer_id, b.reply_to_top_id, b.reply_to_story_id, b.quote_text, b.quote_entities_json, b.quote_offset, b.fwd_from_peer_type, b.fwd_from_peer_id, b.fwd_from_name, b.fwd_date, b.fwd_saved_from_peer_type, b.fwd_saved_from_peer_id, b.fwd_saved_from_msg_id, b.saved_peer_type, b.saved_peer_id, b.pts, b.media_json, b.media_unread, b.reaction_unread, b.pinned, b.via_bot_id, b.grouped_id, b.effect, b.reply_markup_json, b.rich_message_json, b.peer_user_id, b.peer_access_hash, b.peer_phone, b.peer_first_name, b.peer_last_name, b.peer_username, b.peer_country_code, b.peer_verified, b.peer_support, b.peer_is_bot, b.peer_bot_info_version, b.peer_premium_until, b.peer_emoji_status_document_id, b.peer_emoji_status_until, b.peer_last_seen_at, b.from_user_user_id, b.from_user_access_hash, b.from_user_phone, b.from_user_first_name, b.from_user_last_name, b.from_user_username, b.from_user_country_code, b.from_user_verified, b.from_user_support, b.from_user_is_bot, b.from_user_bot_info_version, b.from_user_premium_until, b.from_user_emoji_status_document_id, b.from_user_emoji_status_until, b.from_user_last_seen_at
     FROM base b
     CROSS JOIN load_params p
     WHERE p.load_type = 'around'
@@ -1743,7 +2595,7 @@ around_forward AS (
   ) f
 ),
 around_backward AS (
-  SELECT b.box_id, b.private_message_id, b.owner_user_id, b.peer_type, b.peer_id, b.from_user_id, b.message_date, b.edit_date, b.outgoing, b.body, b.entities_json, b.silent, b.noforwards, b.reply_to_msg_id, b.reply_to_peer_type, b.reply_to_peer_id, b.reply_to_top_id, b.quote_text, b.quote_entities_json, b.quote_offset, b.fwd_from_peer_type, b.fwd_from_peer_id, b.fwd_from_name, b.fwd_date, b.pts, b.media_json, b.media_unread, b.reaction_unread, b.peer_user_id, b.peer_access_hash, b.peer_phone, b.peer_first_name, b.peer_last_name, b.peer_username, b.peer_country_code, b.peer_verified, b.peer_support, b.peer_last_seen_at, b.from_user_user_id, b.from_user_access_hash, b.from_user_phone, b.from_user_first_name, b.from_user_last_name, b.from_user_username, b.from_user_country_code, b.from_user_verified, b.from_user_support, b.from_user_last_seen_at
+  SELECT b.box_id, b.private_message_id, b.owner_user_id, b.peer_type, b.peer_id, b.from_user_id, b.message_date, b.ttl_period, b.expires_at, b.edit_date, b.outgoing, b.body, b.entities_json, b.silent, b.noforwards, b.reply_to_msg_id, b.reply_to_peer_type, b.reply_to_peer_id, b.reply_to_top_id, b.reply_to_story_id, b.quote_text, b.quote_entities_json, b.quote_offset, b.fwd_from_peer_type, b.fwd_from_peer_id, b.fwd_from_name, b.fwd_date, b.fwd_saved_from_peer_type, b.fwd_saved_from_peer_id, b.fwd_saved_from_msg_id, b.saved_peer_type, b.saved_peer_id, b.pts, b.media_json, b.media_unread, b.reaction_unread, b.pinned, b.via_bot_id, b.grouped_id, b.effect, b.reply_markup_json, b.rich_message_json, b.peer_user_id, b.peer_access_hash, b.peer_phone, b.peer_first_name, b.peer_last_name, b.peer_username, b.peer_country_code, b.peer_verified, b.peer_support, b.peer_is_bot, b.peer_bot_info_version, b.peer_premium_until, b.peer_emoji_status_document_id, b.peer_emoji_status_until, b.peer_last_seen_at, b.from_user_user_id, b.from_user_access_hash, b.from_user_phone, b.from_user_first_name, b.from_user_last_name, b.from_user_username, b.from_user_country_code, b.from_user_verified, b.from_user_support, b.from_user_is_bot, b.from_user_bot_info_version, b.from_user_premium_until, b.from_user_emoji_status_document_id, b.from_user_emoji_status_until, b.from_user_last_seen_at
   FROM base b
   CROSS JOIN load_params p
   WHERE p.load_type = 'around'
@@ -1755,9 +2607,9 @@ around_backward AS (
   LIMIT GREATEST((SELECT limit_count + add_offset FROM load_params), 0)
 ),
 forward AS (
-  SELECT f.box_id, f.private_message_id, f.owner_user_id, f.peer_type, f.peer_id, f.from_user_id, f.message_date, f.edit_date, f.outgoing, f.body, f.entities_json, f.silent, f.noforwards, f.reply_to_msg_id, f.reply_to_peer_type, f.reply_to_peer_id, f.reply_to_top_id, f.quote_text, f.quote_entities_json, f.quote_offset, f.fwd_from_peer_type, f.fwd_from_peer_id, f.fwd_from_name, f.fwd_date, f.pts, f.media_json, f.media_unread, f.reaction_unread, f.peer_user_id, f.peer_access_hash, f.peer_phone, f.peer_first_name, f.peer_last_name, f.peer_username, f.peer_country_code, f.peer_verified, f.peer_support, f.peer_last_seen_at, f.from_user_user_id, f.from_user_access_hash, f.from_user_phone, f.from_user_first_name, f.from_user_last_name, f.from_user_username, f.from_user_country_code, f.from_user_verified, f.from_user_support, f.from_user_last_seen_at
+  SELECT f.box_id, f.private_message_id, f.owner_user_id, f.peer_type, f.peer_id, f.from_user_id, f.message_date, f.ttl_period, f.expires_at, f.edit_date, f.outgoing, f.body, f.entities_json, f.silent, f.noforwards, f.reply_to_msg_id, f.reply_to_peer_type, f.reply_to_peer_id, f.reply_to_top_id, f.reply_to_story_id, f.quote_text, f.quote_entities_json, f.quote_offset, f.fwd_from_peer_type, f.fwd_from_peer_id, f.fwd_from_name, f.fwd_date, f.fwd_saved_from_peer_type, f.fwd_saved_from_peer_id, f.fwd_saved_from_msg_id, f.saved_peer_type, f.saved_peer_id, f.pts, f.media_json, f.media_unread, f.reaction_unread, f.pinned, f.via_bot_id, f.grouped_id, f.effect, f.reply_markup_json, f.rich_message_json, f.peer_user_id, f.peer_access_hash, f.peer_phone, f.peer_first_name, f.peer_last_name, f.peer_username, f.peer_country_code, f.peer_verified, f.peer_support, f.peer_is_bot, f.peer_bot_info_version, f.peer_premium_until, f.peer_emoji_status_document_id, f.peer_emoji_status_until, f.peer_last_seen_at, f.from_user_user_id, f.from_user_access_hash, f.from_user_phone, f.from_user_first_name, f.from_user_last_name, f.from_user_username, f.from_user_country_code, f.from_user_verified, f.from_user_support, f.from_user_is_bot, f.from_user_bot_info_version, f.from_user_premium_until, f.from_user_emoji_status_document_id, f.from_user_emoji_status_until, f.from_user_last_seen_at
   FROM (
-    SELECT b.box_id, b.private_message_id, b.owner_user_id, b.peer_type, b.peer_id, b.from_user_id, b.message_date, b.edit_date, b.outgoing, b.body, b.entities_json, b.silent, b.noforwards, b.reply_to_msg_id, b.reply_to_peer_type, b.reply_to_peer_id, b.reply_to_top_id, b.quote_text, b.quote_entities_json, b.quote_offset, b.fwd_from_peer_type, b.fwd_from_peer_id, b.fwd_from_name, b.fwd_date, b.pts, b.media_json, b.media_unread, b.reaction_unread, b.peer_user_id, b.peer_access_hash, b.peer_phone, b.peer_first_name, b.peer_last_name, b.peer_username, b.peer_country_code, b.peer_verified, b.peer_support, b.peer_last_seen_at, b.from_user_user_id, b.from_user_access_hash, b.from_user_phone, b.from_user_first_name, b.from_user_last_name, b.from_user_username, b.from_user_country_code, b.from_user_verified, b.from_user_support, b.from_user_last_seen_at
+    SELECT b.box_id, b.private_message_id, b.owner_user_id, b.peer_type, b.peer_id, b.from_user_id, b.message_date, b.ttl_period, b.expires_at, b.edit_date, b.outgoing, b.body, b.entities_json, b.silent, b.noforwards, b.reply_to_msg_id, b.reply_to_peer_type, b.reply_to_peer_id, b.reply_to_top_id, b.reply_to_story_id, b.quote_text, b.quote_entities_json, b.quote_offset, b.fwd_from_peer_type, b.fwd_from_peer_id, b.fwd_from_name, b.fwd_date, b.fwd_saved_from_peer_type, b.fwd_saved_from_peer_id, b.fwd_saved_from_msg_id, b.saved_peer_type, b.saved_peer_id, b.pts, b.media_json, b.media_unread, b.reaction_unread, b.pinned, b.via_bot_id, b.grouped_id, b.effect, b.reply_markup_json, b.rich_message_json, b.peer_user_id, b.peer_access_hash, b.peer_phone, b.peer_first_name, b.peer_last_name, b.peer_username, b.peer_country_code, b.peer_verified, b.peer_support, b.peer_is_bot, b.peer_bot_info_version, b.peer_premium_until, b.peer_emoji_status_document_id, b.peer_emoji_status_until, b.peer_last_seen_at, b.from_user_user_id, b.from_user_access_hash, b.from_user_phone, b.from_user_first_name, b.from_user_last_name, b.from_user_username, b.from_user_country_code, b.from_user_verified, b.from_user_support, b.from_user_is_bot, b.from_user_bot_info_version, b.from_user_premium_until, b.from_user_emoji_status_document_id, b.from_user_emoji_status_until, b.from_user_last_seen_at
     FROM base b
     CROSS JOIN load_params p
     WHERE p.load_type = 'forward'
@@ -1770,13 +2622,13 @@ forward AS (
   ) f
 ),
 paged AS (
-  SELECT box_id, private_message_id, owner_user_id, peer_type, peer_id, from_user_id, message_date, edit_date, outgoing, body, entities_json, silent, noforwards, reply_to_msg_id, reply_to_peer_type, reply_to_peer_id, reply_to_top_id, quote_text, quote_entities_json, quote_offset, fwd_from_peer_type, fwd_from_peer_id, fwd_from_name, fwd_date, pts, media_json, media_unread, reaction_unread, peer_user_id, peer_access_hash, peer_phone, peer_first_name, peer_last_name, peer_username, peer_country_code, peer_verified, peer_support, peer_last_seen_at, from_user_user_id, from_user_access_hash, from_user_phone, from_user_first_name, from_user_last_name, from_user_username, from_user_country_code, from_user_verified, from_user_support, from_user_last_seen_at FROM backward
+  SELECT box_id, private_message_id, owner_user_id, peer_type, peer_id, from_user_id, message_date, ttl_period, expires_at, edit_date, outgoing, body, entities_json, silent, noforwards, reply_to_msg_id, reply_to_peer_type, reply_to_peer_id, reply_to_top_id, reply_to_story_id, quote_text, quote_entities_json, quote_offset, fwd_from_peer_type, fwd_from_peer_id, fwd_from_name, fwd_date, fwd_saved_from_peer_type, fwd_saved_from_peer_id, fwd_saved_from_msg_id, saved_peer_type, saved_peer_id, pts, media_json, media_unread, reaction_unread, pinned, via_bot_id, grouped_id, effect, reply_markup_json, rich_message_json, peer_user_id, peer_access_hash, peer_phone, peer_first_name, peer_last_name, peer_username, peer_country_code, peer_verified, peer_support, peer_is_bot, peer_bot_info_version, peer_premium_until, peer_emoji_status_document_id, peer_emoji_status_until, peer_last_seen_at, from_user_user_id, from_user_access_hash, from_user_phone, from_user_first_name, from_user_last_name, from_user_username, from_user_country_code, from_user_verified, from_user_support, from_user_is_bot, from_user_bot_info_version, from_user_premium_until, from_user_emoji_status_document_id, from_user_emoji_status_until, from_user_last_seen_at FROM backward
   UNION ALL
-  SELECT box_id, private_message_id, owner_user_id, peer_type, peer_id, from_user_id, message_date, edit_date, outgoing, body, entities_json, silent, noforwards, reply_to_msg_id, reply_to_peer_type, reply_to_peer_id, reply_to_top_id, quote_text, quote_entities_json, quote_offset, fwd_from_peer_type, fwd_from_peer_id, fwd_from_name, fwd_date, pts, media_json, media_unread, reaction_unread, peer_user_id, peer_access_hash, peer_phone, peer_first_name, peer_last_name, peer_username, peer_country_code, peer_verified, peer_support, peer_last_seen_at, from_user_user_id, from_user_access_hash, from_user_phone, from_user_first_name, from_user_last_name, from_user_username, from_user_country_code, from_user_verified, from_user_support, from_user_last_seen_at FROM around_forward
+  SELECT box_id, private_message_id, owner_user_id, peer_type, peer_id, from_user_id, message_date, ttl_period, expires_at, edit_date, outgoing, body, entities_json, silent, noforwards, reply_to_msg_id, reply_to_peer_type, reply_to_peer_id, reply_to_top_id, reply_to_story_id, quote_text, quote_entities_json, quote_offset, fwd_from_peer_type, fwd_from_peer_id, fwd_from_name, fwd_date, fwd_saved_from_peer_type, fwd_saved_from_peer_id, fwd_saved_from_msg_id, saved_peer_type, saved_peer_id, pts, media_json, media_unread, reaction_unread, pinned, via_bot_id, grouped_id, effect, reply_markup_json, rich_message_json, peer_user_id, peer_access_hash, peer_phone, peer_first_name, peer_last_name, peer_username, peer_country_code, peer_verified, peer_support, peer_is_bot, peer_bot_info_version, peer_premium_until, peer_emoji_status_document_id, peer_emoji_status_until, peer_last_seen_at, from_user_user_id, from_user_access_hash, from_user_phone, from_user_first_name, from_user_last_name, from_user_username, from_user_country_code, from_user_verified, from_user_support, from_user_is_bot, from_user_bot_info_version, from_user_premium_until, from_user_emoji_status_document_id, from_user_emoji_status_until, from_user_last_seen_at FROM around_forward
   UNION ALL
-  SELECT box_id, private_message_id, owner_user_id, peer_type, peer_id, from_user_id, message_date, edit_date, outgoing, body, entities_json, silent, noforwards, reply_to_msg_id, reply_to_peer_type, reply_to_peer_id, reply_to_top_id, quote_text, quote_entities_json, quote_offset, fwd_from_peer_type, fwd_from_peer_id, fwd_from_name, fwd_date, pts, media_json, media_unread, reaction_unread, peer_user_id, peer_access_hash, peer_phone, peer_first_name, peer_last_name, peer_username, peer_country_code, peer_verified, peer_support, peer_last_seen_at, from_user_user_id, from_user_access_hash, from_user_phone, from_user_first_name, from_user_last_name, from_user_username, from_user_country_code, from_user_verified, from_user_support, from_user_last_seen_at FROM around_backward
+  SELECT box_id, private_message_id, owner_user_id, peer_type, peer_id, from_user_id, message_date, ttl_period, expires_at, edit_date, outgoing, body, entities_json, silent, noforwards, reply_to_msg_id, reply_to_peer_type, reply_to_peer_id, reply_to_top_id, reply_to_story_id, quote_text, quote_entities_json, quote_offset, fwd_from_peer_type, fwd_from_peer_id, fwd_from_name, fwd_date, fwd_saved_from_peer_type, fwd_saved_from_peer_id, fwd_saved_from_msg_id, saved_peer_type, saved_peer_id, pts, media_json, media_unread, reaction_unread, pinned, via_bot_id, grouped_id, effect, reply_markup_json, rich_message_json, peer_user_id, peer_access_hash, peer_phone, peer_first_name, peer_last_name, peer_username, peer_country_code, peer_verified, peer_support, peer_is_bot, peer_bot_info_version, peer_premium_until, peer_emoji_status_document_id, peer_emoji_status_until, peer_last_seen_at, from_user_user_id, from_user_access_hash, from_user_phone, from_user_first_name, from_user_last_name, from_user_username, from_user_country_code, from_user_verified, from_user_support, from_user_is_bot, from_user_bot_info_version, from_user_premium_until, from_user_emoji_status_document_id, from_user_emoji_status_until, from_user_last_seen_at FROM around_backward
   UNION ALL
-  SELECT box_id, private_message_id, owner_user_id, peer_type, peer_id, from_user_id, message_date, edit_date, outgoing, body, entities_json, silent, noforwards, reply_to_msg_id, reply_to_peer_type, reply_to_peer_id, reply_to_top_id, quote_text, quote_entities_json, quote_offset, fwd_from_peer_type, fwd_from_peer_id, fwd_from_name, fwd_date, pts, media_json, media_unread, reaction_unread, peer_user_id, peer_access_hash, peer_phone, peer_first_name, peer_last_name, peer_username, peer_country_code, peer_verified, peer_support, peer_last_seen_at, from_user_user_id, from_user_access_hash, from_user_phone, from_user_first_name, from_user_last_name, from_user_username, from_user_country_code, from_user_verified, from_user_support, from_user_last_seen_at FROM forward
+  SELECT box_id, private_message_id, owner_user_id, peer_type, peer_id, from_user_id, message_date, ttl_period, expires_at, edit_date, outgoing, body, entities_json, silent, noforwards, reply_to_msg_id, reply_to_peer_type, reply_to_peer_id, reply_to_top_id, reply_to_story_id, quote_text, quote_entities_json, quote_offset, fwd_from_peer_type, fwd_from_peer_id, fwd_from_name, fwd_date, fwd_saved_from_peer_type, fwd_saved_from_peer_id, fwd_saved_from_msg_id, saved_peer_type, saved_peer_id, pts, media_json, media_unread, reaction_unread, pinned, via_bot_id, grouped_id, effect, reply_markup_json, rich_message_json, peer_user_id, peer_access_hash, peer_phone, peer_first_name, peer_last_name, peer_username, peer_country_code, peer_verified, peer_support, peer_is_bot, peer_bot_info_version, peer_premium_until, peer_emoji_status_document_id, peer_emoji_status_until, peer_last_seen_at, from_user_user_id, from_user_access_hash, from_user_phone, from_user_first_name, from_user_last_name, from_user_username, from_user_country_code, from_user_verified, from_user_support, from_user_is_bot, from_user_bot_info_version, from_user_premium_until, from_user_emoji_status_document_id, from_user_emoji_status_until, from_user_last_seen_at FROM forward
 )
 SELECT
   box_id,
@@ -1786,6 +2638,8 @@ SELECT
   peer_id,
   from_user_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   outgoing,
   body,
@@ -1796,6 +2650,7 @@ SELECT
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities_json,
   quote_offset,
@@ -1803,10 +2658,21 @@ SELECT
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
   pts,
   media_json,
   media_unread,
   reaction_unread,
+  pinned,
+  via_bot_id,
+  grouped_id,
+  effect,
+  reply_markup_json,
+  rich_message_json,
   peer_user_id,
   peer_access_hash,
   peer_phone,
@@ -1816,6 +2682,11 @@ SELECT
   peer_country_code,
   peer_verified,
   peer_support,
+  peer_is_bot,
+  peer_bot_info_version,
+  peer_premium_until,
+  peer_emoji_status_document_id,
+  peer_emoji_status_until,
   peer_last_seen_at,
   from_user_user_id,
   from_user_access_hash,
@@ -1826,6 +2697,11 @@ SELECT
   from_user_country_code,
   from_user_verified,
   from_user_support,
+  from_user_is_bot,
+  from_user_bot_info_version,
+  from_user_premium_until,
+  from_user_emoji_status_document_id,
+  from_user_emoji_status_until,
   from_user_last_seen_at,
   COALESCE(total.total_count, 0)::int AS total_count
 FROM paged
@@ -1845,59 +2721,87 @@ type ListMessagesByUserParams struct {
 	Query          string
 	MaxID          int32
 	MinID          int32
+	PinnedOnly     bool
+	MusicOnly      bool
+	SavedPeerType  string
+	SavedPeerID    int64
 	NeedTotalCount bool
 }
 
 type ListMessagesByUserRow struct {
-	BoxID               int32
-	PrivateMessageID    int64
-	OwnerUserID         int64
-	PeerType            string
-	PeerID              int64
-	FromUserID          int64
-	MessageDate         int32
-	EditDate            int32
-	Outgoing            bool
-	Body                string
-	EntitiesJson        string
-	Silent              bool
-	Noforwards          bool
-	ReplyToMsgID        int32
-	ReplyToPeerType     string
-	ReplyToPeerID       int64
-	ReplyToTopID        int32
-	QuoteText           string
-	QuoteEntitiesJson   string
-	QuoteOffset         int32
-	FwdFromPeerType     string
-	FwdFromPeerID       int64
-	FwdFromName         string
-	FwdDate             int32
-	Pts                 int32
-	MediaJson           string
-	MediaUnread         bool
-	ReactionUnread      bool
-	PeerUserID          int64
-	PeerAccessHash      int64
-	PeerPhone           string
-	PeerFirstName       string
-	PeerLastName        string
-	PeerUsername        string
-	PeerCountryCode     string
-	PeerVerified        bool
-	PeerSupport         bool
-	PeerLastSeenAt      int64
-	FromUserUserID      int64
-	FromUserAccessHash  int64
-	FromUserPhone       string
-	FromUserFirstName   string
-	FromUserLastName    string
-	FromUserUsername    string
-	FromUserCountryCode string
-	FromUserVerified    bool
-	FromUserSupport     bool
-	FromUserLastSeenAt  int64
-	TotalCount          int32
+	BoxID                         int32
+	PrivateMessageID              int64
+	OwnerUserID                   int64
+	PeerType                      string
+	PeerID                        int64
+	FromUserID                    int64
+	MessageDate                   int32
+	TtlPeriod                     int32
+	ExpiresAt                     int32
+	EditDate                      int32
+	Outgoing                      bool
+	Body                          string
+	EntitiesJson                  string
+	Silent                        bool
+	Noforwards                    bool
+	ReplyToMsgID                  int32
+	ReplyToPeerType               string
+	ReplyToPeerID                 int64
+	ReplyToTopID                  int32
+	ReplyToStoryID                int32
+	QuoteText                     string
+	QuoteEntitiesJson             string
+	QuoteOffset                   int32
+	FwdFromPeerType               string
+	FwdFromPeerID                 int64
+	FwdFromName                   string
+	FwdDate                       int32
+	FwdSavedFromPeerType          string
+	FwdSavedFromPeerID            int64
+	FwdSavedFromMsgID             int32
+	SavedPeerType                 string
+	SavedPeerID                   int64
+	Pts                           int32
+	MediaJson                     string
+	MediaUnread                   bool
+	ReactionUnread                bool
+	Pinned                        bool
+	ViaBotID                      int64
+	GroupedID                     int64
+	Effect                        int64
+	ReplyMarkupJson               string
+	RichMessageJson               string
+	PeerUserID                    int64
+	PeerAccessHash                int64
+	PeerPhone                     string
+	PeerFirstName                 string
+	PeerLastName                  string
+	PeerUsername                  string
+	PeerCountryCode               string
+	PeerVerified                  bool
+	PeerSupport                   bool
+	PeerIsBot                     bool
+	PeerBotInfoVersion            int32
+	PeerPremiumUntil              int64
+	PeerEmojiStatusDocumentID     int64
+	PeerEmojiStatusUntil          int64
+	PeerLastSeenAt                int64
+	FromUserUserID                int64
+	FromUserAccessHash            int64
+	FromUserPhone                 string
+	FromUserFirstName             string
+	FromUserLastName              string
+	FromUserUsername              string
+	FromUserCountryCode           string
+	FromUserVerified              bool
+	FromUserSupport               bool
+	FromUserIsBot                 bool
+	FromUserBotInfoVersion        int32
+	FromUserPremiumUntil          int64
+	FromUserEmojiStatusDocumentID int64
+	FromUserEmojiStatusUntil      int64
+	FromUserLastSeenAt            int64
+	TotalCount                    int32
 }
 
 func (q *Queries) ListMessagesByUser(ctx context.Context, arg ListMessagesByUserParams) ([]ListMessagesByUserRow, error) {
@@ -1913,6 +2817,10 @@ func (q *Queries) ListMessagesByUser(ctx context.Context, arg ListMessagesByUser
 		arg.Query,
 		arg.MaxID,
 		arg.MinID,
+		arg.PinnedOnly,
+		arg.MusicOnly,
+		arg.SavedPeerType,
+		arg.SavedPeerID,
 		arg.NeedTotalCount,
 	)
 	if err != nil {
@@ -1930,6 +2838,8 @@ func (q *Queries) ListMessagesByUser(ctx context.Context, arg ListMessagesByUser
 			&i.PeerID,
 			&i.FromUserID,
 			&i.MessageDate,
+			&i.TtlPeriod,
+			&i.ExpiresAt,
 			&i.EditDate,
 			&i.Outgoing,
 			&i.Body,
@@ -1940,6 +2850,7 @@ func (q *Queries) ListMessagesByUser(ctx context.Context, arg ListMessagesByUser
 			&i.ReplyToPeerType,
 			&i.ReplyToPeerID,
 			&i.ReplyToTopID,
+			&i.ReplyToStoryID,
 			&i.QuoteText,
 			&i.QuoteEntitiesJson,
 			&i.QuoteOffset,
@@ -1947,10 +2858,21 @@ func (q *Queries) ListMessagesByUser(ctx context.Context, arg ListMessagesByUser
 			&i.FwdFromPeerID,
 			&i.FwdFromName,
 			&i.FwdDate,
+			&i.FwdSavedFromPeerType,
+			&i.FwdSavedFromPeerID,
+			&i.FwdSavedFromMsgID,
+			&i.SavedPeerType,
+			&i.SavedPeerID,
 			&i.Pts,
 			&i.MediaJson,
 			&i.MediaUnread,
 			&i.ReactionUnread,
+			&i.Pinned,
+			&i.ViaBotID,
+			&i.GroupedID,
+			&i.Effect,
+			&i.ReplyMarkupJson,
+			&i.RichMessageJson,
 			&i.PeerUserID,
 			&i.PeerAccessHash,
 			&i.PeerPhone,
@@ -1960,6 +2882,11 @@ func (q *Queries) ListMessagesByUser(ctx context.Context, arg ListMessagesByUser
 			&i.PeerCountryCode,
 			&i.PeerVerified,
 			&i.PeerSupport,
+			&i.PeerIsBot,
+			&i.PeerBotInfoVersion,
+			&i.PeerPremiumUntil,
+			&i.PeerEmojiStatusDocumentID,
+			&i.PeerEmojiStatusUntil,
 			&i.PeerLastSeenAt,
 			&i.FromUserUserID,
 			&i.FromUserAccessHash,
@@ -1970,8 +2897,187 @@ func (q *Queries) ListMessagesByUser(ctx context.Context, arg ListMessagesByUser
 			&i.FromUserCountryCode,
 			&i.FromUserVerified,
 			&i.FromUserSupport,
+			&i.FromUserIsBot,
+			&i.FromUserBotInfoVersion,
+			&i.FromUserPremiumUntil,
+			&i.FromUserEmojiStatusDocumentID,
+			&i.FromUserEmojiStatusUntil,
 			&i.FromUserLastSeenAt,
 			&i.TotalCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUnreadReactionMessageBoxes = `-- name: ListUnreadReactionMessageBoxes :many
+SELECT
+  box_id,
+  private_message_id,
+  owner_user_id,
+  peer_type,
+  peer_id,
+  from_user_id,
+  message_date,
+  ttl_period,
+  expires_at,
+  edit_date,
+  outgoing,
+  body,
+  entities::text AS entities_json,
+  silent,
+  noforwards,
+  reply_to_msg_id,
+  reply_to_peer_type,
+  reply_to_peer_id,
+  reply_to_top_id,
+  reply_to_story_id,
+  quote_text,
+  quote_entities::text AS quote_entities_json,
+  quote_offset,
+  fwd_from_peer_type,
+  fwd_from_peer_id,
+  fwd_from_name,
+  fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
+  pts,
+  media::text AS media_json,
+  media_unread,
+  reaction_unread,
+  pinned,
+  via_bot_id,
+  grouped_id,
+  effect,
+  reply_markup::text AS reply_markup_json,
+  rich_message::text AS rich_message_json
+FROM message_boxes
+WHERE owner_user_id = $1
+  AND peer_type = $2
+  AND peer_id = $3
+  AND NOT deleted
+  AND reaction_unread
+ORDER BY box_id DESC
+LIMIT $4
+`
+
+type ListUnreadReactionMessageBoxesParams struct {
+	OwnerUserID int64
+	PeerType    string
+	PeerID      int64
+	PageLimit   int32
+}
+
+type ListUnreadReactionMessageBoxesRow struct {
+	BoxID                int32
+	PrivateMessageID     int64
+	OwnerUserID          int64
+	PeerType             string
+	PeerID               int64
+	FromUserID           int64
+	MessageDate          int32
+	TtlPeriod            int32
+	ExpiresAt            int32
+	EditDate             int32
+	Outgoing             bool
+	Body                 string
+	EntitiesJson         string
+	Silent               bool
+	Noforwards           bool
+	ReplyToMsgID         int32
+	ReplyToPeerType      string
+	ReplyToPeerID        int64
+	ReplyToTopID         int32
+	ReplyToStoryID       int32
+	QuoteText            string
+	QuoteEntitiesJson    string
+	QuoteOffset          int32
+	FwdFromPeerType      string
+	FwdFromPeerID        int64
+	FwdFromName          string
+	FwdDate              int32
+	FwdSavedFromPeerType string
+	FwdSavedFromPeerID   int64
+	FwdSavedFromMsgID    int32
+	SavedPeerType        string
+	SavedPeerID          int64
+	Pts                  int32
+	MediaJson            string
+	MediaUnread          bool
+	ReactionUnread       bool
+	Pinned               bool
+	ViaBotID             int64
+	GroupedID            int64
+	Effect               int64
+	ReplyMarkupJson      string
+	RichMessageJson      string
+}
+
+func (q *Queries) ListUnreadReactionMessageBoxes(ctx context.Context, arg ListUnreadReactionMessageBoxesParams) ([]ListUnreadReactionMessageBoxesRow, error) {
+	rows, err := q.db.Query(ctx, listUnreadReactionMessageBoxes,
+		arg.OwnerUserID,
+		arg.PeerType,
+		arg.PeerID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListUnreadReactionMessageBoxesRow
+	for rows.Next() {
+		var i ListUnreadReactionMessageBoxesRow
+		if err := rows.Scan(
+			&i.BoxID,
+			&i.PrivateMessageID,
+			&i.OwnerUserID,
+			&i.PeerType,
+			&i.PeerID,
+			&i.FromUserID,
+			&i.MessageDate,
+			&i.TtlPeriod,
+			&i.ExpiresAt,
+			&i.EditDate,
+			&i.Outgoing,
+			&i.Body,
+			&i.EntitiesJson,
+			&i.Silent,
+			&i.Noforwards,
+			&i.ReplyToMsgID,
+			&i.ReplyToPeerType,
+			&i.ReplyToPeerID,
+			&i.ReplyToTopID,
+			&i.ReplyToStoryID,
+			&i.QuoteText,
+			&i.QuoteEntitiesJson,
+			&i.QuoteOffset,
+			&i.FwdFromPeerType,
+			&i.FwdFromPeerID,
+			&i.FwdFromName,
+			&i.FwdDate,
+			&i.FwdSavedFromPeerType,
+			&i.FwdSavedFromPeerID,
+			&i.FwdSavedFromMsgID,
+			&i.SavedPeerType,
+			&i.SavedPeerID,
+			&i.Pts,
+			&i.MediaJson,
+			&i.MediaUnread,
+			&i.ReactionUnread,
+			&i.Pinned,
+			&i.ViaBotID,
+			&i.GroupedID,
+			&i.Effect,
+			&i.ReplyMarkupJson,
+			&i.RichMessageJson,
 		); err != nil {
 			return nil, err
 		}
@@ -1993,6 +3099,8 @@ SELECT
   peer_id,
   from_user_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   outgoing,
   body,
@@ -2003,6 +3111,7 @@ SELECT
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities::text AS quote_entities_json,
   quote_offset,
@@ -2010,57 +3119,84 @@ SELECT
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
   pts,
   media::text AS media_json,
   media_unread,
-  reaction_unread
+  reaction_unread,
+  pinned,
+  via_bot_id,
+  grouped_id,
+  effect,
+  reply_markup::text AS reply_markup_json,
+  rich_message::text AS rich_message_json
 FROM message_boxes
-WHERE message_sender_id = $1::bigint
-  AND private_message_id = $2::bigint
+WHERE owner_user_id = ANY($1::bigint[])
+  AND message_sender_id = $2::bigint
+  AND private_message_id = $3::bigint
   AND NOT deleted
 ORDER BY owner_user_id ASC, box_id ASC
 FOR UPDATE
 `
 
 type ListVisibleMessageBoxesByPrivateMessageParams struct {
+	OwnerUserIds     []int64
 	MessageSenderID  int64
 	PrivateMessageID int64
 }
 
 type ListVisibleMessageBoxesByPrivateMessageRow struct {
-	BoxID             int32
-	PrivateMessageID  int64
-	OwnerUserID       int64
-	MessageSenderID   int64
-	PeerType          string
-	PeerID            int64
-	FromUserID        int64
-	MessageDate       int32
-	EditDate          int32
-	Outgoing          bool
-	Body              string
-	EntitiesJson      string
-	Silent            bool
-	Noforwards        bool
-	ReplyToMsgID      int32
-	ReplyToPeerType   string
-	ReplyToPeerID     int64
-	ReplyToTopID      int32
-	QuoteText         string
-	QuoteEntitiesJson string
-	QuoteOffset       int32
-	FwdFromPeerType   string
-	FwdFromPeerID     int64
-	FwdFromName       string
-	FwdDate           int32
-	Pts               int32
-	MediaJson         string
-	MediaUnread       bool
-	ReactionUnread    bool
+	BoxID                int32
+	PrivateMessageID     int64
+	OwnerUserID          int64
+	MessageSenderID      int64
+	PeerType             string
+	PeerID               int64
+	FromUserID           int64
+	MessageDate          int32
+	TtlPeriod            int32
+	ExpiresAt            int32
+	EditDate             int32
+	Outgoing             bool
+	Body                 string
+	EntitiesJson         string
+	Silent               bool
+	Noforwards           bool
+	ReplyToMsgID         int32
+	ReplyToPeerType      string
+	ReplyToPeerID        int64
+	ReplyToTopID         int32
+	ReplyToStoryID       int32
+	QuoteText            string
+	QuoteEntitiesJson    string
+	QuoteOffset          int32
+	FwdFromPeerType      string
+	FwdFromPeerID        int64
+	FwdFromName          string
+	FwdDate              int32
+	FwdSavedFromPeerType string
+	FwdSavedFromPeerID   int64
+	FwdSavedFromMsgID    int32
+	SavedPeerType        string
+	SavedPeerID          int64
+	Pts                  int32
+	MediaJson            string
+	MediaUnread          bool
+	ReactionUnread       bool
+	Pinned               bool
+	ViaBotID             int64
+	GroupedID            int64
+	Effect               int64
+	ReplyMarkupJson      string
+	RichMessageJson      string
 }
 
 func (q *Queries) ListVisibleMessageBoxesByPrivateMessage(ctx context.Context, arg ListVisibleMessageBoxesByPrivateMessageParams) ([]ListVisibleMessageBoxesByPrivateMessageRow, error) {
-	rows, err := q.db.Query(ctx, listVisibleMessageBoxesByPrivateMessage, arg.MessageSenderID, arg.PrivateMessageID)
+	rows, err := q.db.Query(ctx, listVisibleMessageBoxesByPrivateMessage, arg.OwnerUserIds, arg.MessageSenderID, arg.PrivateMessageID)
 	if err != nil {
 		return nil, err
 	}
@@ -2077,6 +3213,8 @@ func (q *Queries) ListVisibleMessageBoxesByPrivateMessage(ctx context.Context, a
 			&i.PeerID,
 			&i.FromUserID,
 			&i.MessageDate,
+			&i.TtlPeriod,
+			&i.ExpiresAt,
 			&i.EditDate,
 			&i.Outgoing,
 			&i.Body,
@@ -2087,6 +3225,7 @@ func (q *Queries) ListVisibleMessageBoxesByPrivateMessage(ctx context.Context, a
 			&i.ReplyToPeerType,
 			&i.ReplyToPeerID,
 			&i.ReplyToTopID,
+			&i.ReplyToStoryID,
 			&i.QuoteText,
 			&i.QuoteEntitiesJson,
 			&i.QuoteOffset,
@@ -2094,10 +3233,21 @@ func (q *Queries) ListVisibleMessageBoxesByPrivateMessage(ctx context.Context, a
 			&i.FwdFromPeerID,
 			&i.FwdFromName,
 			&i.FwdDate,
+			&i.FwdSavedFromPeerType,
+			&i.FwdSavedFromPeerID,
+			&i.FwdSavedFromMsgID,
+			&i.SavedPeerType,
+			&i.SavedPeerID,
 			&i.Pts,
 			&i.MediaJson,
 			&i.MediaUnread,
 			&i.ReactionUnread,
+			&i.Pinned,
+			&i.ViaBotID,
+			&i.GroupedID,
+			&i.Effect,
+			&i.ReplyMarkupJson,
+			&i.RichMessageJson,
 		); err != nil {
 			return nil, err
 		}
@@ -2120,6 +3270,29 @@ func (q *Queries) MaxMessageBoxID(ctx context.Context, ownerUserID int64) (int32
 	var max_box_id int32
 	err := row.Scan(&max_box_id)
 	return max_box_id, err
+}
+
+const setMessageBoxPinned = `-- name: SetMessageBoxPinned :execrows
+UPDATE message_boxes
+SET pinned = $1::boolean
+WHERE owner_user_id = $2::bigint
+  AND box_id = $3::int
+  AND NOT deleted
+  AND pinned <> $1::boolean
+`
+
+type SetMessageBoxPinnedParams struct {
+	Pinned      bool
+	OwnerUserID int64
+	BoxID       int32
+}
+
+func (q *Queries) SetMessageBoxPinned(ctx context.Context, arg SetMessageBoxPinnedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setMessageBoxPinned, arg.Pinned, arg.OwnerUserID, arg.BoxID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const topVisibleMessageBoxByPeer = `-- name: TopVisibleMessageBoxByPeer :one
@@ -2153,6 +3326,112 @@ func (q *Queries) TopVisibleMessageBoxByPeer(ctx context.Context, arg TopVisible
 	return i, err
 }
 
+const unpinAllMessageBoxesByPeer = `-- name: UnpinAllMessageBoxesByPeer :many
+WITH target AS (
+  SELECT m.owner_user_id, m.box_id
+  FROM message_boxes m
+  WHERE m.owner_user_id = $1::bigint
+    AND m.peer_type = $2::text
+    AND m.peer_id = $3::bigint
+    AND m.pinned
+    AND NOT m.deleted
+  ORDER BY m.box_id DESC
+  LIMIT $4::int
+  FOR UPDATE
+)
+UPDATE message_boxes m
+SET pinned = false
+FROM target t
+WHERE m.owner_user_id = t.owner_user_id
+  AND m.box_id = t.box_id
+RETURNING m.box_id, m.private_message_id, m.message_sender_id
+`
+
+type UnpinAllMessageBoxesByPeerParams struct {
+	OwnerUserID int64
+	PeerType    string
+	PeerID      int64
+	LimitCount  int32
+}
+
+type UnpinAllMessageBoxesByPeerRow struct {
+	BoxID            int32
+	PrivateMessageID int64
+	MessageSenderID  int64
+}
+
+// 按批清除（affectedHistory.offset 续清语义），单条 updatePinnedMessages
+// 的 messages 向量随之有界。
+func (q *Queries) UnpinAllMessageBoxesByPeer(ctx context.Context, arg UnpinAllMessageBoxesByPeerParams) ([]UnpinAllMessageBoxesByPeerRow, error) {
+	rows, err := q.db.Query(ctx, unpinAllMessageBoxesByPeer,
+		arg.OwnerUserID,
+		arg.PeerType,
+		arg.PeerID,
+		arg.LimitCount,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []UnpinAllMessageBoxesByPeerRow
+	for rows.Next() {
+		var i UnpinAllMessageBoxesByPeerRow
+		if err := rows.Scan(&i.BoxID, &i.PrivateMessageID, &i.MessageSenderID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const unpinMessageBoxesByPrivateMessages = `-- name: UnpinMessageBoxesByPrivateMessages :many
+WITH requested AS (
+  SELECT
+    ($2::bigint[])[i] AS message_sender_id,
+    ($3::bigint[])[i] AS private_message_id
+  FROM generate_subscripts($3::bigint[], 1) AS g(i)
+  WHERE i <= cardinality($2::bigint[])
+)
+UPDATE message_boxes m
+SET pinned = false
+FROM requested r
+WHERE m.owner_user_id = $1::bigint
+  AND m.message_sender_id = r.message_sender_id
+  AND m.private_message_id = r.private_message_id
+  AND m.pinned
+  AND NOT m.deleted
+RETURNING m.box_id
+`
+
+type UnpinMessageBoxesByPrivateMessagesParams struct {
+	OwnerUserID       int64
+	MessageSenderIds  []int64
+	PrivateMessageIds []int64
+}
+
+func (q *Queries) UnpinMessageBoxesByPrivateMessages(ctx context.Context, arg UnpinMessageBoxesByPrivateMessagesParams) ([]int32, error) {
+	rows, err := q.db.Query(ctx, unpinMessageBoxesByPrivateMessages, arg.OwnerUserID, arg.MessageSenderIds, arg.PrivateMessageIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []int32
+	for rows.Next() {
+		var box_id int32
+		if err := rows.Scan(&box_id); err != nil {
+			return nil, err
+		}
+		items = append(items, box_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const updateDialogReadInbox = `-- name: UpdateDialogReadInbox :one
 UPDATE dialogs d
 SET
@@ -2169,7 +3448,6 @@ SET
   ),
   unread_mark = false,
   unread_mentions_count = 0,
-  unread_reactions_count = 0,
   updated_at = now()
 WHERE d.user_id = $2::bigint
   AND d.peer_type = $3::text
@@ -2239,9 +3517,13 @@ UPDATE message_boxes
 SET body = $1::text,
     entities = $2::jsonb,
     edit_date = $3::int,
-    pts = $4::int
-WHERE owner_user_id = $5::bigint
-  AND box_id = $6::int
+    pts = $4::int,
+    reply_markup = CASE
+      WHEN $5::boolean THEN $6::jsonb
+      ELSE reply_markup
+    END
+WHERE owner_user_id = $7::bigint
+  AND box_id = $8::int
   AND NOT deleted
 RETURNING
   box_id,
@@ -2252,6 +3534,8 @@ RETURNING
   peer_id,
   from_user_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   outgoing,
   body,
@@ -2262,6 +3546,7 @@ RETURNING
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities::text AS quote_entities_json,
   quote_offset,
@@ -2269,51 +3554,78 @@ RETURNING
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
   pts,
   media::text AS media_json,
   media_unread,
-  reaction_unread
+  reaction_unread,
+  pinned,
+  via_bot_id,
+  grouped_id,
+  effect,
+  reply_markup::text AS reply_markup_json,
+  rich_message::text AS rich_message_json
 `
 
 type UpdateMessageBoxEditParams struct {
-	Body         string
-	EntitiesJson []byte
-	EditDate     int32
-	Pts          int32
-	OwnerUserID  int64
-	BoxID        int32
+	Body            string
+	EntitiesJson    []byte
+	EditDate        int32
+	Pts             int32
+	SetReplyMarkup  bool
+	ReplyMarkupJson []byte
+	OwnerUserID     int64
+	BoxID           int32
 }
 
 type UpdateMessageBoxEditRow struct {
-	BoxID             int32
-	PrivateMessageID  int64
-	OwnerUserID       int64
-	MessageSenderID   int64
-	PeerType          string
-	PeerID            int64
-	FromUserID        int64
-	MessageDate       int32
-	EditDate          int32
-	Outgoing          bool
-	Body              string
-	EntitiesJson      string
-	Silent            bool
-	Noforwards        bool
-	ReplyToMsgID      int32
-	ReplyToPeerType   string
-	ReplyToPeerID     int64
-	ReplyToTopID      int32
-	QuoteText         string
-	QuoteEntitiesJson string
-	QuoteOffset       int32
-	FwdFromPeerType   string
-	FwdFromPeerID     int64
-	FwdFromName       string
-	FwdDate           int32
-	Pts               int32
-	MediaJson         string
-	MediaUnread       bool
-	ReactionUnread    bool
+	BoxID                int32
+	PrivateMessageID     int64
+	OwnerUserID          int64
+	MessageSenderID      int64
+	PeerType             string
+	PeerID               int64
+	FromUserID           int64
+	MessageDate          int32
+	TtlPeriod            int32
+	ExpiresAt            int32
+	EditDate             int32
+	Outgoing             bool
+	Body                 string
+	EntitiesJson         string
+	Silent               bool
+	Noforwards           bool
+	ReplyToMsgID         int32
+	ReplyToPeerType      string
+	ReplyToPeerID        int64
+	ReplyToTopID         int32
+	ReplyToStoryID       int32
+	QuoteText            string
+	QuoteEntitiesJson    string
+	QuoteOffset          int32
+	FwdFromPeerType      string
+	FwdFromPeerID        int64
+	FwdFromName          string
+	FwdDate              int32
+	FwdSavedFromPeerType string
+	FwdSavedFromPeerID   int64
+	FwdSavedFromMsgID    int32
+	SavedPeerType        string
+	SavedPeerID          int64
+	Pts                  int32
+	MediaJson            string
+	MediaUnread          bool
+	ReactionUnread       bool
+	Pinned               bool
+	ViaBotID             int64
+	GroupedID            int64
+	Effect               int64
+	ReplyMarkupJson      string
+	RichMessageJson      string
 }
 
 func (q *Queries) UpdateMessageBoxEdit(ctx context.Context, arg UpdateMessageBoxEditParams) (UpdateMessageBoxEditRow, error) {
@@ -2322,6 +3634,8 @@ func (q *Queries) UpdateMessageBoxEdit(ctx context.Context, arg UpdateMessageBox
 		arg.EntitiesJson,
 		arg.EditDate,
 		arg.Pts,
+		arg.SetReplyMarkup,
+		arg.ReplyMarkupJson,
 		arg.OwnerUserID,
 		arg.BoxID,
 	)
@@ -2335,6 +3649,8 @@ func (q *Queries) UpdateMessageBoxEdit(ctx context.Context, arg UpdateMessageBox
 		&i.PeerID,
 		&i.FromUserID,
 		&i.MessageDate,
+		&i.TtlPeriod,
+		&i.ExpiresAt,
 		&i.EditDate,
 		&i.Outgoing,
 		&i.Body,
@@ -2345,6 +3661,7 @@ func (q *Queries) UpdateMessageBoxEdit(ctx context.Context, arg UpdateMessageBox
 		&i.ReplyToPeerType,
 		&i.ReplyToPeerID,
 		&i.ReplyToTopID,
+		&i.ReplyToStoryID,
 		&i.QuoteText,
 		&i.QuoteEntitiesJson,
 		&i.QuoteOffset,
@@ -2352,10 +3669,21 @@ func (q *Queries) UpdateMessageBoxEdit(ctx context.Context, arg UpdateMessageBox
 		&i.FwdFromPeerID,
 		&i.FwdFromName,
 		&i.FwdDate,
+		&i.FwdSavedFromPeerType,
+		&i.FwdSavedFromPeerID,
+		&i.FwdSavedFromMsgID,
+		&i.SavedPeerType,
+		&i.SavedPeerID,
 		&i.Pts,
 		&i.MediaJson,
 		&i.MediaUnread,
 		&i.ReactionUnread,
+		&i.Pinned,
+		&i.ViaBotID,
+		&i.GroupedID,
+		&i.Effect,
+		&i.ReplyMarkupJson,
+		&i.RichMessageJson,
 	)
 	return i, err
 }
@@ -2364,15 +3692,21 @@ const updatePrivateMessageEdit = `-- name: UpdatePrivateMessageEdit :exec
 UPDATE private_messages
 SET body = $1::text,
     entities = $2::jsonb,
-    edit_date = $3::int
-WHERE sender_user_id = $4::bigint
-  AND id = $5::bigint
+    edit_date = $3::int,
+    reply_markup = CASE
+      WHEN $4::boolean THEN $5::jsonb
+      ELSE reply_markup
+    END
+WHERE sender_user_id = $6::bigint
+  AND id = $7::bigint
 `
 
 type UpdatePrivateMessageEditParams struct {
 	Body             string
 	EntitiesJson     []byte
 	EditDate         int32
+	SetReplyMarkup   bool
+	ReplyMarkupJson  []byte
 	SenderUserID     int64
 	PrivateMessageID int64
 }
@@ -2382,6 +3716,8 @@ func (q *Queries) UpdatePrivateMessageEdit(ctx context.Context, arg UpdatePrivat
 		arg.Body,
 		arg.EntitiesJson,
 		arg.EditDate,
+		arg.SetReplyMarkup,
+		arg.ReplyMarkupJson,
 		arg.SenderUserID,
 		arg.PrivateMessageID,
 	)

@@ -1,31 +1,85 @@
 -- upload_parts ----------------------------------------------------------------
 
 -- name: SaveUploadPart :exec
-INSERT INTO upload_parts (owner_user_id, file_id, part, total_parts, is_big, bytes)
+INSERT INTO upload_parts (owner_user_id, file_id, part, total_parts, is_big, backend, object_key, size, sha256)
 VALUES (
   sqlc.arg(owner_user_id)::bigint,
   sqlc.arg(file_id)::bigint,
   sqlc.arg(part)::int,
   sqlc.arg(total_parts)::int,
   sqlc.arg(is_big)::boolean,
-  sqlc.arg(bytes)::bytea
+  sqlc.arg(backend)::text,
+  sqlc.arg(object_key)::text,
+  sqlc.arg(size)::bigint,
+  sqlc.arg(sha256)::bytea
 )
 ON CONFLICT (owner_user_id, file_id, part) DO UPDATE SET
   total_parts = EXCLUDED.total_parts,
   is_big = EXCLUDED.is_big,
-  bytes = EXCLUDED.bytes;
+  backend = EXCLUDED.backend,
+  object_key = EXCLUDED.object_key,
+  size = EXCLUDED.size,
+  sha256 = EXCLUDED.sha256,
+  created_at = now();
+
+-- name: GetUploadPartUsage :one
+SELECT
+  COALESCE(SUM(size), 0)::bigint AS bytes,
+  COUNT(*)::int AS parts,
+  COUNT(DISTINCT file_id)::int AS files
+FROM upload_parts
+WHERE owner_user_id = sqlc.arg(owner_user_id)::bigint;
+
+-- name: GetUploadPartSlot :one
+SELECT
+  COALESCE((
+    SELECT size
+    FROM upload_parts
+    WHERE owner_user_id = sqlc.arg(owner_user_id)::bigint
+      AND file_id = sqlc.arg(file_id)::bigint
+      AND part = sqlc.arg(part)::int
+  ), -1)::bigint AS existing_bytes,
+  COALESCE((
+    SELECT object_key
+    FROM upload_parts
+    WHERE owner_user_id = sqlc.arg(owner_user_id)::bigint
+      AND file_id = sqlc.arg(file_id)::bigint
+      AND part = sqlc.arg(part)::int
+  ), '')::text AS object_key,
+  (
+    SELECT COUNT(*)::int
+    FROM upload_parts
+    WHERE owner_user_id = sqlc.arg(owner_user_id)::bigint
+      AND file_id = sqlc.arg(file_id)::bigint
+  )::int AS file_parts;
 
 -- name: ListUploadParts :many
-SELECT part, total_parts, is_big, bytes
+SELECT part, total_parts, is_big, backend, object_key, size, sha256
 FROM upload_parts
 WHERE owner_user_id = sqlc.arg(owner_user_id)::bigint
   AND file_id = sqlc.arg(file_id)::bigint
 ORDER BY part ASC;
 
--- name: DeleteUploadParts :exec
+-- name: DeleteUploadParts :many
 DELETE FROM upload_parts
 WHERE owner_user_id = sqlc.arg(owner_user_id)::bigint
-  AND file_id = sqlc.arg(file_id)::bigint;
+  AND file_id = sqlc.arg(file_id)::bigint
+RETURNING object_key;
+
+-- name: DeleteExpiredUploadParts :many
+WITH doomed AS (
+  SELECT owner_user_id, file_id, part
+  FROM upload_parts
+  WHERE created_at < sqlc.arg(before)::timestamptz
+  ORDER BY created_at ASC
+  LIMIT sqlc.arg(batch_limit)::int
+)
+DELETE FROM upload_parts p
+USING doomed d
+WHERE p.owner_user_id = d.owner_user_id
+  AND p.file_id = d.file_id
+  AND p.part = d.part
+RETURNING p.object_key;
 
 -- file_blobs ------------------------------------------------------------------
 

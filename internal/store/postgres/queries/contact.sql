@@ -2,6 +2,7 @@
 SELECT
   c.contact_user_id,
   c.mutual,
+  c.close_friend,
   c.contact_phone,
   c.contact_first_name,
   c.contact_last_name,
@@ -16,6 +17,11 @@ SELECT
   u.country_code,
   u.verified,
   u.support,
+  u.is_bot,
+  u.bot_info_version,
+  u.premium_expires_at,
+  u.emoji_status_document_id,
+  u.emoji_status_until,
   u.last_seen_at
 FROM contacts c
 JOIN users u ON u.id = c.contact_user_id
@@ -26,6 +32,7 @@ ORDER BY c.contact_first_name, c.contact_last_name, u.first_name, u.last_name, u
 SELECT
   c.contact_user_id,
   c.mutual,
+  c.close_friend,
   c.contact_phone,
   c.contact_first_name,
   c.contact_last_name,
@@ -40,6 +47,11 @@ SELECT
   u.country_code,
   u.verified,
   u.support,
+  u.is_bot,
+  u.bot_info_version,
+  u.premium_expires_at,
+  u.emoji_status_document_id,
+  u.emoji_status_until,
   u.last_seen_at
 FROM contacts c
 JOIN users u ON u.id = c.contact_user_id
@@ -98,6 +110,7 @@ reverse_updated AS (
 SELECT
   c.contact_user_id,
   c.mutual,
+  c.close_friend,
   c.contact_phone,
   c.contact_first_name,
   c.contact_last_name,
@@ -112,6 +125,11 @@ SELECT
   u.country_code,
   u.verified,
   u.support,
+  u.is_bot,
+  u.bot_info_version,
+  u.premium_expires_at,
+  u.emoji_status_document_id,
+  u.emoji_status_until,
   u.last_seen_at,
   EXISTS (SELECT 1 FROM reverse_updated)::boolean AS reverse_mutual_changed
 FROM upserted c
@@ -130,6 +148,7 @@ WITH updated AS (
 SELECT
   c.contact_user_id,
   c.mutual,
+  c.close_friend,
   c.contact_phone,
   c.contact_first_name,
   c.contact_last_name,
@@ -144,6 +163,11 @@ SELECT
   u.country_code,
   u.verified,
   u.support,
+  u.is_bot,
+  u.bot_info_version,
+  u.premium_expires_at,
+  u.emoji_status_document_id,
+  u.emoji_status_until,
   u.last_seen_at
 FROM updated c
 JOIN users u ON u.id = c.contact_user_id;

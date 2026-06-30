@@ -14,4 +14,6 @@ type AuthorizationStore interface {
 	Delete(ctx context.Context, authKeyID [8]byte) error
 	DeleteByHash(ctx context.Context, userID, hash int64) (domain.Authorization, bool, error)
 	DeleteByUserExcept(ctx context.Context, userID int64, keepAuthKeyID [8]byte) ([]domain.Authorization, error)
+	// MarkPasswordPassed 清除 auth_key 的 password_pending 标记，使其转为完全授权（两步验证通过后调用）。
+	MarkPasswordPassed(ctx context.Context, authKeyID [8]byte) error
 }

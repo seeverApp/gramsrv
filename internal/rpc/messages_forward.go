@@ -1,0 +1,425 @@
+package rpc
+
+import (
+	"context"
+	"errors"
+	"strings"
+
+	"github.com/gotd/td/tg"
+
+	"telesrv/internal/domain"
+)
+
+func (r *Router) onMessagesForwardMessages(ctx context.Context, req *tg.MessagesForwardMessagesRequest) (tg.UpdatesClass, error) {
+	if len(req.ID) == 0 || len(req.ID) != len(req.RandomID) {
+		return nil, inputRequestInvalidErr()
+	}
+	if len(req.ID) > domain.MaxForwardMessageIDs {
+		return nil, limitInvalidErr()
+	}
+	if req.ScheduleRepeatPeriod != 0 {
+		return nil, scheduleDateInvalidErr()
+	}
+	if err := forwardMessagesUnsupportedOptionErr(req); err != nil {
+		return nil, err
+	}
+	topMsgID, topMsgIDSet := req.GetTopMsgID()
+	if !topMsgIDSet && req.TopMsgID != 0 {
+		topMsgID, topMsgIDSet = req.TopMsgID, true
+	}
+	if topMsgIDSet && (topMsgID < 0 || topMsgID > domain.MaxMessageBoxID) {
+		return nil, replyMessageIDInvalidErr()
+	}
+	userID, _, err := r.currentUserID(ctx)
+	if err != nil {
+		return nil, internalErr()
+	}
+	if userID == 0 {
+		return nil, peerIDInvalidErr()
+	}
+	fromPeer, err := r.checkedDomainPeerFromInputPeer(ctx, userID, req.FromPeer)
+	if err != nil {
+		return nil, err
+	}
+	toPeer, err := r.checkedDomainPeerFromInputPeer(ctx, userID, req.ToPeer)
+	if err != nil {
+		return nil, err
+	}
+	sendAs, err := r.resolveSendAsPeer(ctx, userID, toPeer, req.SendAs)
+	if err != nil {
+		return nil, err
+	}
+	replyTo, err := r.messageReplyFromInput(ctx, userID, toPeer, req.ReplyTo)
+	if err != nil {
+		return nil, err
+	}
+	replyTo, err = mergeForwardTopMsgID(toPeer, replyTo, topMsgID, topMsgIDSet)
+	if err != nil {
+		return nil, err
+	}
+	if r.deps.Users != nil {
+		for _, peer := range []domain.Peer{fromPeer, toPeer} {
+			if peer.Type != domain.PeerTypeUser || peer.ID == userID {
+				continue
+			}
+			if _, found, err := r.deps.Users.ByID(ctx, userID, peer.ID); err != nil {
+				return nil, internalErr()
+			} else if !found {
+				return nil, peerIDInvalidErr()
+			}
+		}
+	}
+	for i, id := range req.ID {
+		if id <= 0 || id > domain.MaxMessageBoxID || req.RandomID[i] == 0 {
+			return nil, messageIDInvalidErr()
+		}
+	}
+	if err := r.checkSendRateLimit(ctx, userID, len(req.ID)); err != nil {
+		return nil, err
+	}
+	if req.ScheduleDate != 0 && !scheduleDateIsImmediate(req.ScheduleDate, int(r.clock.Now().Unix())) {
+		return r.scheduleForwardMessages(ctx, userID, fromPeer, toPeer, req, replyTo, sendAs)
+	}
+	if toPeer.Type == domain.PeerTypeChannel {
+		if r.deps.Channels == nil {
+			return nil, peerIDInvalidErr()
+		}
+		sources, err := r.forwardSources(ctx, userID, fromPeer, req.ID)
+		if err != nil {
+			return nil, messageForwardErr(err)
+		}
+		recipients := make([]int64, 0)
+		results := make([]domain.SendChannelMessageResult, 0, len(sources))
+		extraUserIDs := make([]int64, 0, len(sources))
+		for i, source := range sources {
+			forward := source.forward
+			if req.DropAuthor {
+				forward = nil
+			}
+			mentionUserIDs := r.mentionUserIDsFromDomain(ctx, userID, source.body, source.entities)
+			res, err := r.deps.Channels.SendMessage(ctx, userID, domain.SendChannelMessageRequest{
+				UserID:         userID,
+				ChannelID:      toPeer.ID,
+				RandomID:       req.RandomID[i],
+				Message:        source.body,
+				Entities:       source.entities,
+				Media:          source.media,
+				MentionUserIDs: mentionUserIDs,
+				Silent:         req.Silent,
+				NoForwards:     req.Noforwards,
+				ReplyTo:        replyTo,
+				Forward:        forward,
+				SendAs:         sendAs,
+				Date:           int(r.clock.Now().Unix()),
+			})
+			if err != nil {
+				return nil, channelInvalidErr(err)
+			}
+			results = append(results, res)
+			// 收件人是该频道的活跃成员集，对本次转发的每条源都相同；只取一次，
+			// 避免一次转发 ≤100 条到 N 成员大群时把 recipients 累积成 ~100×N 条目
+			// 的巨大临时切片（N=10^5 时约千万级）。
+			if len(recipients) == 0 {
+				recipients = res.Recipients
+			}
+			if sourceUserID := source.userID(); sourceUserID != 0 {
+				extraUserIDs = append(extraUserIDs, sourceUserID)
+			}
+		}
+		// echo 与 fan-out 用各自独立 cache（RPC vs worker goroutine 防竞态）。多条转发汇成
+		// 一个 fan-out job（channelMessagesUpdatesWithPeerCache 内含多条 UpdateNewChannelMessage），
+		// 由同 channel 分片 FIFO 原子投递。
+		echoCache := newViewerPeerCache(r)
+		updates := r.channelMessagesUpdatesWithPeerCache(ctx, userID, results, req.RandomID, true, extraUserIDs, echoCache)
+		fanoutPts := 0
+		if n := len(results); n > 0 {
+			fanoutPts = results[n-1].Event.Pts
+		}
+		r.enqueueChannelMessagesFanout(ctx, userID, toPeer.ID, fanoutPts, recipients, results, extraUserIDs)
+		for _, res := range results {
+			r.pushChannelDiscussionUpdate(ctx, userID, res.Discussion)
+		}
+		return updates, nil
+	}
+	if toPeer.Type == domain.PeerTypeUser {
+		if r.deps.Messages == nil {
+			return nil, peerIDInvalidErr()
+		}
+		recipientBlocked, err := r.peerBlocksUser(ctx, userID, toPeer.ID)
+		if err != nil {
+			return nil, err
+		}
+		// 私聊源与频道源统一经 forwardSources 取源：首次生成的 forward header 在
+		// forwardSources 内已按原作者 PrivacyKeyForwards 降级（不允许链接回账号时仅保
+		// 留 from_name），避免私聊→私聊路径泄漏原作者可点击账号；media 也随 source 透传。
+		sources, err := r.forwardSources(ctx, userID, fromPeer, req.ID)
+		if err != nil {
+			return nil, messageForwardErr(err)
+		}
+		sessionID, _ := SessionIDFrom(ctx)
+		authKeyID, _ := AuthKeyIDFrom(ctx)
+		res := domain.ForwardPrivateMessagesResult{OwnerUserID: userID}
+		for i, source := range sources {
+			forward := source.forward
+			if req.DropAuthor {
+				forward = nil
+			}
+			if forward != nil && toPeer.ID == userID {
+				saved := *forward
+				saved.SavedFrom = fromPeer
+				saved.SavedFromMsgID = req.ID[i]
+				forward = &saved
+			}
+			sent, err := r.deps.Messages.SendPrivateText(ctx, userID, domain.SendPrivateTextRequest{
+				SenderUserID:     userID,
+				RecipientUserID:  toPeer.ID,
+				RandomID:         req.RandomID[i],
+				Message:          source.body,
+				Entities:         source.entities,
+				Media:            source.media,
+				Silent:           req.Silent,
+				NoForwards:       req.Noforwards,
+				ReplyTo:          replyTo,
+				Forward:          forward,
+				Date:             int(r.clock.Now().Unix()),
+				OriginAuthKeyID:  authKeyID,
+				OriginSessionID:  sessionID,
+				RecipientBlocked: recipientBlocked,
+			})
+			if err != nil {
+				return nil, messageForwardErr(err)
+			}
+			res.SenderMessages = append(res.SenderMessages, sent.SenderMessage)
+			res.RecipientMessages = append(res.RecipientMessages, sent.RecipientMessage)
+			res.SenderEvents = append(res.SenderEvents, sent.SenderEvent)
+			res.RecipientEvents = append(res.RecipientEvents, sent.RecipientEvent)
+			res.Duplicates = append(res.Duplicates, sent.Duplicate)
+		}
+		return tgForwardMessagesUpdates(res, req.RandomID, r.usersForMessageUpdates(ctx, userID, res.SenderMessages), r.chatsForMessageUpdates(ctx, userID, res.SenderMessages)), nil
+	}
+	return nil, peerIDInvalidErr()
+}
+
+func mergeForwardTopMsgID(toPeer domain.Peer, replyTo *domain.MessageReply, topMsgID int, topMsgIDSet bool) (*domain.MessageReply, error) {
+	if !topMsgIDSet || topMsgID == 0 {
+		return replyTo, nil
+	}
+	if topMsgID < 0 || topMsgID > domain.MaxMessageBoxID || toPeer.Type != domain.PeerTypeChannel {
+		return nil, replyMessageIDInvalidErr()
+	}
+	if replyTo == nil {
+		return &domain.MessageReply{
+			Peer:         toPeer,
+			TopMessageID: topMsgID,
+			ForumTopic:   true,
+		}, nil
+	}
+	if replyTo.Peer.ID != 0 && replyTo.Peer != toPeer {
+		return nil, replyMessageIDInvalidErr()
+	}
+	if replyTo.TopMessageID != 0 && replyTo.TopMessageID != topMsgID {
+		return nil, replyMessageIDInvalidErr()
+	}
+	merged := *replyTo
+	merged.Peer = toPeer
+	merged.TopMessageID = topMsgID
+	merged.QuoteEntities = append([]domain.MessageEntity(nil), replyTo.QuoteEntities...)
+	if merged.MessageID == 0 {
+		merged.ForumTopic = true
+	}
+	return &merged, nil
+}
+
+func (r *Router) forwardSources(ctx context.Context, userID int64, fromPeer domain.Peer, ids []int) ([]forwardSource, error) {
+	out := make([]forwardSource, 0, len(ids))
+	switch fromPeer.Type {
+	case domain.PeerTypeUser:
+		if r.deps.Messages == nil {
+			return nil, domain.ErrMessageIDInvalid
+		}
+		list, err := r.deps.Messages.GetMessages(ctx, userID, ids)
+		if err != nil {
+			return nil, domain.ErrMessageIDInvalid
+		}
+		byID := make(map[int]domain.Message, len(list.Messages))
+		for _, msg := range list.Messages {
+			byID[msg.ID] = msg
+		}
+		for _, id := range ids {
+			msg, ok := byID[id]
+			if !ok {
+				return nil, domain.ErrMessageIDInvalid
+			}
+			if msg.Peer != fromPeer {
+				return nil, domain.ErrMessageIDInvalid
+			}
+			if msg.NoForwards {
+				return nil, domain.ErrChatForwardsRestricted
+			}
+			forward := cloneDomainMessageForward(msg.Forward)
+			if forward == nil {
+				forward = &domain.MessageForward{From: msg.From, Date: msg.Date}
+				r.applyForwardAuthorPrivacy(ctx, userID, forward)
+			}
+			out = append(out, forwardSource{
+				body: msg.Body,
+				entities: append([]domain.MessageEntity(nil),
+					msg.Entities...),
+				media:   msg.Media,
+				forward: forward,
+				from:    msg.From,
+				date:    msg.Date,
+			})
+		}
+	case domain.PeerTypeChannel:
+		if r.deps.Channels == nil {
+			return nil, domain.ErrMessageIDInvalid
+		}
+		history, err := r.deps.Channels.GetMessages(ctx, userID, fromPeer.ID, ids)
+		if err != nil {
+			return nil, domain.ErrMessageIDInvalid
+		}
+		byID := make(map[int]domain.ChannelMessage, len(history.Messages))
+		for _, msg := range history.Messages {
+			byID[msg.ID] = msg
+		}
+		for _, id := range ids {
+			msg, ok := byID[id]
+			if !ok {
+				return nil, domain.ErrMessageIDInvalid
+			}
+			if msg.NoForwards || history.Channel.NoForwards {
+				return nil, domain.ErrChatForwardsRestricted
+			}
+			if msg.Action != nil || (msg.Body == "" && msg.Media.IsZero()) {
+				return nil, domain.ErrMessageIDInvalid
+			}
+			forward := cloneDomainMessageForward(msg.Forward)
+			from := msg.From
+			if from.ID == 0 && msg.SenderUserID != 0 {
+				from = domain.Peer{Type: domain.PeerTypeUser, ID: msg.SenderUserID}
+			}
+			if msg.Post {
+				from = domain.Peer{Type: domain.PeerTypeChannel, ID: msg.ChannelID}
+			}
+			if forward == nil {
+				forward = &domain.MessageForward{From: from, Date: msg.Date}
+				if from.Type == domain.PeerTypeChannel {
+					forward.ChannelPost = msg.ID
+				}
+				r.applyForwardAuthorPrivacy(ctx, userID, forward)
+			}
+			out = append(out, forwardSource{
+				body: msg.Body,
+				entities: append([]domain.MessageEntity(nil),
+					msg.Entities...),
+				media:   msg.Media,
+				forward: forward,
+				from:    from,
+				date:    msg.Date,
+			})
+		}
+	default:
+		return nil, domain.ErrMessageIDInvalid
+	}
+	return out, nil
+}
+
+func cloneDomainMessageForward(in *domain.MessageForward) *domain.MessageForward {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+func (r *Router) forwardAuthorDisplayName(ctx context.Context, viewerUserID, authorUserID int64) string {
+	name := ""
+	if r.deps.Users != nil {
+		if author, found, err := r.deps.Users.ByID(ctx, viewerUserID, authorUserID); err == nil && found {
+			name = strings.TrimSpace(strings.TrimSpace(author.FirstName) + " " + strings.TrimSpace(author.LastName))
+		}
+	}
+	if name == "" {
+		name = "Deleted Account"
+	}
+	return name
+}
+
+// applyForwardAuthorPrivacy 在首次生成 forward header 时按原作者的
+// forwards 隐私规则降级：不允许链接回账号时只保留展示名 from_name。
+// 已有 header 的再转发沿用原 header，不重新评估。
+func (r *Router) applyForwardAuthorPrivacy(ctx context.Context, forwarderUserID int64, forward *domain.MessageForward) {
+	if forward == nil || forward.From.Type != domain.PeerTypeUser || forward.From.ID == 0 || forward.FromName != "" {
+		return
+	}
+	if forward.From.ID == forwarderUserID || r.deps.Privacy == nil {
+		return
+	}
+	allowed, err := r.deps.Privacy.CanSee(ctx, forward.From.ID, forwarderUserID, domain.PrivacyKeyForwards)
+	if err != nil || allowed {
+		return
+	}
+	name := r.forwardAuthorDisplayName(ctx, forwarderUserID, forward.From.ID)
+	forward.From = domain.Peer{}
+	forward.FromName = name
+}
+
+func messageForwardErr(err error) error {
+	switch {
+	case errors.Is(err, domain.ErrMessageIDInvalid):
+		return messageIDInvalidErr()
+	case errors.Is(err, domain.ErrChatForwardsRestricted):
+		return chatForwardsRestrictedErr()
+	case errors.Is(err, domain.ErrReplyMessageIDInvalid):
+		return replyMessageIDInvalidErr()
+	default:
+		return internalErr()
+	}
+}
+
+func tgForwardMessagesUpdates(res domain.ForwardPrivateMessagesResult, randomIDs []int64, users []tg.UserClass, chats []tg.ChatClass) *tg.Updates {
+	updates := make([]tg.UpdateClass, 0, len(res.SenderMessages)*2)
+	date := 0
+	for i, msg := range res.SenderMessages {
+		randomID := int64(0)
+		if i < len(randomIDs) {
+			randomID = randomIDs[i]
+		}
+		updates = append(updates, &tg.UpdateMessageID{ID: msg.ID, RandomID: randomID})
+		event := domain.UpdateEvent{}
+		if i < len(res.SenderEvents) {
+			event = res.SenderEvents[i]
+		}
+		item := tgMessage(msg)
+		if item == nil {
+			item = &tg.MessageEmpty{ID: msg.ID}
+		}
+		pts := event.Pts
+		if pts == 0 {
+			pts = msg.Pts
+		}
+		ptsCount := event.PtsCount
+		if ptsCount == 0 {
+			ptsCount = 1
+		}
+		updates = append(updates, &tg.UpdateNewMessage{
+			Message:  item,
+			Pts:      pts,
+			PtsCount: ptsCount,
+		})
+		if date == 0 {
+			date = event.Date
+		}
+		if date == 0 {
+			date = msg.Date
+		}
+	}
+	return &tg.Updates{
+		Updates: updates,
+		Users:   users,
+		Chats:   chats,
+		Date:    date,
+		Seq:     0,
+	}
+}

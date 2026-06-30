@@ -12,6 +12,16 @@ type DispatchOutboxRetentionStore interface {
 	DeleteFailed(ctx context.Context, olderThan time.Duration, limit int) (int, error)
 }
 
+// TempAuthKeyRetentionStore 回收过期的 PFS temp auth key 绑定。
+type TempAuthKeyRetentionStore interface {
+	DeleteExpired(ctx context.Context, expiredBefore int64, limit int) (int, error)
+}
+
+// tempAuthKeyExpiryGrace 是 temp key 过期后的回收宽限：ResolveAuthKey 对
+// 「已过期但 perm 已授权」的绑定是容忍的，立即删除会突然断掉这批宽限中的
+// 连接；回收目标是清堆积，晚一天无妨。
+const tempAuthKeyExpiryGrace = 24 * time.Hour
+
 // RetentionWorker 周期性回收存储中的死数据。
 //
 // 注意：本 worker 刻意不清理 user_update_events —— pts log 永久保留。原因：TDesktop 不支持
@@ -22,13 +32,14 @@ type DispatchOutboxRetentionStore interface {
 // 长期膨胀作为已知 todo。
 type RetentionWorker struct {
 	outbox    DispatchOutboxRetentionStore
+	tempKeys  TempAuthKeyRetentionStore // 可为 nil（不回收 temp key 绑定）
 	logger    *zap.Logger
 	retention time.Duration
 	interval  time.Duration
 	batch     int
 }
 
-func NewRetentionWorker(outbox DispatchOutboxRetentionStore, logger *zap.Logger, retention, interval time.Duration, batch int) *RetentionWorker {
+func NewRetentionWorker(outbox DispatchOutboxRetentionStore, tempKeys TempAuthKeyRetentionStore, logger *zap.Logger, retention, interval time.Duration, batch int) *RetentionWorker {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -43,6 +54,7 @@ func NewRetentionWorker(outbox DispatchOutboxRetentionStore, logger *zap.Logger,
 	}
 	return &RetentionWorker{
 		outbox:    outbox,
+		tempKeys:  tempKeys,
 		logger:    logger,
 		retention: retention,
 		interval:  interval,
@@ -70,5 +82,14 @@ func (w *RetentionWorker) runOnce(ctx context.Context) {
 		w.logger.Warn("清理 failed dispatch_outbox 失败", zap.Error(err))
 	} else if outboxDeleted > 0 {
 		w.logger.Info("清理 failed dispatch_outbox 完成", zap.Int("deleted", outboxDeleted))
+	}
+	if w.tempKeys != nil {
+		expiredBefore := time.Now().Add(-tempAuthKeyExpiryGrace).Unix()
+		tempDeleted, err := w.tempKeys.DeleteExpired(ctx, expiredBefore, w.batch)
+		if err != nil {
+			w.logger.Warn("回收过期 temp auth key 绑定失败", zap.Error(err))
+		} else if tempDeleted > 0 {
+			w.logger.Info("回收过期 temp auth key 绑定完成", zap.Int("deleted", tempDeleted))
+		}
 	}
 }

@@ -1,4 +1,0 @@
--- No-op by design.
---
--- Fresh databases own this column from 0022; this migration only repairs older
--- developer databases that had already applied an earlier 0022 draft.

@@ -1,1 +1,0 @@
-DROP INDEX IF EXISTS channel_message_reactions_unread_owner_idx;

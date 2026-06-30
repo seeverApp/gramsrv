@@ -9,6 +9,29 @@ import (
 	"context"
 )
 
+const deleteExpiredTempAuthKeys = `-- name: DeleteExpiredTempAuthKeys :execrows
+DELETE FROM auth_keys
+WHERE auth_key_id IN (
+  SELECT temp_auth_key_id
+  FROM temp_auth_key_bindings
+  WHERE expires_at < $1
+  LIMIT $2
+)
+`
+
+type DeleteExpiredTempAuthKeysParams struct {
+	ExpiresAt int32
+	Limit     int32
+}
+
+func (q *Queries) DeleteExpiredTempAuthKeys(ctx context.Context, arg DeleteExpiredTempAuthKeysParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteExpiredTempAuthKeys, arg.ExpiresAt, arg.Limit)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getTempAuthKeyBinding = `-- name: GetTempAuthKeyBinding :one
 SELECT
   temp_auth_key_id,

@@ -93,11 +93,21 @@ func (s *HelpStore) UpsertCountries(ctx context.Context, countries []domain.Coun
 			return fmt.Errorf("upsert country %q: %w", country.ISO2, err)
 		}
 		for j, code := range country.CountryCodes {
+			// prefixes/patterns 列 NOT NULL:无前缀/格式的国家(如 AD)catalog 里为 nil,
+			// 须规整为空数组,否则 pgx 写 NULL 触发 23502。
+			prefixes := code.Prefixes
+			if prefixes == nil {
+				prefixes = []string{}
+			}
+			patterns := code.Patterns
+			if patterns == nil {
+				patterns = []string{}
+			}
 			if err := s.q.UpsertCountryCode(ctx, sqlcgen.UpsertCountryCodeParams{
 				Iso2:        country.ISO2,
 				CountryCode: code.CountryCode,
-				Prefixes:    code.Prefixes,
-				Patterns:    code.Patterns,
+				Prefixes:    prefixes,
+				Patterns:    patterns,
 				OrderIndex:  int32(j + 1),
 			}); err != nil {
 				return fmt.Errorf("upsert country code %q/%q: %w", country.ISO2, code.CountryCode, err)

@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"reflect"
@@ -8,6 +9,74 @@ import (
 
 	"telesrv/internal/domain"
 )
+
+func TestChannelCreateCreatesPermanentInviteAndHasLink(t *testing.T) {
+	ctx := context.Background()
+	store := NewChannelStore()
+	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
+		CreatorUserID: 1,
+		Title:         "private group with main link",
+		Megagroup:     true,
+		Date:          1_700_000_090,
+	})
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if !created.Channel.HasLink {
+		t.Fatalf("created channel HasLink = false, want true")
+	}
+	view, err := store.GetChannel(ctx, 1, created.Channel.ID)
+	if err != nil {
+		t.Fatalf("get channel: %v", err)
+	}
+	if !view.Channel.HasLink {
+		t.Fatalf("stored channel HasLink = false, want true")
+	}
+	if view.ExportedInvite == nil || !view.ExportedInvite.Permanent || view.ExportedInvite.Revoked || view.ExportedInvite.AdminUserID != 1 {
+		t.Fatalf("owner view exported invite = %+v, want creator permanent main link", view.ExportedInvite)
+	}
+	invites, err := store.ListExportedInvites(ctx, domain.ChannelInviteListRequest{
+		UserID:      1,
+		ChannelID:   created.Channel.ID,
+		AdminUserID: 1,
+		Limit:       10,
+	})
+	if err != nil {
+		t.Fatalf("list exported invites: %v", err)
+	}
+	if invites.Count != 1 || len(invites.Invites) != 1 || !invites.Invites[0].Permanent || invites.Invites[0].Revoked {
+		t.Fatalf("invites = %+v, want one active permanent main link", invites)
+	}
+}
+
+func TestChannelViewExportedInviteIsAdminOnly(t *testing.T) {
+	ctx := context.Background()
+	store := NewChannelStore()
+	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
+		CreatorUserID: 1,
+		Title:         "private group with regular member",
+		Megagroup:     true,
+		MemberUserIDs: []int64{2},
+		Date:          1_700_000_091,
+	})
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	ownerView, err := store.GetChannel(ctx, 1, created.Channel.ID)
+	if err != nil {
+		t.Fatalf("get owner channel: %v", err)
+	}
+	if ownerView.ExportedInvite == nil || !ownerView.ExportedInvite.Permanent {
+		t.Fatalf("owner exported invite = %+v, want permanent main link", ownerView.ExportedInvite)
+	}
+	memberView, err := store.GetChannel(ctx, 2, created.Channel.ID)
+	if err != nil {
+		t.Fatalf("get member channel: %v", err)
+	}
+	if memberView.ExportedInvite != nil {
+		t.Fatalf("member exported invite = %+v, want nil", memberView.ExportedInvite)
+	}
+}
 
 func TestChannelRealtimeRecipientsAreCapped(t *testing.T) {
 	store := NewChannelStore()
@@ -36,6 +105,71 @@ func TestChannelRealtimeRecipientsAreCapped(t *testing.T) {
 	}
 	if got := len(recipients); got != domain.MaxChannelRealtimeFanout {
 		t.Fatalf("listed active members = %d, want capped %d", got, domain.MaxChannelRealtimeFanout)
+	}
+}
+
+func TestChannelCreatorLeaveTransfersOwner(t *testing.T) {
+	ctx := context.Background()
+	store := NewChannelStore()
+	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
+		CreatorUserID: 1,
+		Title:         "creator transfer",
+		Megagroup:     true,
+		MemberUserIDs: []int64{2, 3},
+		Date:          1_700_000_110,
+	})
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if _, err := store.EditChannelAdmin(ctx, domain.EditChannelAdminRequest{
+		UserID:    1,
+		ChannelID: created.Channel.ID,
+		MemberID:  3,
+		AdminRights: domain.ChannelAdminRights{
+			ChangeInfo: true,
+			AddAdmins:  true,
+		},
+		Date: 1_700_000_111,
+	}); err != nil {
+		t.Fatalf("promote admin: %v", err)
+	}
+	future, err := store.FutureCreatorAfterLeave(ctx, created.Channel.ID, 1)
+	if err != nil {
+		t.Fatalf("future creator: %v", err)
+	}
+	if future.UserID != 3 {
+		t.Fatalf("future creator = %+v, want admin user 3", future)
+	}
+	left, err := store.LeaveChannel(ctx, created.Channel.ID, 1, 1_700_000_112)
+	if err != nil {
+		t.Fatalf("creator leave: %v", err)
+	}
+	if left.Channel.CreatorUserID != 3 || left.Channel.ParticipantsCount != 2 || left.Channel.AdminsCount != 1 {
+		t.Fatalf("channel after creator leave = %+v, want owner=3 participants=2 admins=1", left.Channel)
+	}
+	newOwner, err := store.GetParticipant(ctx, 3, created.Channel.ID, 3)
+	if err != nil {
+		t.Fatalf("get new owner: %v", err)
+	}
+	if newOwner.Role != domain.ChannelRoleCreator || newOwner.Status != domain.ChannelMemberActive {
+		t.Fatalf("new owner = %+v, want active creator", newOwner)
+	}
+	oldOwner, err := store.GetParticipant(ctx, 3, created.Channel.ID, 1)
+	if err != nil {
+		t.Fatalf("get old owner: %v", err)
+	}
+	if oldOwner.Status != domain.ChannelMemberLeft || oldOwner.Role == domain.ChannelRoleCreator {
+		t.Fatalf("old owner = %+v, want left non-creator", oldOwner)
+	}
+	if _, err := store.JoinChannel(ctx, created.Channel.ID, 1, 1_700_000_113); err != nil {
+		t.Fatalf("old owner rejoin: %v", err)
+	}
+	rejoined, err := store.GetParticipant(ctx, 3, created.Channel.ID, 1)
+	if err != nil {
+		t.Fatalf("get rejoined old owner: %v", err)
+	}
+	if rejoined.Role != domain.ChannelRoleMember || rejoined.Status != domain.ChannelMemberActive || rejoined.Rank != "" {
+		t.Fatalf("rejoined old owner = %+v, want active plain member", rejoined)
 	}
 }
 
@@ -71,7 +205,24 @@ func TestChannelAdminAndBanDoNotAdvanceChannelPts(t *testing.T) {
 		t.Fatalf("edit admin pts = event(%d,%d) channel %d, want unchanged %d", promoted.Event.Pts, promoted.Event.PtsCount, promoted.Channel.Pts, ptsFloor)
 	}
 
-	banned, err := store.EditChannelBanned(ctx, domain.EditChannelBannedRequest{
+	muted, err := store.EditChannelBanned(ctx, domain.EditChannelBannedRequest{
+		UserID:      1,
+		ChannelID:   channelID,
+		Participant: domain.Peer{Type: domain.PeerTypeUser, ID: 2},
+		BannedRights: domain.ChannelBannedRights{
+			SendMessages: true,
+			UntilDate:    1_700_001_121,
+		},
+		Date: 1_700_000_122,
+	})
+	if err != nil {
+		t.Fatalf("edit banned mute: %v", err)
+	}
+	if muted.Event.Pts != 0 || muted.Event.PtsCount != 0 || muted.Channel.Pts != ptsFloor || muted.ServiceEvent.Pts != 0 {
+		t.Fatalf("mute pts = event(%d,%d) channel %d, want unchanged %d without service message", muted.Event.Pts, muted.Event.PtsCount, muted.Channel.Pts, ptsFloor)
+	}
+
+	kicked, err := store.EditChannelBanned(ctx, domain.EditChannelBannedRequest{
 		UserID:      1,
 		ChannelID:   channelID,
 		Participant: domain.Peer{Type: domain.PeerTypeUser, ID: 2},
@@ -79,13 +230,21 @@ func TestChannelAdminAndBanDoNotAdvanceChannelPts(t *testing.T) {
 			ViewMessages: true,
 			UntilDate:    1_700_001_121,
 		},
-		Date: 1_700_000_122,
+		Date: 1_700_000_123,
 	})
 	if err != nil {
-		t.Fatalf("edit banned: %v", err)
+		t.Fatalf("edit banned kick: %v", err)
 	}
-	if banned.Event.Pts != 0 || banned.Event.PtsCount != 0 || banned.Channel.Pts != ptsFloor {
-		t.Fatalf("edit banned pts = event(%d,%d) channel %d, want unchanged %d", banned.Event.Pts, banned.Event.PtsCount, banned.Channel.Pts, ptsFloor)
+	// megagroup 踢人产生可见 "X removed Y" 服务消息并占 channel pts；
+	// participant update 本身仍不占 pts。
+	if kicked.Event.Pts != 0 || kicked.Event.PtsCount != 0 {
+		t.Fatalf("kick participant event = (%d,%d), must stay transient", kicked.Event.Pts, kicked.Event.PtsCount)
+	}
+	if kicked.ServiceEvent.Pts != ptsFloor+1 || kicked.Message.Action == nil || kicked.Message.Action.Type != domain.ChannelActionChatDelete {
+		t.Fatalf("kick service = event %+v message %+v, want ChatDelete service message at pts %d", kicked.ServiceEvent, kicked.Message, ptsFloor+1)
+	}
+	if kicked.Channel.Pts != ptsFloor+1 {
+		t.Fatalf("kick channel pts = %d, want %d", kicked.Channel.Pts, ptsFloor+1)
 	}
 
 	diff, err := store.ListChannelDifference(ctx, domain.ChannelDifferenceRequest{
@@ -97,8 +256,145 @@ func TestChannelAdminAndBanDoNotAdvanceChannelPts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list difference: %v", err)
 	}
-	if len(diff.Events) != 0 || diff.Pts != ptsFloor {
-		t.Fatalf("difference after participant state change = %+v, want no durable events at pts %d", diff, ptsFloor)
+	if len(diff.Events) != 1 || diff.Pts != ptsFloor+1 {
+		t.Fatalf("difference after kick = %+v, want only the kick service message at pts %d", diff, ptsFloor+1)
+	}
+}
+
+func TestChannelStoreGetMessagesNonMemberPublicPreview(t *testing.T) {
+	ctx := context.Background()
+	store := NewChannelStore()
+	const owner, outsider int64 = 1, 99
+
+	// 公开广播频道：非成员可读取消息（查看他人资料里的公开「个人频道」时，DrKLO 经
+	// channels.getMessages 拉最新一帖依赖此；否则资料页个人频道整块不显示）。
+	pub, err := store.CreateChannel(ctx, domain.CreateChannelRequest{CreatorUserID: owner, Title: "public", Broadcast: true, Date: 1_700_000_000})
+	if err != nil {
+		t.Fatalf("create public: %v", err)
+	}
+	if _, err := store.UpdateUsername(ctx, domain.UpdateChannelUsernameRequest{UserID: owner, ChannelID: pub.Channel.ID, Username: "pub_preview_mem"}); err != nil {
+		t.Fatalf("make public: %v", err)
+	}
+	sent, err := store.SendChannelMessage(ctx, domain.SendChannelMessageRequest{UserID: owner, ChannelID: pub.Channel.ID, RandomID: 111, Message: "hello", Date: 1_700_000_001})
+	if err != nil {
+		t.Fatalf("send public: %v", err)
+	}
+	got, err := store.GetChannelMessages(ctx, outsider, pub.Channel.ID, []int{sent.Message.ID})
+	if err != nil {
+		t.Fatalf("non-member getMessages on public channel: %v", err)
+	}
+	if len(got.Messages) != 1 || got.Messages[0].ID != sent.Message.ID {
+		t.Fatalf("non-member should read public channel message, got %+v", got.Messages)
+	}
+
+	// 私有广播频道（无 username）：非成员仍被拒（ErrChannelPrivate）。
+	priv, err := store.CreateChannel(ctx, domain.CreateChannelRequest{CreatorUserID: owner, Title: "private", Broadcast: true, Date: 1_700_000_002})
+	if err != nil {
+		t.Fatalf("create private: %v", err)
+	}
+	privSent, err := store.SendChannelMessage(ctx, domain.SendChannelMessageRequest{UserID: owner, ChannelID: priv.Channel.ID, RandomID: 222, Message: "secret", Date: 1_700_000_003})
+	if err != nil {
+		t.Fatalf("send private: %v", err)
+	}
+	if _, err := store.GetChannelMessages(ctx, outsider, priv.Channel.ID, []int{privSent.Message.ID}); !errors.Is(err, domain.ErrChannelPrivate) {
+		t.Fatalf("non-member getMessages on private channel = %v, want ErrChannelPrivate", err)
+	}
+}
+
+func TestChannelStoreStoryMessageForwardsPublicOnlyAndDeleteRollback(t *testing.T) {
+	ctx := context.Background()
+	store := NewChannelStore()
+	source := domain.Peer{Type: domain.PeerTypeUser, ID: 42}
+	media := &domain.MessageMedia{
+		Kind: domain.MessageMediaKindStory,
+		Story: &domain.MessageStory{
+			Peer: source,
+			ID:   7,
+			Story: &domain.Story{
+				Owner: source,
+				ID:    7,
+			},
+		},
+	}
+	publicCreated, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
+		CreatorUserID: 1,
+		Title:         "public story forwards",
+		Broadcast:     true,
+		Date:          1_700_000_130,
+	})
+	if err != nil {
+		t.Fatalf("create public channel: %v", err)
+	}
+	publicChannel, err := store.UpdateUsername(ctx, domain.UpdateChannelUsernameRequest{
+		UserID:    1,
+		ChannelID: publicCreated.Channel.ID,
+		Username:  "story_forward_memory",
+	})
+	if err != nil {
+		t.Fatalf("make public channel: %v", err)
+	}
+	privateCreated, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
+		CreatorUserID: 1,
+		Title:         "private story forwards",
+		Broadcast:     true,
+		Date:          1_700_000_131,
+	})
+	if err != nil {
+		t.Fatalf("create private channel: %v", err)
+	}
+	publicSent, err := store.SendChannelMessage(ctx, domain.SendChannelMessageRequest{
+		UserID:    1,
+		ChannelID: publicChannel.ID,
+		RandomID:  9141301,
+		Media:     media,
+		Date:      1_700_000_132,
+	})
+	if err != nil {
+		t.Fatalf("send public story message: %v", err)
+	}
+	if _, err := store.SendChannelMessage(ctx, domain.SendChannelMessageRequest{
+		UserID:    1,
+		ChannelID: privateCreated.Channel.ID,
+		RandomID:  9141302,
+		Media:     media,
+		Date:      1_700_000_133,
+	}); err != nil {
+		t.Fatalf("send private story message: %v", err)
+	}
+	list, err := store.ListStoryMessageForwards(ctx, domain.StoryMessageForwardListRequest{
+		ViewerUserID: 42,
+		Owner:        source,
+		StoryID:      7,
+		Limit:        10,
+	})
+	if err != nil {
+		t.Fatalf("list story message forwards: %v", err)
+	}
+	if list.Count != 1 || len(list.Forwards) != 1 {
+		t.Fatalf("story message forwards = %+v, want one public forward", list)
+	}
+	if got := list.Forwards[0].PublicForward.Message.ChannelID; got != publicChannel.ID {
+		t.Fatalf("forward channel = %d, want public channel %d", got, publicChannel.ID)
+	}
+	if _, err := store.DeleteChannelMessages(ctx, domain.DeleteChannelMessagesRequest{
+		UserID:    1,
+		ChannelID: publicChannel.ID,
+		IDs:       []int{publicSent.Message.ID},
+		Date:      1_700_000_134,
+	}); err != nil {
+		t.Fatalf("delete public story message: %v", err)
+	}
+	empty, err := store.ListStoryMessageForwards(ctx, domain.StoryMessageForwardListRequest{
+		ViewerUserID: 42,
+		Owner:        source,
+		StoryID:      7,
+		Limit:        10,
+	})
+	if err != nil {
+		t.Fatalf("list story message forwards after delete: %v", err)
+	}
+	if empty.Count != 0 || len(empty.Forwards) != 0 {
+		t.Fatalf("story message forwards after delete = %+v, want empty", empty)
 	}
 }
 
@@ -493,8 +789,18 @@ func TestChannelDeleteHistoryCapsHugeMaxID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("delete second batch: %v", err)
 	}
-	if second.Offset != 0 || len(second.DeletedIDs) != 3 || second.Event.PtsCount != 3 {
-		t.Fatalf("second batch = %+v, want final bounded page", second)
+	if second.Offset != 0 || len(second.DeletedIDs) != 2 || second.Event.PtsCount != 2 {
+		t.Fatalf("second batch = %+v, want final bounded page keeping create service message", second)
+	}
+	if second.Channel.TopMessageID != created.Message.ID {
+		t.Fatalf("top after full clear = %d, want create service message %d", second.Channel.TopMessageID, created.Message.ID)
+	}
+	history, err := store.ListChannelHistory(ctx, 1, domain.ChannelHistoryFilter{ChannelID: created.Channel.ID, Limit: 10})
+	if err != nil {
+		t.Fatalf("list history after full clear: %v", err)
+	}
+	if len(history.Messages) != 1 || history.Messages[0].ID != created.Message.ID || history.Messages[0].Action == nil {
+		t.Fatalf("history after full clear = %+v, want only create service message", history.Messages)
 	}
 }
 
@@ -675,6 +981,230 @@ func TestChannelUnreadExcludesOwnOutgoing(t *testing.T) {
 	}
 	if read.StillUnreadCount != 0 || read.Dialog.UnreadCount != 0 {
 		t.Fatalf("read result = %+v, want no own-outgoing unread", read)
+	}
+}
+
+func TestChannelMessageReplyMarkupSurvivesReadPaths(t *testing.T) {
+	ctx := context.Background()
+	store := NewChannelStore()
+	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
+		CreatorUserID: 1,
+		Title:         "channel reply markup",
+		Megagroup:     true,
+		MemberUserIDs: []int64{2},
+		Date:          1_700_000_380,
+	})
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	markup := &domain.MessageReplyMarkup{Inline: [][]domain.MarkupButton{{
+		{Type: domain.MarkupButtonCallback, Text: "Open", Data: []byte{0x00, 0xff, 0x42}},
+	}}}
+	assertMarkup := func(name string, got *domain.MessageReplyMarkup) {
+		t.Helper()
+		if got == nil || len(got.Inline) != 1 || len(got.Inline[0]) != 1 {
+			t.Fatalf("%s markup = %+v, want one callback button", name, got)
+		}
+		btn := got.Inline[0][0]
+		if btn.Type != domain.MarkupButtonCallback || btn.Text != "Open" || !bytes.Equal(btn.Data, []byte{0x00, 0xff, 0x42}) {
+			t.Fatalf("%s button = %+v, want callback Open bytes", name, btn)
+		}
+	}
+	sent, err := store.SendChannelMessage(ctx, domain.SendChannelMessageRequest{
+		UserID:      1,
+		ChannelID:   created.Channel.ID,
+		RandomID:    38_001,
+		Message:     "via inline keyboard",
+		ViaBotID:    99,
+		ReplyMarkup: markup,
+		Date:        1_700_000_381,
+	})
+	if err != nil {
+		t.Fatalf("send channel message: %v", err)
+	}
+	markup.Inline[0][0].Text = "Changed"
+	markup.Inline[0][0].Data[0] = 0x7f
+	assertMarkup("send result", sent.Message.ReplyMarkup)
+	assertMarkup("send event", sent.Event.Message.ReplyMarkup)
+
+	duplicate, err := store.SendChannelMessage(ctx, domain.SendChannelMessageRequest{
+		UserID:    1,
+		ChannelID: created.Channel.ID,
+		RandomID:  38_001,
+		Message:   "duplicate must not replace",
+		Date:      1_700_000_382,
+	})
+	if err != nil {
+		t.Fatalf("duplicate send: %v", err)
+	}
+	if !duplicate.Duplicate || duplicate.Message.ViaBotID != 99 {
+		t.Fatalf("duplicate = %+v, want original via bot", duplicate.Message)
+	}
+	assertMarkup("duplicate message", duplicate.Message.ReplyMarkup)
+	assertMarkup("duplicate event", duplicate.Event.Message.ReplyMarkup)
+
+	history, err := store.ListChannelHistory(ctx, 1, domain.ChannelHistoryFilter{ChannelID: created.Channel.ID, Limit: 10})
+	if err != nil {
+		t.Fatalf("list history: %v", err)
+	}
+	if len(history.Messages) == 0 || history.Messages[0].ViaBotID != 99 {
+		t.Fatalf("history messages = %+v, want via bot 99", history.Messages)
+	}
+	assertMarkup("history message", history.Messages[0].ReplyMarkup)
+
+	byID, err := store.GetChannelMessages(ctx, 1, created.Channel.ID, []int{sent.Message.ID})
+	if err != nil {
+		t.Fatalf("get channel messages: %v", err)
+	}
+	if len(byID.Messages) != 1 || byID.Messages[0].ViaBotID != 99 {
+		t.Fatalf("get messages = %+v, want via bot 99", byID.Messages)
+	}
+	assertMarkup("get messages", byID.Messages[0].ReplyMarkup)
+
+	diff, err := store.ListChannelDifference(ctx, domain.ChannelDifferenceRequest{UserID: 1, ChannelID: created.Channel.ID, Pts: created.Channel.Pts, Limit: 10})
+	if err != nil {
+		t.Fatalf("list difference: %v", err)
+	}
+	if len(diff.NewMessages) != 1 || diff.NewMessages[0].ViaBotID != 99 {
+		t.Fatalf("difference messages = %+v, want via bot 99", diff.NewMessages)
+	}
+	assertMarkup("difference message", diff.NewMessages[0].ReplyMarkup)
+
+	dialogs, err := store.ListChannelDialogs(ctx, 1, domain.DialogFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("list dialogs: %v", err)
+	}
+	if len(dialogs.Messages) == 0 || dialogs.Messages[0].ViaBotID != 99 {
+		t.Fatalf("dialog messages = %+v, want via bot 99", dialogs.Messages)
+	}
+	assertMarkup("dialog top message", dialogs.Messages[0].ReplyMarkup)
+}
+
+func TestChannelMessageViaBotEditUpdatesReplyMarkup(t *testing.T) {
+	ctx := context.Background()
+	store := NewChannelStore()
+	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
+		CreatorUserID: 1,
+		Title:         "channel via bot edit",
+		Megagroup:     true,
+		MemberUserIDs: []int64{2},
+		Date:          1_700_000_390,
+	})
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	sent, err := store.SendChannelMessage(ctx, domain.SendChannelMessageRequest{
+		UserID:    1,
+		ChannelID: created.Channel.ID,
+		RandomID:  39_001,
+		Message:   "before",
+		ViaBotID:  99,
+		Date:      1_700_000_391,
+	})
+	if err != nil {
+		t.Fatalf("send channel message: %v", err)
+	}
+	markup := &domain.MessageReplyMarkup{Inline: [][]domain.MarkupButton{{
+		{Type: domain.MarkupButtonCallback, Text: "Done", Data: []byte("v2")},
+	}}}
+	if _, err := store.EditChannelMessage(ctx, domain.EditChannelMessageRequest{
+		UserID:          1,
+		ChannelID:       created.Channel.ID,
+		ID:              sent.Message.ID,
+		Message:         "wrong",
+		ViaBotEditBotID: 100,
+		EditDate:        1_700_000_392,
+		SetReplyMarkup:  true,
+		ReplyMarkup:     markup,
+	}); err != domain.ErrMessageAuthorRequired {
+		t.Fatalf("wrong via bot edit err = %v, want ErrMessageAuthorRequired", err)
+	}
+	edited, err := store.EditChannelMessage(ctx, domain.EditChannelMessageRequest{
+		UserID:          1,
+		ChannelID:       created.Channel.ID,
+		ID:              sent.Message.ID,
+		Message:         "after",
+		ViaBotEditBotID: 99,
+		EditDate:        1_700_000_393,
+		SetReplyMarkup:  true,
+		ReplyMarkup:     markup,
+	})
+	if err != nil {
+		t.Fatalf("via bot edit: %v", err)
+	}
+	if edited.Event.Type != domain.ChannelUpdateEditMessage || edited.Message.Body != "after" || edited.Message.ViaBotID != 99 {
+		t.Fatalf("edited = %+v event=%+v, want edit via bot", edited.Message, edited.Event)
+	}
+	if edited.Message.ReplyMarkup == nil || edited.Message.ReplyMarkup.Inline[0][0].Text != "Done" || !bytes.Equal(edited.Message.ReplyMarkup.Inline[0][0].Data, []byte("v2")) {
+		t.Fatalf("edited markup = %+v, want Done/v2", edited.Message.ReplyMarkup)
+	}
+	diff, err := store.ListChannelDifference(ctx, domain.ChannelDifferenceRequest{UserID: 1, ChannelID: created.Channel.ID, Pts: sent.Event.Pts, Limit: 10})
+	if err != nil {
+		t.Fatalf("list edit difference: %v", err)
+	}
+	if len(diff.OtherUpdates) != 1 || diff.OtherUpdates[0].Message.Body != "after" {
+		t.Fatalf("edit difference = %+v, want one edited message", diff.OtherUpdates)
+	}
+}
+
+func TestBroadcastChannelReactionsAreAnonymousAndSkipUnread(t *testing.T) {
+	ctx := context.Background()
+	store := NewChannelStore()
+	created, err := store.CreateChannel(ctx, domain.CreateChannelRequest{
+		CreatorUserID: 1,
+		Title:         "broadcast reaction",
+		Broadcast:     true,
+		MemberUserIDs: []int64{2},
+		Date:          1_700_000_500,
+	})
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	sent, err := store.SendChannelMessage(ctx, domain.SendChannelMessageRequest{
+		UserID:    1,
+		ChannelID: created.Channel.ID,
+		RandomID:  50_001,
+		Message:   "broadcast post",
+		Date:      1_700_000_501,
+	})
+	if err != nil {
+		t.Fatalf("send channel message: %v", err)
+	}
+	res, err := store.SetChannelMessageReactions(ctx, domain.SetChannelMessageReactionsRequest{
+		UserID:    2,
+		ChannelID: created.Channel.ID,
+		MessageID: sent.Message.ID,
+		Reactions: []domain.MessageReaction{{
+			Type:     domain.MessageReactionEmoji,
+			Emoticon: "\U0001f44d",
+		}},
+		Date: 1_700_000_502,
+	})
+	if err != nil {
+		t.Fatalf("set channel reaction: %v", err)
+	}
+	if len(res.Reactions.Results) != 1 || res.Reactions.Results[0].Count != 1 {
+		t.Fatalf("broadcast reaction results = %+v, want count-only aggregate", res.Reactions.Results)
+	}
+	if len(res.Reactions.Recent) != 0 {
+		t.Fatalf("broadcast recent reactors = %+v, want anonymous (empty)", res.Reactions.Recent)
+	}
+	if res.Reactions.CanSeeList {
+		t.Fatalf("broadcast can_see_list = true, want false")
+	}
+	for _, rows := range store.reactions[created.Channel.ID][sent.Message.ID] {
+		for _, row := range rows {
+			if row.Unread {
+				t.Fatalf("broadcast reaction row = %+v, want unread bookkeeping skipped", row)
+			}
+		}
+	}
+	dialogs, err := store.GetChannelDialogs(ctx, 1, []int64{created.Channel.ID})
+	if err != nil {
+		t.Fatalf("get owner channel dialogs: %v", err)
+	}
+	if len(dialogs.Dialogs) != 1 || dialogs.Dialogs[0].UnreadReactions != 0 {
+		t.Fatalf("owner dialogs = %+v, want no unread reaction badge on broadcast", dialogs.Dialogs)
 	}
 }
 

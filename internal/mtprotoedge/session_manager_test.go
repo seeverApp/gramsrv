@@ -23,6 +23,23 @@ func (e *countingOutboundEncoder) Encode(b *bin.Buffer) error {
 	return (&tg.UpdatesTooLong{}).Encode(b)
 }
 
+type closeCountingTransport struct {
+	closes int
+}
+
+func (t *closeCountingTransport) Send(context.Context, *bin.Buffer) error {
+	return errors.New("test transport send")
+}
+
+func (t *closeCountingTransport) Recv(context.Context, *bin.Buffer) error {
+	return errors.New("test transport recv")
+}
+
+func (t *closeCountingTransport) Close() error {
+	t.closes++
+	return nil
+}
+
 // TestSessionManagerRegistry 验证注册表的注册/注销/查找语义（不涉及网络发送）。
 func TestSessionManagerRegistry(t *testing.T) {
 	sm := NewSessionManager(zaptest.NewLogger(t))
@@ -146,6 +163,81 @@ func TestSessionManagerScopesSameSessionIDByAuthKey(t *testing.T) {
 	}
 }
 
+func TestSessionManagerCloseSessionsForBusinessAuthKeyClosesBoundTempAndRaw(t *testing.T) {
+	sm := NewSessionManager(zaptest.NewLogger(t))
+	rawTemp := [8]byte{1}
+	perm := [8]byte{9}
+	otherRaw := [8]byte{2}
+	otherPerm := [8]byte{8}
+	tempTransport := &closeCountingTransport{}
+	permTransport := &closeCountingTransport{}
+	otherTransport := &closeCountingTransport{}
+	cTemp := &Conn{sessionID: 11, authKeyID: rawTemp, transport: tempTransport}
+	cPerm := &Conn{sessionID: 12, authKeyID: perm, transport: permTransport}
+	cOther := &Conn{sessionID: 13, authKeyID: otherRaw}
+	cOther.transport = otherTransport
+
+	sm.Register(cTemp)
+	sm.Register(cPerm)
+	sm.Register(cOther)
+	sm.BindAuthKeyForSession(rawTemp, 11, perm)
+	sm.BindAuthKeyForSession(perm, 12, perm)
+	sm.BindAuthKeyForSession(otherRaw, 13, otherPerm)
+	sm.BindUserForAuthKey(rawTemp, 11, 100)
+	sm.BindUserForAuthKey(perm, 12, 100)
+	sm.BindUserForAuthKey(otherRaw, 13, 200)
+
+	if closed := sm.CloseSessionsForBusinessAuthKey(perm); closed != 2 {
+		t.Fatalf("closed sessions = %d, want 2", closed)
+	}
+	if tempTransport.closes != 1 || permTransport.closes != 1 {
+		t.Fatalf("transport closes temp=%d perm=%d, want 1/1", tempTransport.closes, permTransport.closes)
+	}
+	if otherTransport.closes != 0 {
+		t.Fatalf("other transport closes = %d, want 0", otherTransport.closes)
+	}
+	if got := sm.Online(); got != 1 {
+		t.Fatalf("online after close = %d, want 1", got)
+	}
+	if _, ok := sm.AuthKeyIDForSession(rawTemp, 11); ok {
+		t.Fatal("temp session still indexed after business auth key close")
+	}
+	if _, ok := sm.AuthKeyIDForSession(perm, 12); ok {
+		t.Fatal("raw perm session still indexed after business auth key close")
+	}
+	if userID, ok := sm.UserIDForAuthKey(otherRaw, 13); !ok || userID != 200 {
+		t.Fatalf("other session user = %d ok %v, want 200/true", userID, ok)
+	}
+	if closed := sm.CloseSessionsForBusinessAuthKey(perm); closed != 0 {
+		t.Fatalf("second close = %d, want 0", closed)
+	}
+}
+
+func TestSessionManagerBusinessAuthKeyIndexTracksRebind(t *testing.T) {
+	sm := NewSessionManager(zaptest.NewLogger(t))
+	raw := [8]byte{1}
+	oldPerm := [8]byte{7}
+	newPerm := [8]byte{8}
+	c := &Conn{sessionID: 21, authKeyID: raw}
+
+	sm.Register(c)
+	sm.BindAuthKeyForSession(raw, 21, oldPerm)
+	sm.BindAuthKeyForSession(raw, 21, newPerm)
+
+	if closed := sm.CloseSessionsForBusinessAuthKey(oldPerm); closed != 0 {
+		t.Fatalf("close old business auth key = %d, want 0", closed)
+	}
+	if got := sm.Online(); got != 1 {
+		t.Fatalf("online after closing old key = %d, want 1", got)
+	}
+	if closed := sm.CloseSessionsForBusinessAuthKey(newPerm); closed != 1 {
+		t.Fatalf("close new business auth key = %d, want 1", closed)
+	}
+	if got := sm.Online(); got != 0 {
+		t.Fatalf("online after closing new key = %d, want 0", got)
+	}
+}
+
 func TestSessionManagerChannelInterestIndex(t *testing.T) {
 	sm := NewSessionManager(zaptest.NewLogger(t))
 	raw := [8]byte{1, 2, 3}
@@ -255,6 +347,40 @@ func TestSessionManagerClearsChannelIndexesOnAuthAndReadinessChanges(t *testing.
 		t.Fatalf("UnbindAuthKey count = %d, want 1", n)
 	}
 	assertCleared("after unbind auth key")
+}
+
+func TestPushToSessionForAuthKeyImmediateBypassesReadinessQueue(t *testing.T) {
+	sm := NewSessionManager(zaptest.NewLogger(t))
+	raw := [8]byte{1, 2, 3}
+	c := &Conn{
+		sessionID:       42,
+		authKeyID:       raw,
+		outbound:        make(chan outboundOp, 1),
+		outboundControl: make(chan outboundOp, 1),
+		outboundStop:    make(chan struct{}),
+	}
+	sm.Register(c)
+
+	msg := &tg.UpdateShort{Update: &tg.UpdateLoginToken{}, Date: 1700000000}
+	if err := sm.PushToSessionForAuthKeyImmediate(context.Background(), raw, 42, proto.MessageFromServer, msg); err != nil {
+		t.Fatalf("immediate push: %v", err)
+	}
+
+	select {
+	case op := <-c.outbound:
+		if op.msg != msg {
+			t.Fatalf("enqueued msg = %T, want original update", op.msg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("immediate push was not enqueued")
+	}
+
+	sm.mu.RLock()
+	pending := len(sm.pending[sessionKey{authKeyID: raw, sessionID: 42}])
+	sm.mu.RUnlock()
+	if pending != 0 {
+		t.Fatalf("pending pushes = %d, want 0", pending)
+	}
 }
 
 // TestSessionManagerPush 验证主动推送端到端：两个 client 连接握手并建立 session 后，

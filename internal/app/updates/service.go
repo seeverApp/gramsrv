@@ -5,6 +5,8 @@ import (
 	"sort"
 	"time"
 
+	"go.uber.org/zap"
+
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
 )
@@ -13,20 +15,20 @@ import (
 type Service struct {
 	states store.UpdateStateStore
 	events store.UpdateEventStore
-	pts    store.PtsAllocator
+	log    *zap.Logger
 }
 
 type dispatchingEventAppender interface {
-	AppendWithDispatch(ctx context.Context, userID int64, event domain.UpdateEvent, excludeAuthKeyID [8]byte, excludeSessionID int64) error
+	AppendAllocatedWithDispatch(ctx context.Context, userID int64, event domain.UpdateEvent, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, error)
 }
 
 // ServiceOption 调整 updates 服务的运行时依赖。
 type ServiceOption func(*Service)
 
-// WithPtsAllocator 使用外部 pts 分配器推进账号级 pts。
-func WithPtsAllocator(pts store.PtsAllocator) ServiceOption {
+// WithLogger 注入 update 状态机日志器，用于追踪 pts 分配、append 失败和 difference gap。
+func WithLogger(log *zap.Logger) ServiceOption {
 	return func(s *Service) {
-		s.pts = pts
+		s.log = log
 	}
 }
 
@@ -36,6 +38,9 @@ func NewService(states store.UpdateStateStore, events store.UpdateEventStore, op
 	s.events = events
 	for _, opt := range opts {
 		opt(s)
+	}
+	if s.log == nil {
+		s.log = zap.NewNop()
 	}
 	return s
 }
@@ -90,13 +95,31 @@ func (s *Service) CurrentState(ctx context.Context, userID int64) (domain.Update
 	return s.currentState(ctx, userID)
 }
 
+// AcknowledgeCurrentState 返回账号当前最大连续状态，并把该设备的确认水位推进到此。
+//
+// 供 updates.getState 使用：协议语义是客户端宣告「从现在开始同步」，启动期的
+// 离线数据由 getDialogs 快照承载（TDesktop 不持久化 pts，每次启动都走此路径）。
+// 若改为返回设备旧确认水位，客户端会在 getDialogs 最新快照之上再重放历史差分，
+// 造成未读重复累计、dialog 预览被旧消息抢占。持久化 pts 的客户端（Android）
+// 启动时直接带本地 pts 调 getDifference，不经过 getState，不受影响。
+func (s *Service) AcknowledgeCurrentState(ctx context.Context, authKeyID [8]byte, userID int64) (domain.UpdateState, error) {
+	st, err := s.currentState(ctx, userID)
+	if err != nil {
+		return domain.UpdateState{}, err
+	}
+	if err := s.saveConfirmedState(ctx, authKeyID, userID, st); err != nil {
+		return domain.UpdateState{}, err
+	}
+	return st, nil
+}
+
 // getDifferenceLimit 是单次 getDifference 返回的最大连续事件数；超出置 Partial 让客户端翻页。
 const getDifferenceLimit = 100
 
 // GetDifference 返回当前 user 从 from 状态之后的增量事件。
 //
 // 对齐 MTProto：只返回从 from.Pts 起「连续」的事件（遇空洞即截断），State.Pts 取最后连续值，
-// 绝不让客户端跳过在途空洞而丢消息——空洞由并发发送的在途事务造成，提交/补洞后客户端下次拉取即可补齐。
+// 绝不让客户端跳过异常空洞而丢消息；正常写路径在 PG 事务内推进 pts 和 durable event。
 // 连续事件填满 limit 时置 Partial（映射 differenceSlice），客户端据返回 State 继续翻页。
 func (s *Service) GetDifference(ctx context.Context, authKeyID [8]byte, userID int64, from domain.UpdateState) (domain.UpdateDifference, error) {
 	st, err := s.currentState(ctx, userID)
@@ -116,10 +139,29 @@ func (s *Service) GetDifference(ctx context.Context, authKeyID [8]byte, userID i
 	if err != nil {
 		return domain.UpdateDifference{}, err
 	}
-	contiguous := contiguousPrefix(events, from.Pts)
+	contiguous, gapEvent, expectedPts := contiguousPrefixAndGap(events, from.Pts)
 	last := from.Pts
 	if len(contiguous) > 0 {
 		last = contiguous[len(contiguous)-1].Pts
+	}
+	if gapEvent != nil {
+		ptsCount := gapEvent.PtsCount
+		if ptsCount <= 0 {
+			ptsCount = 1
+		}
+		s.log.Warn("difference_stopped_at_gap",
+			zap.String("scope", "user"),
+			zap.Int64("user_id", userID),
+			zap.Int("request_pts", from.Pts),
+			zap.Int("current_pts", st.Pts),
+			zap.Int("returned_pts", last),
+			zap.Int("expected_pts", expectedPts),
+			zap.Int("got_pts", gapEvent.Pts),
+			zap.Int("got_pts_count", ptsCount),
+			zap.String("event_type", string(gapEvent.Type)),
+			zap.Int("events_read", len(events)),
+			zap.Int("events_returned", len(contiguous)),
+		)
 	}
 	out := st
 	out.Pts = last
@@ -160,8 +202,13 @@ func (s *Service) saveConfirmedState(ctx context.Context, authKeyID [8]byte, use
 // contiguousPrefix 返回从 from 起 pts 严格连续（from+1, from+2, ...）的事件前缀。
 // 先按 pts 升序排序以兼容存储返回顺序，遇到空洞即停。
 func contiguousPrefix(events []domain.UpdateEvent, from int) []domain.UpdateEvent {
+	out, _, _ := contiguousPrefixAndGap(events, from)
+	return out
+}
+
+func contiguousPrefixAndGap(events []domain.UpdateEvent, from int) ([]domain.UpdateEvent, *domain.UpdateEvent, int) {
 	if len(events) == 0 {
-		return nil
+		return nil, nil, 0
 	}
 	sorted := make([]domain.UpdateEvent, len(events))
 	copy(sorted, events)
@@ -173,13 +220,15 @@ func contiguousPrefix(events []domain.UpdateEvent, from int) []domain.UpdateEven
 		if ptsCount <= 0 {
 			ptsCount = 1
 		}
-		if event.Pts != cursor+ptsCount {
-			break
+		expected := cursor + ptsCount
+		if event.Pts != expected {
+			gap := event
+			return out, &gap, expected
 		}
 		out = append(out, event)
 		cursor = event.Pts
 	}
-	return out
+	return out, nil, 0
 }
 
 // ClearAuthKey 清理某 auth_key 的设备状态。
@@ -232,6 +281,142 @@ func (s *Service) RecordMessageReactions(ctx context.Context, authKeyID [8]byte,
 	})
 }
 
+// RecordMessagePoll records a durable marker for message poll state changes
+// (vote / close). updateMessagePoll has no pts fields in Layer 225 — same
+// bookkeeping shape as RecordMessageReactions.
+func (s *Service) RecordMessagePoll(ctx context.Context, authKeyID [8]byte, userID int64, msg domain.Message) (domain.UpdateEvent, domain.UpdateState, error) {
+	if userID == 0 {
+		userID = msg.OwnerUserID
+	}
+	date := msg.Date
+	if date == 0 {
+		date = int(time.Now().Unix())
+	}
+	return s.recordEventWithoutState(ctx, userID, domain.UpdateEvent{
+		Type:     domain.UpdateEventMessagePoll,
+		Date:     date,
+		Message:  msg,
+		Peer:     msg.Peer,
+		PtsCount: 1,
+	})
+}
+
+// RecordStory records a story snapshot change for offline difference replay.
+func (s *Service) RecordStory(ctx context.Context, authKeyID [8]byte, userID int64, story domain.Story, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
+	if userID == 0 && story.Owner.Type == domain.PeerTypeUser {
+		userID = story.Owner.ID
+	}
+	return s.recordEvent(ctx, authKeyID, userID, domain.UpdateEvent{
+		Type:     domain.UpdateEventStory,
+		Date:     story.Date,
+		Peer:     story.Owner,
+		Story:    story,
+		PtsCount: 1,
+	}, true, excludeSessionID)
+}
+
+// RecordStoryFanout records a story visibility change for a user who did not
+// initiate the RPC that caused it. It writes durable updates/outbox but does
+// not acknowledge any device-local update state.
+func (s *Service) RecordStoryFanout(ctx context.Context, userID int64, story domain.Story) (domain.UpdateEvent, domain.UpdateState, error) {
+	if userID == 0 {
+		return domain.UpdateEvent{}, domain.UpdateState{}, domain.ErrStoryPeerInvalid
+	}
+	return s.recordEventCore(ctx, [8]byte{}, userID, domain.UpdateEvent{
+		Type:     domain.UpdateEventStory,
+		Date:     story.Date,
+		Peer:     story.Owner,
+		Story:    story,
+		PtsCount: 1,
+	}, true, 0, false)
+}
+
+// RecordReadStories records a read boundary update for multi-device sync.
+func (s *Service) RecordReadStories(ctx context.Context, authKeyID [8]byte, userID int64, read domain.StoryReadResult, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
+	if userID == 0 {
+		userID = read.ViewerID
+	}
+	return s.recordEvent(ctx, authKeyID, userID, domain.UpdateEvent{
+		Type:     domain.UpdateEventReadStories,
+		Date:     read.Date,
+		Peer:     read.Peer,
+		MaxID:    read.MaxReadID,
+		PtsCount: 1,
+	}, true, excludeSessionID)
+}
+
+// RecordSentStoryReaction records the current user's story reaction for multi-device sync.
+func (s *Service) RecordSentStoryReaction(ctx context.Context, authKeyID [8]byte, userID int64, reaction domain.StoryReactionResult, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
+	if userID == 0 {
+		userID = reaction.ViewerID
+	}
+	return s.recordEvent(ctx, authKeyID, userID, domain.UpdateEvent{
+		Type:     domain.UpdateEventSentStoryReaction,
+		Date:     reaction.Date,
+		Peer:     reaction.Peer,
+		MaxID:    reaction.StoryID,
+		Story:    reaction.Story,
+		Reaction: reaction.Reaction,
+		PtsCount: 1,
+	}, true, excludeSessionID)
+}
+
+// RecordNewStoryReaction records the story owner's notification for a reaction
+// sent by another user. It does not advance any owner device confirmation state:
+// the owner did not initiate the RPC, but online outbox and offline difference
+// must still see the durable event.
+func (s *Service) RecordNewStoryReaction(ctx context.Context, authKeyID [8]byte, ownerUserID int64, reaction domain.StoryReactionResult, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
+	if ownerUserID == 0 && reaction.Story.Owner.Type == domain.PeerTypeUser {
+		ownerUserID = reaction.Story.Owner.ID
+	}
+	if ownerUserID == 0 && reaction.Peer.Type == domain.PeerTypeUser {
+		ownerUserID = reaction.Peer.ID
+	}
+	if ownerUserID == 0 || reaction.ViewerID == 0 || reaction.Reaction == nil {
+		return domain.UpdateEvent{}, domain.UpdateState{}, domain.ErrStoryPeerInvalid
+	}
+	return s.recordEventCore(ctx, authKeyID, ownerUserID, domain.UpdateEvent{
+		Type:     domain.UpdateEventNewStoryReaction,
+		Date:     reaction.Date,
+		Peer:     domain.Peer{Type: domain.PeerTypeUser, ID: reaction.ViewerID},
+		MaxID:    reaction.StoryID,
+		Story:    reaction.Story,
+		Reaction: reaction.Reaction,
+		PtsCount: 1,
+	}, true, excludeSessionID, false)
+}
+
+// RecordQuickReplyMutation records account-local quick reply state changes for
+// multi-device sync. Quick-reply TL updates do not carry pts, so outbox appends
+// auxiliary pts bookkeeping just like other account settings events.
+func (s *Service) RecordQuickReplyMutation(ctx context.Context, authKeyID [8]byte, userID int64, mutation domain.QuickReplyMutation, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
+	if userID == 0 {
+		userID = mutation.List.OwnerUserID
+	}
+	event := domain.UpdateEvent{
+		Date:              mutation.Date,
+		PtsCount:          1,
+		QuickReplies:      append([]domain.QuickReply(nil), mutation.List.QuickReplies...),
+		QuickReply:        mutation.QuickReply,
+		QuickReplyMessage: mutation.Message,
+		MessageIDs:        append([]int(nil), mutation.MessageIDs...),
+		MaxID:             mutation.ShortcutID,
+	}
+	switch mutation.Kind {
+	case domain.QuickReplyMutationNew:
+		event.Type = domain.UpdateEventNewQuickReply
+	case domain.QuickReplyMutationDelete:
+		event.Type = domain.UpdateEventDeleteQuickReply
+	case domain.QuickReplyMutationMessage:
+		event.Type = domain.UpdateEventQuickReplyMessage
+	case domain.QuickReplyMutationIDs:
+		event.Type = domain.UpdateEventDeleteQuickReplyMessages
+	default:
+		event.Type = domain.UpdateEventQuickReplies
+	}
+	return s.recordEvent(ctx, authKeyID, userID, event, true, excludeSessionID)
+}
+
 // RecordReadHistory 推进 update 状态并追加一条 read_history_inbox 事件。
 func (s *Service) RecordReadHistory(ctx context.Context, authKeyID [8]byte, userID int64, read domain.ReadHistoryResult, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
 	if userID == 0 {
@@ -244,7 +429,18 @@ func (s *Service) RecordReadHistory(ctx context.Context, authKeyID [8]byte, user
 		Peer:             read.Peer,
 		MaxID:            read.MaxID,
 		StillUnreadCount: read.StillUnreadCount,
+		ChannelPts:       read.ChannelPts,
 		PtsCount:         1,
+	}, true, excludeSessionID)
+}
+
+// RecordChannelState 记录当前账号与某频道成员关系变化（leave/kick），
+// 离线设备经 difference 收到 updateChannel 后重拉 channel 状态。
+func (s *Service) RecordChannelState(ctx context.Context, authKeyID [8]byte, userID, channelID int64, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
+	return s.recordEvent(ctx, authKeyID, userID, domain.UpdateEvent{
+		Type:     domain.UpdateEventChannelState,
+		Peer:     domain.Peer{Type: domain.PeerTypeChannel, ID: channelID},
+		PtsCount: 1,
 	}, true, excludeSessionID)
 }
 
@@ -256,20 +452,54 @@ func (s *Service) RecordContactsReset(ctx context.Context, authKeyID [8]byte, us
 	}, true, excludeSessionID)
 }
 
-// RecordDialogPinned 记录单个会话置顶状态变化。
-func (s *Service) RecordDialogPinned(ctx context.Context, authKeyID [8]byte, userID int64, peer domain.Peer, pinned bool, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
+// RecordDraftMessage 记录某会话云草稿变化（保存/清空都是同一事件——草稿是绝对
+// 状态，重放时按 peer 重载当前值）。updateDraftMessage 无 pts 字段，走 LacksWirePts
+// aux 簿记；topMsgID 是 forum 话题草稿键（复用 MaxID 列持久化）。
+func (s *Service) RecordDraftMessage(ctx context.Context, authKeyID [8]byte, userID int64, peer domain.Peer, topMsgID int, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
+	return s.recordEvent(ctx, authKeyID, userID, domain.UpdateEvent{
+		Type:     domain.UpdateEventDraftMessage,
+		Peer:     peer,
+		MaxID:    topMsgID,
+		PtsCount: 1,
+	}, true, excludeSessionID)
+}
+
+// RecordDialogPinned 记录单个会话置顶状态变化；folderID 是会话所在 folder
+// （0 主列表/1 归档），缺失会让离线设备把归档内置顶重放到主列表。
+func (s *Service) RecordDialogPinned(ctx context.Context, authKeyID [8]byte, userID int64, peer domain.Peer, pinned bool, folderID int, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
 	return s.recordEvent(ctx, authKeyID, userID, domain.UpdateEvent{
 		Type:     domain.UpdateEventDialogPinned,
+		Peer:     peer,
+		Bool:     pinned,
+		FolderID: folderID,
+		PtsCount: 1,
+	}, true, excludeSessionID)
+}
+
+// RecordPinnedDialogs 记录指定 folder 内置顶顺序变化，并把新顺序持久化给 getDifference/outbox。
+func (s *Service) RecordPinnedDialogs(ctx context.Context, authKeyID [8]byte, userID int64, folderID int, order []domain.Peer, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
+	return s.recordEvent(ctx, authKeyID, userID, domain.UpdateEvent{
+		Type:     domain.UpdateEventPinnedDialogs,
+		Peers:    append([]domain.Peer(nil), order...),
+		FolderID: folderID,
+		PtsCount: 1,
+	}, true, excludeSessionID)
+}
+
+// RecordSavedDialogPinned 记录收藏夹单个子会话置顶状态变化。
+func (s *Service) RecordSavedDialogPinned(ctx context.Context, authKeyID [8]byte, userID int64, peer domain.Peer, pinned bool, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
+	return s.recordEvent(ctx, authKeyID, userID, domain.UpdateEvent{
+		Type:     domain.UpdateEventSavedDialogPinned,
 		Peer:     peer,
 		Bool:     pinned,
 		PtsCount: 1,
 	}, true, excludeSessionID)
 }
 
-// RecordPinnedDialogs 记录置顶会话顺序变化，并把新顺序持久化给 getDifference/outbox。
-func (s *Service) RecordPinnedDialogs(ctx context.Context, authKeyID [8]byte, userID int64, order []domain.Peer, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
+// RecordPinnedSavedDialogs 记录收藏夹置顶顺序变化，新顺序持久化给 getDifference/outbox。
+func (s *Service) RecordPinnedSavedDialogs(ctx context.Context, authKeyID [8]byte, userID int64, order []domain.Peer, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
 	return s.recordEvent(ctx, authKeyID, userID, domain.UpdateEvent{
-		Type:     domain.UpdateEventPinnedDialogs,
+		Type:     domain.UpdateEventPinnedSavedDialogs,
 		Peers:    append([]domain.Peer(nil), order...),
 		PtsCount: 1,
 	}, true, excludeSessionID)
@@ -295,12 +525,34 @@ func (s *Service) RecordChannelViewForumAsMessages(ctx context.Context, authKeyI
 	}, true, excludeSessionID)
 }
 
+// RecordChannelDiscussionInbox 记录 forum 话题级已读（updateReadChannelDiscussionInbox），
+// 占一个账号 pts（LacksWirePts），供自己其它设备在线同步与离线差分恢复。
+func (s *Service) RecordChannelDiscussionInbox(ctx context.Context, authKeyID [8]byte, userID, channelID int64, topicID, maxID int, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
+	return s.recordEvent(ctx, authKeyID, userID, domain.UpdateEvent{
+		Type:     domain.UpdateEventReadChannelDiscussionInbox,
+		Peer:     domain.Peer{Type: domain.PeerTypeChannel, ID: channelID},
+		TopMsgID: topicID,
+		MaxID:    maxID,
+		PtsCount: 1,
+	}, true, excludeSessionID)
+}
+
 // RecordPeerSettings 记录 peer settings 变化。
 func (s *Service) RecordPeerSettings(ctx context.Context, authKeyID [8]byte, userID int64, peer domain.Peer, settings domain.PeerSettings, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
 	return s.recordEvent(ctx, authKeyID, userID, domain.UpdateEvent{
 		Type:     domain.UpdateEventPeerSettings,
 		Peer:     peer,
 		Settings: settings,
+		PtsCount: 1,
+	}, true, excludeSessionID)
+}
+
+// RecordPeerStoryBlocked 记录当前账号 story blocklist 对某个 peer 的可见状态变化。
+func (s *Service) RecordPeerStoryBlocked(ctx context.Context, authKeyID [8]byte, userID int64, peer domain.Peer, blocked bool, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error) {
+	return s.recordEvent(ctx, authKeyID, userID, domain.UpdateEvent{
+		Type:     domain.UpdateEventPeerStoryBlocked,
+		Peer:     peer,
+		Bool:     blocked,
 		PtsCount: 1,
 	}, true, excludeSessionID)
 }
@@ -372,37 +624,48 @@ func (s *Service) recordEventCore(ctx context.Context, authKeyID [8]byte, userID
 	if event.PtsCount == 0 {
 		event.PtsCount = 1
 	}
-	pts, err := s.nextPtsN(ctx, userID, event.PtsCount)
-	if err != nil {
-		return domain.UpdateEvent{}, domain.UpdateState{}, err
-	}
-	st := domain.UpdateState{Pts: pts, Date: date, Seq: 0}
 	event.UserID = userID
-	event.Pts = st.Pts
 	event.Date = date
+	st := domain.UpdateState{Date: date, Seq: 0}
 	if s.events != nil {
 		var err error
 		if dispatch {
 			if appender, ok := s.events.(dispatchingEventAppender); ok {
-				err = appender.AppendWithDispatch(ctx, userID, event, authKeyID, excludeSessionID)
+				event, err = appender.AppendAllocatedWithDispatch(ctx, userID, event, authKeyID, excludeSessionID)
 			} else {
-				err = s.events.Append(ctx, userID, event)
+				event, err = s.events.AppendAllocated(ctx, userID, event)
 			}
 		} else {
-			err = s.events.Append(ctx, userID, event)
+			event, err = s.events.AppendAllocated(ctx, userID, event)
 		}
 		if err != nil {
-			if !dispatch {
-				_ = s.events.Append(ctx, userID, domain.UpdateEvent{
-					UserID:   userID,
-					Type:     domain.UpdateEventNoop,
-					Pts:      pts,
-					PtsCount: event.PtsCount,
-					Date:     date,
-				})
-			}
+			s.log.Warn("update_event_append_failed",
+				zap.String("scope", "user"),
+				zap.Int64("user_id", userID),
+				zap.Int("pts", event.Pts),
+				zap.Int("pts_count", event.PtsCount),
+				zap.String("event_type", string(event.Type)),
+				zap.Error(err),
+				zap.Error(ctx.Err()),
+			)
 			return domain.UpdateEvent{}, domain.UpdateState{}, err
 		}
+		st.Pts = event.Pts
+		s.log.Debug("update_event_appended",
+			zap.String("scope", "user"),
+			zap.Int64("user_id", userID),
+			zap.Int("pts", event.Pts),
+			zap.Int("pts_count", event.PtsCount),
+			zap.String("event_type", string(event.Type)),
+			zap.Bool("dispatch", dispatch),
+		)
+	} else {
+		current, err := s.currentPts(ctx, userID)
+		if err != nil {
+			return domain.UpdateEvent{}, domain.UpdateState{}, err
+		}
+		event.Pts = current + event.PtsCount
+		st.Pts = event.Pts
 	}
 	if saveState && s.states != nil {
 		if err := s.states.Save(ctx, authKeyID, userID, st); err != nil {
@@ -413,53 +676,10 @@ func (s *Service) recordEventCore(ctx context.Context, authKeyID [8]byte, userID
 }
 
 // currentPts 供 GetState 报告「当前 pts」。对齐 MTProto：报告最大连续已提交 pts，
-// 而非 Redis allocator 的最大已分配值——后者在并发发送在途时会超前于已提交事件，
-// 会让首次登录基线越过在途空洞而丢消息。allocator 仅在无 events 存储时兜底。
+// PG 实现中该值由同一事务内的 pts 分配 + durable event 写入共同维护。
 func (s *Service) currentPts(ctx context.Context, userID int64) (int, error) {
 	if s.events != nil {
 		return s.events.MaxContiguousPts(ctx, userID)
 	}
-	if s.pts != nil {
-		return s.pts.CurrentPts(ctx, userID)
-	}
 	return 0, nil
-}
-
-func (s *Service) nextPts(ctx context.Context, userID int64) (int, error) {
-	if s.pts != nil {
-		return s.pts.NextPts(ctx, userID)
-	}
-	current, err := s.currentPts(ctx, userID)
-	if err != nil {
-		return 0, err
-	}
-	return current + 1, nil
-}
-
-func (s *Service) nextPtsN(ctx context.Context, userID int64, count int) (int, error) {
-	if count <= 0 {
-		count = 1
-	}
-	if count == 1 {
-		return s.nextPts(ctx, userID)
-	}
-	if s.pts != nil {
-		if ranges, ok := s.pts.(store.PtsRangeAllocator); ok {
-			return ranges.NextPtsN(ctx, userID, count)
-		}
-		var pts int
-		var err error
-		for i := 0; i < count; i++ {
-			pts, err = s.pts.NextPts(ctx, userID)
-			if err != nil {
-				return 0, err
-			}
-		}
-		return pts, nil
-	}
-	current, err := s.currentPts(ctx, userID)
-	if err != nil {
-		return 0, err
-	}
-	return current + count, nil
 }

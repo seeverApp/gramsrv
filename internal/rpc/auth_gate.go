@@ -1,0 +1,59 @@
+package rpc
+
+import "github.com/gotd/td/tg"
+
+// rpcAllowedWithoutAuthorization returns true for methods that are valid before
+// an auth key is bound to a user. Everything else must fail with
+// AUTH_KEY_UNREGISTERED so stale Web/desktop sessions fall back to login.
+//
+// Inbound layer/client-drift upgrades run before this gate (see router.dispatch),
+// so ids here are always canonical (227) — old client constructor ids never reach
+// this check.
+func rpcAllowedWithoutAuthorization(id uint32) bool {
+	switch id {
+	case tg.AuthBindTempAuthKeyRequestTypeID,
+		tg.AuthExportLoginTokenRequestTypeID,
+		tg.AuthImportLoginTokenRequestTypeID,
+		tg.AuthAcceptLoginTokenRequestTypeID,
+		tg.AuthInitPasskeyLoginRequestTypeID,
+		tg.AuthFinishPasskeyLoginRequestTypeID,
+		tg.AuthDropTempAuthKeysRequestTypeID,
+		tg.AuthSendCodeRequestTypeID,
+		tg.AuthResendCodeRequestTypeID,
+		tg.AuthCancelCodeRequestTypeID,
+		tg.AuthSignInRequestTypeID,
+		tg.AuthSignUpRequestTypeID,
+		tg.AuthImportBotAuthorizationRequestTypeID,
+		tg.AuthCheckPasswordRequestTypeID,
+		tg.AuthRequestPasswordRecoveryRequestTypeID,
+		tg.AuthRecoverPasswordRequestTypeID,
+		tg.AuthCheckRecoveryPasswordRequestTypeID,
+		tg.AuthRequestFirebaseSMSRequestTypeID,
+		tg.AuthReportMissingCodeRequestTypeID,
+		tg.AuthResetLoginEmailRequestTypeID,
+		tg.AccountGetPasswordRequestTypeID,
+		// 登录邮箱 setup（emailVerifyPurposeLoginSetup）发生在登录流程中、尚未鉴权，
+		// 故这两个 account.* 方法必须放行 pre-auth；loginChange 分支内部仍校验 userID。
+		tg.AccountSendVerifyEmailCodeRequestTypeID,
+		tg.AccountVerifyEmailRequestTypeID,
+		tg.HelpGetConfigRequestTypeID,
+		tg.HelpGetNearestDCRequestTypeID,
+		tg.HelpGetInviteTextRequestTypeID,
+		tg.HelpGetAppConfigRequestTypeID,
+		tg.HelpGetCountriesListRequestTypeID,
+		tg.HelpGetTimezonesListRequestTypeID,
+		tg.HelpGetPeerColorsRequestTypeID,
+		tg.HelpGetPeerProfileColorsRequestTypeID,
+		tg.HelpGetPromoDataRequestTypeID,
+		tg.HelpGetTermsOfServiceUpdateRequestTypeID,
+		tg.HelpGetPremiumPromoRequestTypeID,
+		tg.LangpackGetLanguagesRequestTypeID,
+		tg.LangpackGetLanguageRequestTypeID,
+		tg.LangpackGetLangPackRequestTypeID,
+		tg.LangpackGetDifferenceRequestTypeID,
+		tg.LangpackGetStringsRequestTypeID:
+		return true
+	default:
+		return false
+	}
+}

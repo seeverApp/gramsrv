@@ -9,6 +9,7 @@ import (
 const (
 	destroyAuthKeyRequestTypeID = 0xd1435160
 	destroyAuthKeyOkTypeID      = 0xf660e1d4
+	destroyAuthKeyFailTypeID    = 0xea109b13
 )
 
 type destroyAuthKeyRequest struct{}
@@ -29,5 +30,12 @@ type destroyAuthKeyOk struct{}
 
 func (*destroyAuthKeyOk) Encode(b *bin.Buffer) error {
 	b.PutID(destroyAuthKeyOkTypeID)
+	return nil
+}
+
+type destroyAuthKeyFail struct{}
+
+func (*destroyAuthKeyFail) Encode(b *bin.Buffer) error {
+	b.PutID(destroyAuthKeyFailTypeID)
 	return nil
 }

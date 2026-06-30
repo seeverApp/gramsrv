@@ -1,8 +1,8 @@
 # gramsrv
 
-`gramsrv` is a Go implementation of a Telegram-like MTProto server, focused on
-real client compatibility, repeatable protocol research, self-hosted chat
-experiments, and ongoing tracking of newer Telegram client behavior.
+`gramsrv` is an open-source Telegram-like MTProto server written in Go. It is
+built for real client compatibility, self-hosted chat experiments, protocol
+research, and long-running work toward a practical community server.
 
 [Website](https://telesrv.net) · [Discussion group](https://t.me/telesrv_chat) · [Channel](https://t.me/telesrv) · [中文 README](README.zh-CN.md)
 
@@ -13,63 +13,37 @@ or sponsored by Telegram or the official Telegram team.
 
 https://github.com/user-attachments/assets/25e651dc-a022-4d60-8b9b-ca3e8bfe216c
 
-## Highlights
+## Project Traits
 
-- **One server program to run.** After PostgreSQL and Redis are ready, the Go
-  server process wires together RSA key preparation, database migrations,
-  language pack seeding, MTProto edge handling, RPC routing, updates,
-  media/files, and reliable dispatch workers.
-- **Multi-device is implemented.** Telegram Desktop and Android clients can use
-  the same server state, with scoped sessions, online fan-out, current-session
-  exclusion, and offline recovery through update difference APIs.
-- **Maintained with Telegram version tracking.** The public baseline stays
-  reproducible, while newer Telegram Desktop and Android behavior is tracked
-  through real client traces, compatibility notes, and targeted follow-up work.
-- **Optimized hot paths are part of the design.** Batched reliable outbox
-  delivery, warmed PostgreSQL pools, scoped session lookups, bounded RPC inputs,
-  and seek-style pagination reduce repeated work on chat, sync, and media paths.
-- **Telegram Desktop is the primary compatibility target.** The public build
-  tracks a pinned TDesktop baseline and keeps compatibility work documented.
-- **Android compatibility is active.** The current public screenshots include a
-  patched Android client connected to the same server path.
-- **Core chat paths work today.** Login, users, contacts, dialogs, private
-  messages, supergroups/channels, media/files, profile/channel photos,
-  stickers, reactions, language packs, and presence are covered on the main
-  path.
-- **Production boundaries are explicit.** Large-scale public channels,
-  multi-DC/file-DC/CDN, Bot API, payments, stories, Premium business logic,
-  abuse controls, and production object storage are outside the current public
-  scope.
+| Status | Trait | What it means |
+|---|---|---|
+| ✅ | One program startup | One Go binary prepares RSA keys, runs migrations, seeds data, opens MTProto, serves RPC handlers, dispatches updates, and starts workers. |
+| ✅ | Fully open server code | Protocol edge, domain services, storage, compatibility handlers, media, updates, admin surfaces, and experiments are all in this repository. |
 
-For downloads, public information, and the current hosted experience entry,
-visit [telesrv.net](https://telesrv.net). For questions, compatibility reports,
-and development discussion, join [t.me/telesrv_chat](https://t.me/telesrv_chat).
+## Feature Checklist
 
-## Maintenance and Version Tracking
+Everything below is an implemented server-side capability in the open-source
+codebase.
 
-`gramsrv` does not treat one pinned client build as the end of the work. The
-pinned Telegram Desktop baseline keeps regressions reproducible, while newer
-Telegram Desktop and Android releases are followed separately through real
-client startup/sync traces, compatibility matrix updates, and focused adaptation
-tasks.
+| Status | Feature | What works today |
+|---|---|---|
+| ✅ | MTProto server edge | TCP transport, RSA key exchange, auth keys, encrypted sessions, salts, ack/resend, bad messages, RPC dispatch, and layer compatibility helpers. |
+| ✅ | Login and accounts | Development login code, sign-in, sign-up, log-out, authorizations, account settings, SRP/password state, email/passkey-oriented paths. |
+| ✅ | Users and contacts | User profiles, usernames, profile photos, contact import/search, blocked/privacy state, presence, and last-seen style status. |
+| ✅ | Dialogs and sync | Dialog list, pinned dialogs, manual unread, folders/filters, drafts, read boundaries, durable updates, online fan-out, and offline difference recovery. |
+| ✅ | Private chats | Send, history, read receipts, edit, delete, forward, reply, rich entities, grouped/media messages, reactions, scheduled/TTL-oriented paths. |
+| ✅ | Supergroups and channels | Create, join, leave, invite links, participants, admins, forum topics, history, send/edit/delete/read, reactions, public search, and previews. |
+| ✅ | Media and files | Upload, download, local blob storage, photos, documents, thumbnails, external media fetch, web page previews, map tile cache hooks, profile/channel photos. |
+| ✅ | Stickers and reactions | Sticker/reaction catalog, seed support, recent reactions, top reactions, default reactions, and moderation-oriented reaction paths. |
+| ✅ | Gifts and stars | Star gifts and local stars ledger foundations for compatibility and future feature work. |
+| ✅ | Bots and mini apps | Bot service foundations, callbacks, inline helpers, webview/mini-app paths, minimal Bot API gateway, and demo tools. |
+| ✅ | Calls and real-time | Private call signaling foundations, group call state, SFU/TURN building blocks, liveness, and expiry workers. |
+| ✅ | Admin and operations | Admin API/UI backend, PostgreSQL migrations, Redis volatile state, retention workers, pprof/debug hooks, and load-test helpers. |
+| ✅ | Desktop, Android, and Web focus | Telegram Desktop is the primary target, with Android and Web compatibility paths actively covered by the same server. |
 
-When a new Telegram client path appears, the expected workflow is to record it,
-bound the inputs, decide whether it should be implemented, stubbed, or marked as
-out of scope, and then keep the repository documentation in sync with the actual
-behavior.
-
-## Repository Layout
-
-```text
-cmd/telesrv/              server entrypoint
-deploy/                   docker-compose and PostgreSQL migrations
-internal/mtprotoedge/     MTProto transport, auth key, session, ack/resend
-internal/rpc/             TL router and Telegram Desktop compatibility handlers
-internal/app/             domain services
-internal/domain/          protocol-independent domain models
-internal/store/           store interfaces and memory/postgres/redis backends
-docs/                     compatibility notes and module design docs
-```
+Some items are compatibility-first or experimental, but they are real open
+server code, not hidden product-only features. The next step is making these
+paths stronger together.
 
 ## Quick Start
 
@@ -85,27 +59,31 @@ Start PostgreSQL and Redis:
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-Build and run the server:
+Build and run the single server program:
 
 ```powershell
 go build -o bin/gramsrv.exe ./cmd/telesrv
 .\bin\gramsrv.exe
 ```
 
-On first start, `gramsrv` creates `data/server_rsa.pem`, applies all database
-migrations, seeds bundled language packs, and listens on `0.0.0.0:2398`.
+On first start, `gramsrv` creates `data/server_rsa.pem`, applies database
+migrations, seeds bundled language packs, prepares optional media resources,
+starts MTProto on `0.0.0.0:2398`, and brings up the update/media/background
+workers in the same process.
 
-Useful development environment variables:
+Useful local environment variables:
 
 | Variable | Default | Meaning |
 |---|---:|---|
 | `TELESRV_LISTEN` | `0.0.0.0:2398` | MTProto listen address |
-| `TELESRV_ADVERTISE_IP` | `127.0.0.1` | IP written into `help.getConfig` |
+| `TELESRV_ADVERTISE_IP` | `127.0.0.1` | IP advertised to compatible clients |
 | `TELESRV_DC` | `2` | self-hosted DC id |
 | `TELESRV_DEV_AUTH_CODE` | `12345` | fixed login code for local development |
 | `TELESRV_POSTGRES_DSN` | local Compose DSN | PostgreSQL connection string |
-| `TELESRV_REDIS_ADDR` | `localhost:6399` | Redis address |
-| `TELESRV_STICKER_SEED_DIR` | `data/sticker-seed` | optional exported sticker/reaction seed directory |
+| `TELESRV_REDIS_ADDR` | `127.0.0.1:6399` | Redis address |
+| `TELESRV_LANGPACK_SEED_DIR` | `data/langpack` | bundled language pack seed directory |
+| `TELESRV_BLOB_DIR` | `data/blobs` | local media blob directory |
+| `TELESRV_STICKER_SEED_DIR` | `data/sticker-seed` | optional sticker/reaction seed directory |
 
 The optional sticker seed directory is skipped when it does not exist.
 
@@ -161,22 +139,49 @@ Recommended checks:
 - Check server logs for no new `NOT_IMPLEMENTED`, `Unhandled RPC`, `bad_msg`,
   panic, or internal errors.
 
-## Documentation
+## Repository Layout
 
-- [Compatibility matrix](docs/compatibility-matrix.md)
-- [Telegram Desktop patch notes](docs/tdesktop-patch-notes.md)
-- [Persistence layer](docs/persistence-layer.md)
-- [Message module](docs/message-module.md)
-- [Channel module](docs/channel-module.md)
-- [Performance audit](docs/performance-audit.md)
+```text
+cmd/telesrv/              server entrypoint
+cmd/telesrv-admin/        admin backend and web UI
+deploy/                   docker-compose, migrations, deploy helpers
+data/                     bundled language packs and optional seed data
+internal/mtprotoedge/     MTProto transport, auth key, session, ack/resend
+internal/rpc/             TL router and client compatibility handlers
+internal/app/             domain services
+internal/domain/          protocol-independent domain models
+internal/store/           memory/postgres/redis storage backends
+internal/seed/            bundled seed catalog loaders
+internal/sfu/             real-time SFU experiments
+internal/turnsrv/         TURN/STUN building blocks
+```
 
-## Contributing
+## Help Improve It
 
-Compatibility-driven contributions are welcome. Useful areas include Telegram
-Desktop and Android reports, reproducible RPC traces, focused bug fixes,
-new Telegram client version reports, multi-device update tests, performance
-work on already implemented paths, and documentation that makes local setup
-easier.
+`gramsrv` will get better fastest if more people run it, break it, profile it,
+and send focused improvements. Helpful contributions include:
 
-If a change affects visible client behavior, include the client version/commit,
-the RPC path you tested, and the server log result.
+- Telegram Desktop and Android compatibility reports with reproducible steps.
+- RPC traces for startup, sync, chat, media, calls, bots, or edge cases.
+- Focused fixes for implemented paths instead of broad rewrites.
+- Tests for online/offline updates, multi-device sessions, read state, media,
+  and channel behavior.
+- Performance work on hot paths such as fan-out, pagination, storage queries,
+  media upload/download, and connection handling.
+- Setup improvements that make the one-program local experience smoother.
+
+If a change affects visible client behavior, please include the client
+version/commit, the RPC path you tested, and whether server logs stayed free of
+new `NOT_IMPLEMENTED`, `Unhandled RPC`, `bad_msg`, panic, or internal errors.
+
+## License
+
+`gramsrv` is released under the [Apache License 2.0](LICENSE). You may use,
+modify, distribute, and use it commercially under the terms of Apache-2.0.
+
+## Custom Development
+
+For paid custom development, you can contact the author through the discussion
+group or website. Custom work can cover server features, Telegram Desktop,
+Android, Web, deployment, compatibility adaptation, or other client/server
+paths around this project.

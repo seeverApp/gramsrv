@@ -10,6 +10,8 @@ import (
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/proto"
 	"github.com/gotd/td/transport"
+
+	"telesrv/internal/compat/layerwire"
 )
 
 // Conn 是一个已识别 session 的客户端连接，持有向其加密发送消息所需的全部上下文。
@@ -67,7 +69,35 @@ type Conn struct {
 	userID                  atomic.Int64
 	userIDResolved          atomic.Bool
 	receivesUpdates         atomic.Bool
+	// membershipsSynced 表示该连接的 channel membership 推送路由（byMemberChannel）
+	// 已成功建立。它与 receivesUpdates 共同构成「session 完全就绪」：membership
+	// 同步失败时保持 false，让置位短路放行、下一条 RPC 重试同步，避免
+	// 「已置位但 channel 路由缺失」的 session 静默漏收超级群推送。
+	membershipsSynced atomic.Bool
+	// keyDestroyed 标记本连接的 auth_key 已被 destroy_auth_key 删除。serveConn 对已建立
+	// 连接复用缓存密钥跳过每帧 AuthKeyStore 回查；置位后强制回落到 Get→AuthKeyNotFound，
+	// 维持「destroy_auth_key 发起连接下一帧自然失效」契约。只由 destroy_auth_key 处理器置位。
+	keyDestroyed atomic.Bool
+	// lastSessionSaveUnix 是上次把本连接 session 持久化到 SessionStore 的 unix 秒，用于把
+	// 每帧 Save 去抖到固定间隔——session 持久化是软状态（生产无热读路径，仅观测/未来用）。
+	// 只由单连接的读循环 goroutine 访问。
+	lastSessionSaveUnix atomic.Int64
+	// clientLayer 是本连接协商的 TL layer（invokeWithLayer/initConnection），由 handleRPC
+	// 在每次 Dispatch 后从 RPC 注册表刷新。出站(rpc_result/push)按此把 227 对象降级给老客户端；
+	// 0 表示尚未协商，按 canonical(227) 处理=不降级。
+	clientLayer atomic.Int32
 }
+
+// ClientLayer 返回连接协商的 TL layer；未协商时返回 canonical layer（227，不降级）。
+func (c *Conn) ClientLayer() int {
+	if l := c.clientLayer.Load(); l != 0 {
+		return int(l)
+	}
+	return layerwire.CanonicalLayer
+}
+
+// SetClientLayer 记录连接协商的 TL layer。
+func (c *Conn) SetClientLayer(layer int) { c.clientLayer.Store(int32(layer)) }
 
 // AuthKeyID 返回连接的 auth_key_id。
 func (c *Conn) AuthKeyID() [8]byte { return c.authKeyID }

@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -17,7 +18,12 @@ import (
 const (
 	defaultOutboxBatch    = 100
 	defaultOutboxInterval = 200 * time.Millisecond
-	defaultOutboxWorkers  = 2
+	defaultOutboxWorkers  = 1
+	// defaultOutboxMaxIdleInterval 是空闲退避上界：连续空 claim 时把轮询间隔从 interval
+	// 指数退避到此上界，削减「无消息时也每 200ms 查一次 DB」的空转；一旦有活就立刻复位到
+	// interval。代价是「长时间静默后的第一条消息」最多多等这个上界——退避只在持续空闲时触及，
+	// 会话期间有近期活动即保持快速轮询，故对正常收发延迟无影响。
+	defaultOutboxMaxIdleInterval = 1 * time.Second
 )
 
 var errMissingOutboxEvent = errors.New("missing outbox update event")
@@ -25,19 +31,37 @@ var errMissingOutboxEvent = errors.New("missing outbox update event")
 // OutboxDispatcher 把 PG transactional outbox 中的 update 批量推给在线 session。
 // 多 worker 并发 claim：ClaimPending 用 FOR UPDATE SKIP LOCKED，worker 间认领不重叠。
 type OutboxDispatcher struct {
-	events      store.UpdateEventStore
-	outbox      store.DispatchOutboxStore
-	sessions    SessionBinder
-	log         *zap.Logger
-	metrics     Metrics
-	batch       int
-	interval    time.Duration
-	workers     int
-	pushTimeout time.Duration
+	events          store.UpdateEventStore
+	outbox          store.DispatchOutboxStore
+	sessions        SessionBinder
+	log             *zap.Logger
+	metrics         Metrics
+	updateBuilder   OutboxUpdateBuilder
+	batch           int
+	interval        time.Duration
+	maxIdleInterval time.Duration
+	workers         int
+	pushTimeout     time.Duration
 }
 
 // OutboxOption 调整 OutboxDispatcher 的运行参数。
 type OutboxOption func(*OutboxDispatcher)
+
+// OutboxUpdateRequest 是 outbox worker 构造在线 updates 时的批量输入。
+type OutboxUpdateRequest struct {
+	TargetUserID int64
+	Event        domain.UpdateEvent
+}
+
+// OutboxUpdateBuilder 按接收者视角批量把 domain.UpdateEvent 转为 TL updates。
+type OutboxUpdateBuilder func(ctx context.Context, requests []OutboxUpdateRequest) []*tg.Updates
+
+// WithOutboxUpdateBuilder 注入按接收者视角的批量 updates 构建器。
+func WithOutboxUpdateBuilder(builder OutboxUpdateBuilder) OutboxOption {
+	return func(d *OutboxDispatcher) {
+		d.updateBuilder = builder
+	}
+}
 
 // WithOutboxBatch 设置每次 claim 的最大条数；<=0 时保持默认。
 func WithOutboxBatch(n int) OutboxOption {
@@ -91,14 +115,15 @@ func NewOutboxDispatcher(events store.UpdateEventStore, outbox store.DispatchOut
 		log = zap.NewNop()
 	}
 	d := &OutboxDispatcher{
-		events:   events,
-		outbox:   outbox,
-		sessions: sessions,
-		log:      log,
-		metrics:  NopMetrics{},
-		batch:    defaultOutboxBatch,
-		interval: defaultOutboxInterval,
-		workers:  defaultOutboxWorkers,
+		events:          events,
+		outbox:          outbox,
+		sessions:        sessions,
+		log:             log,
+		metrics:         NopMetrics{},
+		batch:           defaultOutboxBatch,
+		interval:        defaultOutboxInterval,
+		maxIdleInterval: defaultOutboxMaxIdleInterval,
+		workers:         defaultOutboxWorkers,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -129,17 +154,9 @@ func (d *OutboxDispatcher) Run(ctx context.Context) {
 }
 
 // runWorker 是单个 claim 循环；多 worker 靠 ClaimPending 的 SKIP LOCKED 互不重叠。
+// 空闲指数退避（interval→maxIdleInterval），claim 到事件即复位到 interval：有活快、无活省。
 func (d *OutboxDispatcher) runWorker(ctx context.Context) {
-	ticker := time.NewTicker(d.interval)
-	defer ticker.Stop()
-	for {
-		d.DispatchOnce(ctx)
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
+	runIdleBackoffLoop(ctx, d.interval, d.maxIdleInterval, d.DispatchOnce)
 }
 
 // batchEventLoader 是 UpdateEventStore 的可选批量能力：一次取多条 (user,pts) 事件。
@@ -152,27 +169,43 @@ type batchOutboxMarker interface {
 	MarkDeliveredBatch(ctx context.Context, items []store.DispatchOutboxItem) error
 }
 
-// DispatchOnce claim 一批 outbox 并投递，测试可直接调用。
+// DispatchOnce claim 一批 outbox 并投递，测试可直接调用。返回本次是否 claim 到事件，
+// 供 runWorker 决定快轮询还是空闲退避。
 // store 同时具备批量取事件 + 批量标记能力时走批量路径（每批 ~3 次 PG 往返），否则逐条回退。
-func (d *OutboxDispatcher) DispatchOnce(ctx context.Context) {
+func (d *OutboxDispatcher) DispatchOnce(ctx context.Context) bool {
 	items, err := d.outbox.ClaimPending(ctx, d.batch)
 	if err != nil {
 		d.log.Warn("claim dispatch outbox", zap.Error(err))
-		return
+		return false
 	}
 	if len(items) == 0 {
-		return
+		return false
 	}
+	sortDispatchItems(items)
 	d.metrics.OutboxClaimed(len(items))
 	if loader, ok := d.events.(batchEventLoader); ok {
 		if marker, ok := d.outbox.(batchOutboxMarker); ok {
 			d.dispatchBatch(ctx, items, loader, marker)
-			return
+			return true
 		}
 	}
 	for _, item := range items {
 		d.dispatchItem(ctx, item)
 	}
+	return true
+}
+
+func sortDispatchItems(items []store.DispatchOutboxItem) {
+	sort.SliceStable(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if a.TargetUserID != b.TargetUserID {
+			return a.TargetUserID < b.TargetUserID
+		}
+		if a.Pts != b.Pts {
+			return a.Pts < b.Pts
+		}
+		return a.ID < b.ID
+	})
 }
 
 type outboxEventKey struct {
@@ -200,14 +233,22 @@ func (d *OutboxDispatcher) dispatchBatch(ctx context.Context, items []store.Disp
 		byKey[outboxEventKey{event.UserID, event.Pts}] = event
 	}
 	start := time.Now()
-	delivered := make([]store.DispatchOutboxItem, 0, len(items))
+	ready := make([]outboxDispatchReady, 0, len(items))
+	requests := make([]OutboxUpdateRequest, 0, len(items))
 	for _, item := range items {
 		event, ok := byKey[outboxEventKey{item.TargetUserID, item.Pts}]
 		if !ok {
 			d.markDispatchFailed(ctx, item, errMissingOutboxEvent)
 			continue
 		}
-		update := tgUpdateForOutboxEvent(event)
+		ready = append(ready, outboxDispatchReady{item: item})
+		requests = append(requests, OutboxUpdateRequest{TargetUserID: item.TargetUserID, Event: event})
+	}
+	builtUpdates := d.buildOutboxUpdates(ctx, requests)
+	delivered := make([]store.DispatchOutboxItem, 0, len(items))
+	for i, entry := range ready {
+		item := entry.item
+		update := builtUpdates[i]
 		if update == nil {
 			delivered = append(delivered, item)
 			continue
@@ -241,6 +282,10 @@ func (d *OutboxDispatcher) dispatchBatch(ctx context.Context, items []store.Disp
 	}
 }
 
+type outboxDispatchReady struct {
+	item store.DispatchOutboxItem
+}
+
 func (d *OutboxDispatcher) dispatchItem(ctx context.Context, item store.DispatchOutboxItem) {
 	start := time.Now()
 	events, err := d.events.ListAfter(ctx, item.TargetUserID, item.Pts-1, 1)
@@ -252,7 +297,7 @@ func (d *OutboxDispatcher) dispatchItem(ctx context.Context, item store.Dispatch
 		d.markDispatchFailed(ctx, item, errMissingOutboxEvent)
 		return
 	}
-	update := tgUpdateForOutboxEvent(events[0])
+	update := d.buildOutboxUpdate(ctx, item, events[0])
 	if update == nil {
 		if err := d.outbox.MarkDelivered(ctx, item.TargetUserID, item.ID); err != nil {
 			d.log.Warn("mark noop dispatch delivered", zap.Int64("target_user_id", item.TargetUserID), zap.Int64("outbox_id", item.ID), zap.Error(err))
@@ -287,6 +332,35 @@ func (d *OutboxDispatcher) dispatchItem(ctx context.Context, item store.Dispatch
 		zap.Int("pts", item.Pts),
 		zap.Int("sessions", sent),
 	)
+}
+
+func (d *OutboxDispatcher) buildOutboxUpdate(ctx context.Context, item store.DispatchOutboxItem, event domain.UpdateEvent) *tg.Updates {
+	updates := d.buildOutboxUpdates(ctx, []OutboxUpdateRequest{{TargetUserID: item.TargetUserID, Event: event}})
+	if len(updates) == 0 {
+		return nil
+	}
+	return updates[0]
+}
+
+func (d *OutboxDispatcher) buildOutboxUpdates(ctx context.Context, requests []OutboxUpdateRequest) []*tg.Updates {
+	out := make([]*tg.Updates, len(requests))
+	if len(requests) == 0 {
+		return out
+	}
+	if d.updateBuilder != nil {
+		built := d.updateBuilder(ctx, requests)
+		if len(built) == len(requests) {
+			return built
+		}
+		d.log.Warn("outbox update builder returned mismatched count",
+			zap.Int("requests", len(requests)),
+			zap.Int("updates", len(built)),
+		)
+	}
+	for i, req := range requests {
+		out[i] = tgUpdateForOutboxEvent(req.Event)
+	}
+	return out
 }
 
 // pushOutboxUpdate 投递一条 outbox update，返回 (送达的在线 session 数, 是否可重试, err)。
@@ -335,9 +409,16 @@ func (d *OutboxDispatcher) markDispatchFailed(ctx context.Context, item store.Di
 }
 
 func tgUpdateForOutboxEvent(event domain.UpdateEvent) *tg.Updates {
+	return tgUpdateForOutboxEventForViewer(event, event.UserID)
+}
+
+func tgUpdateForOutboxEventForViewer(event domain.UpdateEvent, viewerUserID int64) *tg.Updates {
+	if viewerUserID == 0 {
+		viewerUserID = event.UserID
+	}
 	switch event.Type {
 	case domain.UpdateEventNewMessage:
-		return tgPrivateMessageUpdates(event, event.Message, 0, false, tgUsers(event.Users), tgChannels(event.UserID, event.Channels))
+		return tgPrivateMessageUpdates(event, event.Message, 0, false, tgUsersForViewer(viewerUserID, event.Users), tgChannels(viewerUserID, event.Channels))
 	case domain.UpdateEventReadHistoryInbox, domain.UpdateEventReadHistoryOutbox:
 		var update tg.UpdateClass
 		if event.Type == domain.UpdateEventReadHistoryOutbox {
@@ -349,7 +430,7 @@ func tgUpdateForOutboxEvent(event domain.UpdateEvent) *tg.Updates {
 			return nil
 		}
 		return &tg.Updates{
-			Updates: []tg.UpdateClass{update},
+			Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{update}, event),
 			Date:    event.Date,
 			Seq:     0, // 私聊不维护账号级 seq，恒 0
 		}
@@ -361,9 +442,23 @@ func tgUpdateForOutboxEvent(event domain.UpdateEvent) *tg.Updates {
 			return nil
 		}
 		return &tg.Updates{
-			Updates: []tg.UpdateClass{update},
+			Updates: appendAuxPtsBookkeeping([]tg.UpdateClass{update}, event),
 			Date:    event.Date,
 			Seq:     0,
 		}
 	}
+}
+
+// appendAuxPtsBookkeeping 给"占账号 pts 但 TL update 不带 pts"的事件附一条
+// 空 updateDeleteMessages：客户端按 pts/pts_count 推进本地水位且不产生任何
+// 可见变化。没有它，客户端水位停在事件前，下一条带 pts 的更新会被判为空洞。
+func appendAuxPtsBookkeeping(updates []tg.UpdateClass, event domain.UpdateEvent) []tg.UpdateClass {
+	if event.Pts <= 0 || event.PtsCount <= 0 || !event.LacksWirePts() {
+		return updates
+	}
+	return append(updates, &tg.UpdateDeleteMessages{
+		Messages: []int{},
+		Pts:      event.Pts,
+		PtsCount: event.PtsCount,
+	})
 }

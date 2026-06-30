@@ -1,3 +1,0 @@
--- Forward-only data normalization. Reintroducing upstream seed document ids on
--- rollback would make local media identity ambiguous again, so there is no
--- destructive down migration.

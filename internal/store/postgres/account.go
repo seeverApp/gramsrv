@@ -31,7 +31,7 @@ SELECT
   email_unconfirmed_pattern, login_email_pattern, secure_random,
   current_algo_salt1, current_algo_salt2, current_algo_g, current_algo_p,
   srp_id, srp_verifier, srp_b_secret, srp_b,
-  recovery_email, recovery_code, recovery_code_expires_at
+  recovery_email, recovery_code, recovery_code_expires_at, login_email
 FROM account_passwords
 WHERE user_id = $1`, userID)
 	var settings domain.PasswordSettings
@@ -42,7 +42,7 @@ WHERE user_id = $1`, userID)
 		&settings.EmailUnconfirmedPattern, &settings.LoginEmailPattern, &settings.SecureRandom,
 		&salt1, &salt2, &settings.NewAlgo.G, &p,
 		&settings.SRPID, &settings.SRPVerifier, &settings.SRPBSecret, &settings.SRPB,
-		&settings.RecoveryEmail, &settings.RecoveryCode, &recoveryExpires,
+		&settings.RecoveryEmail, &settings.RecoveryCode, &recoveryExpires, &settings.LoginEmail,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.PasswordSettings{}, false, nil
@@ -85,9 +85,9 @@ INSERT INTO account_passwords (
   email_unconfirmed_pattern, login_email_pattern, secure_random,
   current_algo_salt1, current_algo_salt2, current_algo_g, current_algo_p,
   srp_id, srp_verifier, srp_b_secret, srp_b,
-  recovery_email, recovery_code, recovery_code_expires_at
+  recovery_email, recovery_code, recovery_code_expires_at, login_email
 )
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
 ON CONFLICT (user_id) DO UPDATE SET
   has_recovery = EXCLUDED.has_recovery,
   has_secure_values = EXCLUDED.has_secure_values,
@@ -107,18 +107,26 @@ ON CONFLICT (user_id) DO UPDATE SET
   recovery_email = EXCLUDED.recovery_email,
   recovery_code = EXCLUDED.recovery_code,
   recovery_code_expires_at = EXCLUDED.recovery_code_expires_at,
+  login_email = EXCLUDED.login_email,
   updated_at = now()`,
 		userID,
 		settings.HasRecovery, settings.HasSecureValues, settings.HasPassword, settings.Hint,
-		settings.EmailUnconfirmedPattern, settings.LoginEmailPattern, settings.SecureRandom,
-		algo.Salt1, algo.Salt2, algo.G, algo.P,
-		settings.SRPID, settings.SRPVerifier, settings.SRPBSecret, settings.SRPB,
-		settings.RecoveryEmail, settings.RecoveryCode, recoveryExpires,
+		settings.EmailUnconfirmedPattern, settings.LoginEmailPattern, nonNilBytea(settings.SecureRandom),
+		nonNilBytea(algo.Salt1), nonNilBytea(algo.Salt2), algo.G, nonNilBytea(algo.P),
+		settings.SRPID, nonNilBytea(settings.SRPVerifier), nonNilBytea(settings.SRPBSecret), nonNilBytea(settings.SRPB),
+		settings.RecoveryEmail, settings.RecoveryCode, recoveryExpires, settings.LoginEmail,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert account password: %w", err)
 	}
 	return nil
+}
+
+func nonNilBytea(in []byte) []byte {
+	if in != nil {
+		return in
+	}
+	return []byte{}
 }
 
 func (s *PasswordStore) GetReactionSettings(ctx context.Context, userID int64) (domain.AccountReactionSettings, bool, error) {
@@ -146,7 +154,9 @@ WHERE user_id = $1`, userID)
 	settings.Notify.MessagesFrom = domain.ReactionNotifyFrom(messagesFrom)
 	settings.Notify.StoriesFrom = domain.ReactionNotifyFrom(storiesFrom)
 	settings.Notify.PollVotesFrom = domain.ReactionNotifyFrom(pollVotesFrom)
-	settings.DefaultReaction = domain.MessageReaction{Type: domain.MessageReactionType(defaultType), Emoticon: defaultValue}
+	if reaction, ok := domain.MessageReactionFromValue(domain.MessageReactionType(defaultType), defaultValue); ok {
+		settings.DefaultReaction = reaction
+	}
 	settings.PaidPrivacy = domain.PaidReactionPrivacy{Kind: domain.PaidReactionPrivacyKind(paidKind)}
 	if settings.PaidPrivacy.Kind == domain.PaidReactionPrivacyPeer && paidPeerType.Valid && paidPeerID.Valid {
 		peer := domain.Peer{Type: domain.PeerType(paidPeerType.String), ID: paidPeerID.Int64}
@@ -180,10 +190,601 @@ ON CONFLICT (user_id) DO UPDATE SET
     updated_at = now()`,
 		userID,
 		string(settings.Notify.MessagesFrom), string(settings.Notify.StoriesFrom), string(settings.Notify.PollVotesFrom), settings.Notify.ShowPreviews,
-		string(settings.DefaultReaction.Type), settings.DefaultReaction.Emoticon,
+		string(settings.DefaultReaction.Type), settings.DefaultReaction.Value(),
 		string(settings.PaidPrivacy.Kind), paidPeerType, paidPeerID,
 	); err != nil {
 		return fmt.Errorf("save account reaction settings: %w", err)
 	}
 	return nil
+}
+
+func (s *PasswordStore) GetAccountSettings(ctx context.Context, userID int64) (domain.AccountSettings, bool, error) {
+	row := s.db.QueryRow(ctx, `
+SELECT archive_and_mute_new_noncontact_peers, keep_archived_unmuted, keep_archived_folders,
+       hide_read_marks, new_noncontact_peers_require_premium, display_gifts_button,
+       noncontact_peers_paid_stars, account_ttl_days, sensitive_content_enabled, contact_signup_silent
+FROM account_settings
+WHERE user_id = $1`, userID)
+	settings := domain.DefaultAccountSettings()
+	gp := &settings.GlobalPrivacy
+	if err := row.Scan(
+		&gp.ArchiveAndMuteNewNoncontactPeers, &gp.KeepArchivedUnmuted, &gp.KeepArchivedFolders,
+		&gp.HideReadMarks, &gp.NewNoncontactPeersRequirePremium, &gp.DisplayGiftsButton,
+		&gp.NoncontactPeersPaidStars, &settings.AccountTTLDays, &settings.SensitiveContentEnabled, &settings.ContactSignUpSilent,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.AccountSettings{}, false, nil
+		}
+		return domain.AccountSettings{}, false, fmt.Errorf("get account settings: %w", err)
+	}
+	return settings, true, nil
+}
+
+func (s *PasswordStore) SaveAccountSettings(ctx context.Context, userID int64, settings domain.AccountSettings) error {
+	gp := settings.GlobalPrivacy
+	if _, err := s.db.Exec(ctx, `
+INSERT INTO account_settings (
+    user_id, archive_and_mute_new_noncontact_peers, keep_archived_unmuted, keep_archived_folders,
+    hide_read_marks, new_noncontact_peers_require_premium, display_gifts_button,
+    noncontact_peers_paid_stars, account_ttl_days, sensitive_content_enabled, contact_signup_silent
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+ON CONFLICT (user_id) DO UPDATE SET
+    archive_and_mute_new_noncontact_peers = EXCLUDED.archive_and_mute_new_noncontact_peers,
+    keep_archived_unmuted = EXCLUDED.keep_archived_unmuted,
+    keep_archived_folders = EXCLUDED.keep_archived_folders,
+    hide_read_marks = EXCLUDED.hide_read_marks,
+    new_noncontact_peers_require_premium = EXCLUDED.new_noncontact_peers_require_premium,
+    display_gifts_button = EXCLUDED.display_gifts_button,
+    noncontact_peers_paid_stars = EXCLUDED.noncontact_peers_paid_stars,
+    account_ttl_days = EXCLUDED.account_ttl_days,
+    sensitive_content_enabled = EXCLUDED.sensitive_content_enabled,
+    contact_signup_silent = EXCLUDED.contact_signup_silent,
+    updated_at = now()`,
+		userID,
+		gp.ArchiveAndMuteNewNoncontactPeers, gp.KeepArchivedUnmuted, gp.KeepArchivedFolders,
+		gp.HideReadMarks, gp.NewNoncontactPeersRequirePremium, gp.DisplayGiftsButton,
+		gp.NoncontactPeersPaidStars, settings.NormalizedTTLDays(), settings.SensitiveContentEnabled, settings.ContactSignUpSilent,
+	); err != nil {
+		return fmt.Errorf("save account settings: %w", err)
+	}
+	return nil
+}
+
+func notifyScopeColumns(scope domain.NotifyScope) (kind, peerType string, peerID int64, topicID int) {
+	kind = string(scope.Kind)
+	if scope.Kind == domain.NotifyScopePeer {
+		return kind, string(scope.Peer.Type), scope.Peer.ID, scope.TopicID
+	}
+	return kind, "", 0, 0
+}
+
+func scanNotifySettings(row pgx.Row) (domain.PeerNotifySettings, error) {
+	var showPreviews, silent, storiesMuted, storiesHideSender sql.NullBool
+	var muteUntil sql.NullInt32
+	if err := row.Scan(&showPreviews, &silent, &muteUntil, &storiesMuted, &storiesHideSender); err != nil {
+		return domain.PeerNotifySettings{}, err
+	}
+	out := domain.PeerNotifySettings{}
+	if showPreviews.Valid {
+		out.ShowPreviews = &showPreviews.Bool
+	}
+	if silent.Valid {
+		out.Silent = &silent.Bool
+	}
+	if muteUntil.Valid {
+		v := int(muteUntil.Int32)
+		out.MuteUntil = &v
+	}
+	if storiesMuted.Valid {
+		out.StoriesMuted = &storiesMuted.Bool
+	}
+	if storiesHideSender.Valid {
+		out.StoriesHideSender = &storiesHideSender.Bool
+	}
+	return out, nil
+}
+
+func (s *PasswordStore) GetNotifySettings(ctx context.Context, ownerUserID int64, scope domain.NotifyScope) (domain.PeerNotifySettings, bool, error) {
+	kind, peerType, peerID, topicID := notifyScopeColumns(scope)
+	row := s.db.QueryRow(ctx, `
+SELECT show_previews, silent, mute_until, stories_muted, stories_hide_sender
+FROM notify_settings
+WHERE owner_user_id = $1 AND scope_kind = $2 AND peer_type = $3 AND peer_id = $4 AND topic_id = $5`,
+		ownerUserID, kind, peerType, peerID, topicID)
+	settings, err := scanNotifySettings(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.PeerNotifySettings{}, false, nil
+		}
+		return domain.PeerNotifySettings{}, false, fmt.Errorf("get notify settings: %w", err)
+	}
+	return settings, true, nil
+}
+
+func (s *PasswordStore) SaveNotifySettings(ctx context.Context, ownerUserID int64, scope domain.NotifyScope, settings domain.PeerNotifySettings) error {
+	kind, peerType, peerID, topicID := notifyScopeColumns(scope)
+	if _, err := s.db.Exec(ctx, `
+INSERT INTO notify_settings (
+    owner_user_id, scope_kind, peer_type, peer_id, topic_id,
+    show_previews, silent, mute_until, stories_muted, stories_hide_sender
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+ON CONFLICT (owner_user_id, scope_kind, peer_type, peer_id, topic_id) DO UPDATE SET
+    show_previews = EXCLUDED.show_previews,
+    silent = EXCLUDED.silent,
+    mute_until = EXCLUDED.mute_until,
+    stories_muted = EXCLUDED.stories_muted,
+    stories_hide_sender = EXCLUDED.stories_hide_sender,
+    updated_at = now()`,
+		ownerUserID, kind, peerType, peerID, topicID,
+		nullableBool(settings.ShowPreviews), nullableBool(settings.Silent), nullableInt(settings.MuteUntil),
+		nullableBool(settings.StoriesMuted), nullableBool(settings.StoriesHideSender),
+	); err != nil {
+		return fmt.Errorf("save notify settings: %w", err)
+	}
+	return nil
+}
+
+func (s *PasswordStore) ResetNotifySettings(ctx context.Context, ownerUserID int64) error {
+	if _, err := s.db.Exec(ctx, `DELETE FROM notify_settings WHERE owner_user_id = $1`, ownerUserID); err != nil {
+		return fmt.Errorf("reset notify settings: %w", err)
+	}
+	return nil
+}
+
+func (s *PasswordStore) GetPeerNotifySettings(ctx context.Context, ownerUserID int64, peers []domain.Peer) (map[domain.Peer]domain.PeerNotifySettings, error) {
+	out := make(map[domain.Peer]domain.PeerNotifySettings, len(peers))
+	if len(peers) == 0 {
+		return out, nil
+	}
+	types := make([]string, 0, len(peers))
+	ids := make([]int64, 0, len(peers))
+	for _, p := range peers {
+		types = append(types, string(p.Type))
+		ids = append(ids, p.ID)
+	}
+	rows, err := s.db.Query(ctx, `
+SELECT peer_type, peer_id, show_previews, silent, mute_until, stories_muted, stories_hide_sender
+FROM notify_settings
+WHERE owner_user_id = $1 AND scope_kind = 'peer' AND topic_id = 0
+  AND (peer_type, peer_id) IN (SELECT * FROM unnest($2::text[], $3::bigint[]))`,
+		ownerUserID, types, ids)
+	if err != nil {
+		return nil, fmt.Errorf("batch get notify settings: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var peerType string
+		var peerID int64
+		var showPreviews, silent, storiesMuted, storiesHideSender sql.NullBool
+		var muteUntil sql.NullInt32
+		if err := rows.Scan(&peerType, &peerID, &showPreviews, &silent, &muteUntil, &storiesMuted, &storiesHideSender); err != nil {
+			return nil, fmt.Errorf("scan notify settings: %w", err)
+		}
+		settings := domain.PeerNotifySettings{}
+		if showPreviews.Valid {
+			settings.ShowPreviews = &showPreviews.Bool
+		}
+		if silent.Valid {
+			settings.Silent = &silent.Bool
+		}
+		if muteUntil.Valid {
+			v := int(muteUntil.Int32)
+			settings.MuteUntil = &v
+		}
+		if storiesMuted.Valid {
+			settings.StoriesMuted = &storiesMuted.Bool
+		}
+		if storiesHideSender.Valid {
+			settings.StoriesHideSender = &storiesHideSender.Bool
+		}
+		out[domain.Peer{Type: domain.PeerType(peerType), ID: peerID}] = settings
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate notify settings: %w", err)
+	}
+	return out, nil
+}
+
+func (s *PasswordStore) AllPeerNotifySettings(ctx context.Context, ownerUserID int64) (map[domain.Peer]domain.PeerNotifySettings, error) {
+	// owner-scoped 单查询，走部分索引 notify_settings_owner_peer_idx（scope_kind='peer' AND topic_id=0）。
+	rows, err := s.db.Query(ctx, `
+SELECT peer_type, peer_id, show_previews, silent, mute_until, stories_muted, stories_hide_sender
+FROM notify_settings
+WHERE owner_user_id = $1 AND scope_kind = 'peer' AND topic_id = 0`, ownerUserID)
+	if err != nil {
+		return nil, fmt.Errorf("all peer notify settings: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[domain.Peer]domain.PeerNotifySettings)
+	for rows.Next() {
+		var peerType string
+		var peerID int64
+		var showPreviews, silent, storiesMuted, storiesHideSender sql.NullBool
+		var muteUntil sql.NullInt32
+		if err := rows.Scan(&peerType, &peerID, &showPreviews, &silent, &muteUntil, &storiesMuted, &storiesHideSender); err != nil {
+			return nil, fmt.Errorf("scan all peer notify settings: %w", err)
+		}
+		settings := domain.PeerNotifySettings{}
+		if showPreviews.Valid {
+			settings.ShowPreviews = &showPreviews.Bool
+		}
+		if silent.Valid {
+			settings.Silent = &silent.Bool
+		}
+		if muteUntil.Valid {
+			v := int(muteUntil.Int32)
+			settings.MuteUntil = &v
+		}
+		if storiesMuted.Valid {
+			settings.StoriesMuted = &storiesMuted.Bool
+		}
+		if storiesHideSender.Valid {
+			settings.StoriesHideSender = &storiesHideSender.Bool
+		}
+		out[domain.Peer{Type: domain.PeerType(peerType), ID: peerID}] = settings
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate all peer notify settings: %w", err)
+	}
+	return out, nil
+}
+
+func (s *PasswordStore) ListNotifyExceptions(ctx context.Context, ownerUserID int64) ([]domain.NotifyException, error) {
+	rows, err := s.db.Query(ctx, `
+SELECT peer_type, peer_id, topic_id, show_previews, silent, mute_until, stories_muted, stories_hide_sender
+FROM notify_settings
+WHERE owner_user_id = $1 AND scope_kind = 'peer'
+ORDER BY peer_type, peer_id, topic_id`, ownerUserID)
+	if err != nil {
+		return nil, fmt.Errorf("list notify exceptions: %w", err)
+	}
+	defer rows.Close()
+	out := make([]domain.NotifyException, 0)
+	for rows.Next() {
+		var peerType string
+		var peerID int64
+		var topicID int
+		var showPreviews, silent, storiesMuted, storiesHideSender sql.NullBool
+		var muteUntil sql.NullInt32
+		if err := rows.Scan(&peerType, &peerID, &topicID, &showPreviews, &silent, &muteUntil, &storiesMuted, &storiesHideSender); err != nil {
+			return nil, fmt.Errorf("scan notify exception: %w", err)
+		}
+		settings := domain.PeerNotifySettings{}
+		if showPreviews.Valid {
+			settings.ShowPreviews = &showPreviews.Bool
+		}
+		if silent.Valid {
+			settings.Silent = &silent.Bool
+		}
+		if muteUntil.Valid {
+			v := int(muteUntil.Int32)
+			settings.MuteUntil = &v
+		}
+		if storiesMuted.Valid {
+			settings.StoriesMuted = &storiesMuted.Bool
+		}
+		if storiesHideSender.Valid {
+			settings.StoriesHideSender = &storiesHideSender.Bool
+		}
+		if settings.IsZero() {
+			continue // 全默认行（如曾静音后取消）不算异常
+		}
+		out = append(out, domain.NotifyException{
+			Peer:     domain.Peer{Type: domain.PeerType(peerType), ID: peerID},
+			TopicID:  topicID,
+			Settings: settings,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate notify exceptions: %w", err)
+	}
+	return out, nil
+}
+
+func (s *PasswordStore) SaveStickerCollectionItem(ctx context.Context, userID int64, kind domain.StickerCollectionKind, documentID int64, unsave bool, now, max int) error {
+	if userID == 0 || documentID == 0 {
+		return domain.ErrStickerInvalid
+	}
+	if unsave {
+		if _, err := s.db.Exec(ctx, `DELETE FROM user_sticker_collections WHERE owner_user_id = $1 AND kind = $2 AND document_id = $3`,
+			userID, string(kind), documentID); err != nil {
+			return fmt.Errorf("unsave sticker collection item: %w", err)
+		}
+		return nil
+	}
+	if max <= 0 {
+		max = domain.MaxStickerCollectionItems(kind)
+	}
+	return withTx(ctx, s.db, "save sticker collection item", func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+INSERT INTO user_sticker_collections (owner_user_id, kind, document_id, used_at)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (owner_user_id, kind, document_id) DO UPDATE SET used_at = EXCLUDED.used_at`,
+			userID, string(kind), documentID, now); err != nil {
+			return fmt.Errorf("upsert sticker collection item: %w", err)
+		}
+		// 截断超上界：单次有序窗口扫描（索引 user_sticker_collections_order_idx 服务
+		// used_at DESC 排序），按 ctid 删除排名 > max 的旧项，避免 NOT IN 双扫全集。
+		if _, err := tx.Exec(ctx, `
+DELETE FROM user_sticker_collections
+WHERE ctid IN (
+  SELECT ctid FROM (
+    SELECT ctid, ROW_NUMBER() OVER (ORDER BY used_at DESC, document_id DESC) AS rn
+    FROM user_sticker_collections
+    WHERE owner_user_id = $1 AND kind = $2
+  ) t WHERE rn > $3
+)`, userID, string(kind), max); err != nil {
+			return fmt.Errorf("trim sticker collection: %w", err)
+		}
+		return nil
+	})
+}
+
+func (s *PasswordStore) ListStickerCollection(ctx context.Context, userID int64, kind domain.StickerCollectionKind, limit int) ([]domain.StickerCollectionItem, error) {
+	if userID == 0 {
+		return nil, nil
+	}
+	if limit <= 0 || limit > domain.MaxStickerCollectionItems(kind) {
+		limit = domain.MaxStickerCollectionItems(kind)
+	}
+	rows, err := s.db.Query(ctx, `
+SELECT document_id, used_at
+FROM user_sticker_collections
+WHERE owner_user_id = $1 AND kind = $2
+ORDER BY used_at DESC, document_id DESC
+LIMIT $3`, userID, string(kind), limit)
+	if err != nil {
+		return nil, fmt.Errorf("list sticker collection: %w", err)
+	}
+	defer rows.Close()
+	out := make([]domain.StickerCollectionItem, 0, limit)
+	for rows.Next() {
+		var item domain.StickerCollectionItem
+		if err := rows.Scan(&item.DocumentID, &item.Date); err != nil {
+			return nil, fmt.Errorf("scan sticker collection item: %w", err)
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate sticker collection: %w", err)
+	}
+	return out, nil
+}
+
+func (s *PasswordStore) ClearStickerCollection(ctx context.Context, userID int64, kind domain.StickerCollectionKind) error {
+	if _, err := s.db.Exec(ctx, `DELETE FROM user_sticker_collections WHERE owner_user_id = $1 AND kind = $2`,
+		userID, string(kind)); err != nil {
+		return fmt.Errorf("clear sticker collection: %w", err)
+	}
+	return nil
+}
+
+func nullableBool(v *bool) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+func nullableInt(v *int) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+func (s *PasswordStore) SaveMusic(ctx context.Context, req domain.SaveMusicRequest) error {
+	if req.UserID == 0 || req.Document.ID == 0 || !req.Document.IsMusic() {
+		return domain.ErrDocumentInvalid
+	}
+	return withTx(ctx, s.db, "save account music", func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+SELECT document_id
+FROM saved_music
+WHERE user_id = $1
+ORDER BY sort_order ASC, document_id ASC
+FOR UPDATE`, req.UserID)
+		if err != nil {
+			return fmt.Errorf("lock saved music: %w", err)
+		}
+		defer rows.Close()
+		current := make([]int64, 0, domain.MaxSavedMusicItems)
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				return fmt.Errorf("scan saved music id: %w", err)
+			}
+			current = append(current, id)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("scan saved music ids: %w", err)
+		}
+		if req.Unsave {
+			if _, err := tx.Exec(ctx, `DELETE FROM saved_music WHERE user_id = $1 AND document_id = $2`, req.UserID, req.Document.ID); err != nil {
+				return fmt.Errorf("delete saved music: %w", err)
+			}
+			return nil
+		}
+		exists := false
+		for _, id := range current {
+			if id == req.Document.ID {
+				exists = true
+				break
+			}
+		}
+		if req.AfterDocumentID == req.Document.ID {
+			if exists {
+				return nil
+			}
+			return domain.ErrDocumentInvalid
+		}
+		next := make([]int64, 0, len(current)+1)
+		afterIndex := -1
+		for _, id := range current {
+			if id == req.Document.ID {
+				continue
+			}
+			if id == req.AfterDocumentID {
+				afterIndex = len(next)
+			}
+			next = append(next, id)
+		}
+		if req.AfterDocumentID != 0 {
+			if afterIndex < 0 {
+				return domain.ErrDocumentInvalid
+			}
+			next = append(next, 0)
+			copy(next[afterIndex+2:], next[afterIndex+1:])
+			next[afterIndex+1] = req.Document.ID
+		} else {
+			next = append([]int64{req.Document.ID}, next...)
+		}
+		if len(next) > domain.MaxSavedMusicItems {
+			next = next[:domain.MaxSavedMusicItems]
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM saved_music WHERE user_id = $1`, req.UserID); err != nil {
+			return fmt.Errorf("clear saved music order: %w", err)
+		}
+		for i, id := range next {
+			if _, err := tx.Exec(ctx, `
+INSERT INTO saved_music (user_id, document_id, sort_order, created_at, updated_at)
+VALUES ($1, $2, $3, now(), now())`, req.UserID, id, i+1); err != nil {
+				return fmt.Errorf("insert saved music: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+func (s *PasswordStore) ListSavedMusicIDs(ctx context.Context, userID int64, limit int) ([]int64, error) {
+	if userID == 0 {
+		return nil, nil
+	}
+	if limit <= 0 || limit > domain.MaxSavedMusicItems {
+		limit = domain.MaxSavedMusicItems
+	}
+	rows, err := s.db.Query(ctx, `
+SELECT document_id
+FROM saved_music
+WHERE user_id = $1
+ORDER BY sort_order ASC, document_id ASC
+LIMIT $2`, userID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list saved music ids: %w", err)
+	}
+	defer rows.Close()
+	ids := make([]int64, 0, limit)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan saved music id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("scan saved music ids: %w", err)
+	}
+	return ids, nil
+}
+
+func (s *PasswordStore) ListSavedMusic(ctx context.Context, userID int64, offset, limit int) (domain.SavedMusicList, error) {
+	out := domain.SavedMusicList{UserID: userID}
+	if userID == 0 {
+		return out, nil
+	}
+	if err := s.db.QueryRow(ctx, `SELECT COUNT(*)::int FROM saved_music WHERE user_id = $1`, userID).Scan(&out.Count); err != nil {
+		return domain.SavedMusicList{}, fmt.Errorf("count saved music: %w", err)
+	}
+	if limit <= 0 || offset < 0 || offset >= out.Count {
+		return out, nil
+	}
+	if limit > domain.MaxSavedMusicItems {
+		limit = domain.MaxSavedMusicItems
+	}
+	docs, err := s.querySavedMusicDocuments(ctx, `
+SELECT d.id, d.access_hash, d.file_reference, d.date, d.mime_type, d.size, d.dc_id,
+       d.attributes::text AS attributes_json, d.thumbs::text AS thumbs_json
+FROM saved_music sm
+JOIN documents d ON d.id = sm.document_id
+WHERE sm.user_id = $1
+ORDER BY sm.sort_order ASC, sm.document_id ASC
+OFFSET $2
+LIMIT $3`, userID, offset, limit)
+	if err != nil {
+		return domain.SavedMusicList{}, err
+	}
+	out.Documents = docs
+	return out, nil
+}
+
+func (s *PasswordStore) GetSavedMusicByIDs(ctx context.Context, userID int64, ids []int64) (domain.SavedMusicList, error) {
+	out := domain.SavedMusicList{UserID: userID}
+	if userID == 0 || len(ids) == 0 {
+		return out, nil
+	}
+	if err := s.db.QueryRow(ctx, `SELECT COUNT(*)::int FROM saved_music WHERE user_id = $1`, userID).Scan(&out.Count); err != nil {
+		return domain.SavedMusicList{}, fmt.Errorf("count saved music: %w", err)
+	}
+	docs, err := s.querySavedMusicDocuments(ctx, `
+SELECT d.id, d.access_hash, d.file_reference, d.date, d.mime_type, d.size, d.dc_id,
+       d.attributes::text AS attributes_json, d.thumbs::text AS thumbs_json
+FROM saved_music sm
+JOIN documents d ON d.id = sm.document_id
+WHERE sm.user_id = $1
+  AND sm.document_id = ANY($2::bigint[])
+ORDER BY sm.sort_order ASC, sm.document_id ASC`, userID, ids)
+	if err != nil {
+		return domain.SavedMusicList{}, err
+	}
+	byID := make(map[int64]domain.Document, len(docs))
+	for _, doc := range docs {
+		byID[doc.ID] = doc
+	}
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if doc, ok := byID[id]; ok {
+			out.Documents = append(out.Documents, doc)
+		}
+	}
+	return out, nil
+}
+
+func (s *PasswordStore) querySavedMusicDocuments(ctx context.Context, sql string, args ...any) ([]domain.Document, error) {
+	rows, err := s.db.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query saved music documents: %w", err)
+	}
+	defer rows.Close()
+	docs := make([]domain.Document, 0)
+	for rows.Next() {
+		var row sqlcgen.GetDocumentRow
+		if err := rows.Scan(
+			&row.ID,
+			&row.AccessHash,
+			&row.FileReference,
+			&row.Date,
+			&row.MimeType,
+			&row.Size,
+			&row.DcID,
+			&row.AttributesJson,
+			&row.ThumbsJson,
+		); err != nil {
+			return nil, fmt.Errorf("scan saved music document: %w", err)
+		}
+		doc, err := documentFromRow(row)
+		if err != nil {
+			return nil, err
+		}
+		if doc.IsMusic() {
+			docs = append(docs, doc)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("scan saved music documents: %w", err)
+	}
+	return docs, nil
 }

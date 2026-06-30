@@ -1,0 +1,286 @@
+package rpc
+
+import (
+	"context"
+	"github.com/gotd/td/bin"
+	"github.com/gotd/td/proto"
+	"sync"
+)
+
+type captureSessions struct {
+	mu              sync.Mutex
+	sessionID       int64
+	userID          int64
+	userResolved    bool
+	authKeyID       [8]byte
+	authKeyResolved bool
+	receives        bool
+	messageType     proto.MessageType
+	message         bin.Encoder
+	userMessage     bin.Encoder // 最近一次 PushToUser* 的消息（与 message 区分：message 也被 PushToSession 覆盖）
+	pushUserIDs     []int64
+	onlineUserIDs   []int64
+	channelViewers  map[int64][]int64
+	channelMembers  map[int64][]int64
+	// channelViewersLimit 记录最近一次 OnlineChannelUserIDs 收到的 limit，验证 fan-out 封顶传参。
+	channelViewersLimit int
+}
+
+type captureSessionsSnapshot struct {
+	sessionID       int64
+	userID          int64
+	userResolved    bool
+	authKeyID       [8]byte
+	authKeyResolved bool
+	receives        bool
+	messageType     proto.MessageType
+	message         bin.Encoder
+}
+
+func (s *captureSessions) snapshot() captureSessionsSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return captureSessionsSnapshot{
+		sessionID:       s.sessionID,
+		userID:          s.userID,
+		userResolved:    s.userResolved,
+		authKeyID:       s.authKeyID,
+		authKeyResolved: s.authKeyResolved,
+		receives:        s.receives,
+		messageType:     s.messageType,
+		message:         s.message,
+	}
+}
+
+func (s *captureSessions) pushedUserIDs() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]int64(nil), s.pushUserIDs...)
+}
+
+// lastUserPush 返回最近一次 PushToUser* 的消息，独立于 message（后者也会被
+// pushOnlinePeerStatusesToCurrentSession 经 PushToSession 覆盖成对端状态）。
+func (s *captureSessions) lastUserPush() bin.Encoder {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.userMessage
+}
+
+func (s *captureSessions) clearMessages() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.message = nil
+	s.userMessage = nil
+	s.pushUserIDs = nil
+}
+
+func (s *captureSessions) BindAuthKey(sessionID int64, authKeyID [8]byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.authKeyResolved && s.authKeyID != authKeyID {
+		s.userID = 0
+		s.userResolved = false
+	}
+	s.sessionID = sessionID
+	s.authKeyID = authKeyID
+	s.authKeyResolved = true
+}
+
+func (s *captureSessions) AuthKeyID(int64) ([8]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.authKeyID, s.authKeyResolved
+}
+
+func (s *captureSessions) BindUser(sessionID, userID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionID = sessionID
+	s.userID = userID
+	s.userResolved = true
+}
+
+func (s *captureSessions) UserID(int64) (int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.userID, s.userID != 0
+}
+
+func (s *captureSessions) UserIDResolved(int64) (int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.userID, s.userResolved
+}
+
+func (s *captureSessions) UnbindAuthKey(authKeyID [8]byte) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.authKeyID == authKeyID {
+		s.userID = 0
+		s.userResolved = true
+		return 1
+	}
+	return 0
+}
+
+func (s *captureSessions) SetReceivesUpdates(sessionID int64, receives bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionID = sessionID
+	s.receives = receives
+}
+
+func (s *captureSessions) PushToSession(_ context.Context, sessionID int64, t proto.MessageType, msg bin.Encoder) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionID = sessionID
+	s.messageType = t
+	s.message = msg
+	return nil
+}
+
+func (s *captureSessions) PushToUserExceptSession(_ context.Context, userID, excludeSessionID int64, t proto.MessageType, msg bin.Encoder) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.userID = userID
+	s.sessionID = excludeSessionID
+	s.messageType = t
+	s.message = msg
+	s.userMessage = msg
+	s.pushUserIDs = append(s.pushUserIDs, userID)
+	return 1, nil
+}
+
+func (s *captureSessions) IsUserOnline(userID int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range s.onlineUserIDs {
+		if id == userID {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *captureSessions) OnlineUserIDsForCandidates(candidateUserIDs []int64, limit int) []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	online := make(map[int64]struct{}, len(s.onlineUserIDs))
+	for _, id := range s.onlineUserIDs {
+		online[id] = struct{}{}
+	}
+	out := make([]int64, 0, len(candidateUserIDs))
+	seen := map[int64]struct{}{}
+	for _, id := range candidateUserIDs {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if _, ok := online[id]; !ok {
+			continue
+		}
+		out = append(out, id)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func (s *captureSessions) TrackChannelInterest(_ [8]byte, _ int64, userID int64, channelIDs []int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.channelViewers == nil {
+		s.channelViewers = make(map[int64][]int64)
+	}
+	for channelID, viewers := range s.channelViewers {
+		out := viewers[:0]
+		for _, viewerID := range viewers {
+			if viewerID != userID {
+				out = append(out, viewerID)
+			}
+		}
+		if len(out) == 0 {
+			delete(s.channelViewers, channelID)
+			continue
+		}
+		s.channelViewers[channelID] = out
+	}
+	for _, channelID := range channelIDs {
+		if channelID == 0 {
+			continue
+		}
+		s.channelViewers[channelID] = append(s.channelViewers[channelID], userID)
+	}
+}
+
+func (s *captureSessions) ClearChannelInterest(_ [8]byte, _ int64, userID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for channelID, viewers := range s.channelViewers {
+		out := viewers[:0]
+		for _, viewerID := range viewers {
+			if viewerID != userID {
+				out = append(out, viewerID)
+			}
+		}
+		if len(out) == 0 {
+			delete(s.channelViewers, channelID)
+			continue
+		}
+		s.channelViewers[channelID] = out
+	}
+}
+
+func (s *captureSessions) OnlineChannelUserIDs(channelID int64, limit int) []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.channelViewersLimit = limit
+	return limitIDs(s.channelViewers[channelID], limit)
+}
+
+func (s *captureSessions) SetSessionChannelMemberships(_ [8]byte, _ int64, userID int64, channelIDs []int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.channelMembers == nil {
+		s.channelMembers = make(map[int64][]int64)
+	}
+	for _, channelID := range channelIDs {
+		if channelID == 0 {
+			continue
+		}
+		s.channelMembers[channelID] = append(s.channelMembers[channelID], userID)
+	}
+}
+
+func (s *captureSessions) AddUserChannelMembership(userID, channelID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.channelMembers == nil {
+		s.channelMembers = make(map[int64][]int64)
+	}
+	s.channelMembers[channelID] = append(s.channelMembers[channelID], userID)
+}
+
+func (s *captureSessions) RemoveUserChannelMembership(userID, channelID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	members := s.channelMembers[channelID]
+	out := members[:0]
+	for _, id := range members {
+		if id != userID {
+			out = append(out, id)
+		}
+	}
+	if len(out) == 0 {
+		delete(s.channelMembers, channelID)
+		return
+	}
+	s.channelMembers[channelID] = out
+}
+
+func (s *captureSessions) OnlineChannelMemberUserIDs(channelID int64, limit int) []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return limitIDs(s.channelMembers[channelID], limit)
+}

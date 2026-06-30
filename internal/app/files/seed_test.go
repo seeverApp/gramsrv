@@ -2,10 +2,13 @@ package files
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"telesrv/internal/domain"
 )
@@ -19,23 +22,96 @@ type fakeMediaStore struct {
 	sets      map[int64]domain.StickerSet
 	reactions []domain.AvailableReaction
 	parts     map[string][]domain.UploadPart
+	webPages  map[int64]domain.MessageWebPage
+	seedState map[string]string
 }
 
 func newFakeMediaStore() *fakeMediaStore {
 	return &fakeMediaStore{
-		blobs:  map[string]domain.FileBlob{},
-		docs:   map[int64]domain.Document{},
-		photos: map[int64]domain.Photo{},
-		sets:   map[int64]domain.StickerSet{},
-		parts:  map[string][]domain.UploadPart{},
+		blobs:     map[string]domain.FileBlob{},
+		docs:      map[int64]domain.Document{},
+		photos:    map[int64]domain.Photo{},
+		sets:      map[int64]domain.StickerSet{},
+		parts:     map[string][]domain.UploadPart{},
+		seedState: map[string]string{},
 	}
 }
 
-func (f *fakeMediaStore) SaveFilePart(_ context.Context, _ domain.UploadPart) error { return nil }
-func (f *fakeMediaStore) LoadFileParts(_ context.Context, _, _ int64) ([]domain.UploadPart, error) {
+func (f *fakeMediaStore) SaveFilePart(_ context.Context, part domain.UploadPart) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := fakeUploadPartKey(part.OwnerUserID, part.FileID)
+	part.SHA256 = append([]byte(nil), part.SHA256...)
+	parts := f.parts[key]
+	for i := range parts {
+		if parts[i].Part == part.Part {
+			parts[i] = part
+			f.parts[key] = parts
+			return nil
+		}
+	}
+	f.parts[key] = append(parts, part)
+	return nil
+}
+func (f *fakeMediaStore) UploadPartUsage(_ context.Context, ownerUserID int64) (domain.UploadPartUsage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var usage domain.UploadPartUsage
+	files := map[int64]struct{}{}
+	for _, parts := range f.parts {
+		for _, p := range parts {
+			if p.OwnerUserID != ownerUserID {
+				continue
+			}
+			usage.Bytes += p.Size
+			usage.Parts++
+			files[p.FileID] = struct{}{}
+		}
+	}
+	usage.Files = len(files)
+	return usage, nil
+}
+func (f *fakeMediaStore) UploadPartSlot(_ context.Context, ownerUserID, fileID int64, part int) (domain.UploadPartSlot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	parts := f.parts[fakeUploadPartKey(ownerUserID, fileID)]
+	slot := domain.UploadPartSlot{FileParts: len(parts)}
+	for _, p := range parts {
+		if p.Part == part {
+			slot.ExistingBytes = p.Size
+			slot.ObjectKey = p.ObjectKey
+			slot.Found = true
+			break
+		}
+	}
+	return slot, nil
+}
+func (f *fakeMediaStore) LoadFileParts(_ context.Context, ownerUserID, fileID int64) ([]domain.UploadPart, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	parts := append([]domain.UploadPart(nil), f.parts[fakeUploadPartKey(ownerUserID, fileID)]...)
+	sort.Slice(parts, func(i, j int) bool { return parts[i].Part < parts[j].Part })
+	return parts, nil
+}
+func (f *fakeMediaStore) DeleteFileParts(_ context.Context, ownerUserID, fileID int64) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := fakeUploadPartKey(ownerUserID, fileID)
+	parts := f.parts[key]
+	keys := make([]string, 0, len(parts))
+	for _, p := range parts {
+		keys = append(keys, p.ObjectKey)
+	}
+	delete(f.parts, key)
+	return keys, nil
+}
+func (f *fakeMediaStore) DeleteExpiredUploadParts(_ context.Context, _ time.Time, _ int) ([]string, error) {
 	return nil, nil
 }
-func (f *fakeMediaStore) DeleteFileParts(_ context.Context, _, _ int64) error { return nil }
+
+func fakeUploadPartKey(ownerUserID, fileID int64) string {
+	return fmt.Sprintf("%d:%d", ownerUserID, fileID)
+}
 
 func (f *fakeMediaStore) PutFileBlob(_ context.Context, blob domain.FileBlob) error {
 	f.mu.Lock()
@@ -48,6 +124,32 @@ func (f *fakeMediaStore) GetFileBlob(_ context.Context, key string) (domain.File
 	defer f.mu.Unlock()
 	b, ok := f.blobs[key]
 	return b, ok, nil
+}
+
+func (f *fakeMediaStore) GetFileBlobs(_ context.Context, keys []string) (map[string]domain.FileBlob, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]domain.FileBlob, len(keys))
+	for _, key := range keys {
+		if b, ok := f.blobs[key]; ok {
+			out[key] = b
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeMediaStore) GetSeedState(_ context.Context, key string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	hash, ok := f.seedState[key]
+	return hash, ok, nil
+}
+
+func (f *fakeMediaStore) PutSeedState(_ context.Context, key, hash string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.seedState[key] = hash
+	return nil
 }
 
 func (f *fakeMediaStore) PutDocument(_ context.Context, doc domain.Document) error {
@@ -84,6 +186,21 @@ func (f *fakeMediaStore) GetPhoto(_ context.Context, id int64) (domain.Photo, bo
 	defer f.mu.Unlock()
 	p, ok := f.photos[id]
 	return p, ok, nil
+}
+func (f *fakeMediaStore) PutWebPage(_ context.Context, urlHash int64, page domain.MessageWebPage, _ int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.webPages == nil {
+		f.webPages = map[int64]domain.MessageWebPage{}
+	}
+	f.webPages[urlHash] = page
+	return nil
+}
+func (f *fakeMediaStore) GetWebPageByURLHash(_ context.Context, urlHash int64) (domain.MessageWebPage, int, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.webPages[urlHash]
+	return p, 0, ok, nil
 }
 
 func (f *fakeMediaStore) PutStickerSet(_ context.Context, set domain.StickerSet) error {
@@ -156,14 +273,8 @@ func (f *fakeMediaStore) CountAvailableReactions(_ context.Context) (int, error)
 	defer f.mu.Unlock()
 	return len(f.reactions), nil
 }
-func (f *fakeMediaStore) AddProfilePhoto(_ context.Context, _ domain.PeerType, _, _ int64, _ int) error {
-	return nil
-}
 func (f *fakeMediaStore) AddProfilePhotoKind(_ context.Context, _ domain.PeerType, _ int64, _ domain.ProfilePhotoKind, _ int64, _ int) error {
 	return nil
-}
-func (f *fakeMediaStore) CurrentProfilePhoto(_ context.Context, _ domain.PeerType, _ int64) (int64, bool, error) {
-	return 0, false, nil
 }
 func (f *fakeMediaStore) CurrentProfilePhotoKind(_ context.Context, _ domain.PeerType, _ int64, _ domain.ProfilePhotoKind) (int64, bool, error) {
 	return 0, false, nil
@@ -174,10 +285,10 @@ func (f *fakeMediaStore) CurrentProfilePhotos(_ context.Context, _ domain.PeerTy
 func (f *fakeMediaStore) CurrentProfilePhotosKind(_ context.Context, _ domain.PeerType, _ []int64, _ domain.ProfilePhotoKind) (map[int64]domain.ProfilePhotoRef, error) {
 	return map[int64]domain.ProfilePhotoRef{}, nil
 }
-func (f *fakeMediaStore) ListProfilePhotos(_ context.Context, _ domain.PeerType, _ int64, _, _ int, _ int64) ([]int64, int, error) {
+func (f *fakeMediaStore) ListProfilePhotosKind(_ context.Context, _ domain.PeerType, _ int64, _ domain.ProfilePhotoKind, _, _ int, _ int64) ([]int64, int, error) {
 	return nil, 0, nil
 }
-func (f *fakeMediaStore) ListProfilePhotosKind(_ context.Context, _ domain.PeerType, _ int64, _ domain.ProfilePhotoKind, _, _ int, _ int64) ([]int64, int, error) {
+func (f *fakeMediaStore) ListProfilePhotoDetailsKind(_ context.Context, _ domain.PeerType, _ int64, _ domain.ProfilePhotoKind, _, _ int, _ int64) ([]domain.Photo, int, error) {
 	return nil, 0, nil
 }
 func (f *fakeMediaStore) DeleteProfilePhotos(_ context.Context, _ domain.PeerType, _ int64, _ []int64) ([]int64, error) {
@@ -249,6 +360,146 @@ func TestSeedMediaRepairsPartialReactionBlobs(t *testing.T) {
 	}
 	if reactions, _ := media.ListAvailableReactions(context.Background()); len(reactions) != 1 {
 		t.Fatalf("reaction upsert duplicated rows: got %d", len(reactions))
+	}
+}
+
+func TestSeedCustomEmojiTGSWithoutThumbGetsSyntheticPreview(t *testing.T) {
+	ctx := context.Background()
+	seedDir := t.TempDir()
+	const sourceID int64 = 4444444
+	writeStatusPackWithoutThumbSeed(t, seedDir, sourceID, 17)
+
+	media := newFakeMediaStore()
+	blobs, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("local fs: %v", err)
+	}
+	svc := NewService(media, blobs, 2)
+	stats, err := svc.SeedMedia(ctx, seedDir, 0)
+	if err != nil {
+		t.Fatalf("seed media: %v", err)
+	}
+	if stats.StickerSets != 1 || stats.Documents != 1 || stats.Blobs != 2 || stats.Skipped {
+		t.Fatalf("stats = %+v, want one set, one doc, main blob plus synthetic preview", stats)
+	}
+
+	set, ok, err := media.GetStickerSetByShortName(ctx, "StatusPack")
+	if err != nil || !ok {
+		t.Fatalf("StatusPack ok=%v err=%v", ok, err)
+	}
+	doc, ok, err := media.GetDocument(ctx, set.DocumentIDs[0])
+	if err != nil || !ok {
+		t.Fatalf("StatusPack document ok=%v err=%v", ok, err)
+	}
+	if !seedDocumentHasAttribute(doc.Attributes, domain.DocAttrCustomEmoji) {
+		t.Fatalf("document attributes = %+v, want custom emoji", doc.Attributes)
+	}
+	thumb, ok := findCachedThumb(doc.Thumbs)
+	if !ok {
+		t.Fatalf("document thumbs = %+v, want synthetic cached preview", doc.Thumbs)
+	}
+	if thumb.Type != seedSyntheticDocumentThumbType || thumb.W != 1 || thumb.H != 1 || len(thumb.Bytes) == 0 {
+		t.Fatalf("synthetic thumb = %+v, want 1x1 cached %q thumb", thumb, seedSyntheticDocumentThumbType)
+	}
+	blob, ok, err := media.GetFileBlob(ctx, fmt.Sprintf("doc:%d:%s", doc.ID, thumb.Type))
+	if err != nil || !ok {
+		t.Fatalf("synthetic thumb blob ok=%v err=%v", ok, err)
+	}
+	if blob.MimeType != "image/png" {
+		t.Fatalf("synthetic thumb blob mime = %q, want image/png", blob.MimeType)
+	}
+}
+
+func TestSeedMediaRepairsCustomEmojiTGSWithoutThumb(t *testing.T) {
+	ctx := context.Background()
+	seedDir := t.TempDir()
+	const sourceID int64 = 5555555
+	const setHash = 23
+	writeStatusPackWithoutThumbSeed(t, seedDir, sourceID, setHash)
+
+	media := newFakeMediaStore()
+	if err := media.PutDocument(ctx, domain.Document{
+		ID:       sourceID,
+		MimeType: "application/x-tgsticker",
+		Attributes: []domain.DocumentAttribute{{
+			Kind:      domain.DocAttrCustomEmoji,
+			Alt:       "\U0001f44b",
+			TextColor: true,
+		}},
+	}); err != nil {
+		t.Fatalf("put stale document: %v", err)
+	}
+	if err := media.PutStickerSet(ctx, domain.StickerSet{
+		ID:         773947703670341676,
+		AccessHash: 1,
+		ShortName:  "StatusPack",
+		Title:      "Status Pack",
+		Hash:       setHash,
+		Kind:       domain.StickerSetKindEmoji,
+		Emojis:     true,
+		DocumentIDs: []int64{
+			sourceID,
+		},
+	}); err != nil {
+		t.Fatalf("put stale sticker set: %v", err)
+	}
+
+	blobs, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("local fs: %v", err)
+	}
+	svc := NewService(media, blobs, 2)
+	stats, err := svc.SeedMedia(ctx, seedDir, 0)
+	if err != nil {
+		t.Fatalf("repair seed: %v", err)
+	}
+	if stats.StickerSets != 1 || stats.Documents != 1 || stats.Blobs != 2 || stats.Skipped {
+		t.Fatalf("repair stats = %+v, want forced reimport", stats)
+	}
+	doc, ok, err := media.GetDocument(ctx, sourceID)
+	if err != nil || !ok {
+		t.Fatalf("repaired document ok=%v err=%v", ok, err)
+	}
+	if _, ok := findCachedThumb(doc.Thumbs); !ok {
+		t.Fatalf("repaired document thumbs = %+v, want synthetic cached preview", doc.Thumbs)
+	}
+}
+
+func TestSeedMediaSkipsUnchangedEffectsDocuments(t *testing.T) {
+	ctx := context.Background()
+	seedDir := t.TempDir()
+	const sourceID int64 = 6666666
+	writeEffectsSeed(t, seedDir, sourceID)
+
+	media := newFakeMediaStore()
+	blobs, err := NewLocalFS(t.TempDir())
+	if err != nil {
+		t.Fatalf("local fs: %v", err)
+	}
+	svc := NewService(media, blobs, 2)
+	first, err := svc.SeedMedia(ctx, seedDir, 0)
+	if err != nil {
+		t.Fatalf("first seed: %v", err)
+	}
+	if first.Effects != 1 || first.Documents != 1 || first.Blobs != 1 {
+		t.Fatalf("first stats = %+v, want one imported effect document/blob", first)
+	}
+
+	second, err := svc.SeedMedia(ctx, seedDir, 0)
+	if err != nil {
+		t.Fatalf("second seed: %v", err)
+	}
+	if second.Effects != 1 || second.Documents != 0 || second.Blobs != 0 {
+		t.Fatalf("second stats = %+v, want effects catalog loaded without document/blob import", second)
+	}
+
+	delete(media.blobs, fmt.Sprintf("doc:%d", sourceID))
+	repaired, err := svc.SeedMedia(ctx, seedDir, 0)
+	if err != nil {
+		t.Fatalf("repair seed: %v", err)
+	}
+	if repaired.Effects != 1 || repaired.Documents != 1 || repaired.Blobs != 1 {
+		t.Fatalf("repair stats = %+v, want missing blob to force reimport", repaired)
 	}
 }
 
@@ -352,6 +603,37 @@ func TestSeedMediaFromRealExport(t *testing.T) {
 		if !hasPathThumb(doc.Thumbs) {
 			t.Fatalf("sample sticker document dropped its PhotoPathSize placeholder: %+v", doc.Thumbs)
 		}
+	}
+}
+
+func writeStatusPackWithoutThumbSeed(t *testing.T, seedDir string, sourceID int64, setHash int) {
+	t.Helper()
+	setDir := filepath.Join(seedDir, "telegram_emoji_export", "StatusPack_773947703670341676")
+	stickersDir := filepath.Join(setDir, "stickers")
+	if err := os.MkdirAll(stickersDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	raw := fmt.Sprintf(`{"result":{"set":{"id":773947703670341676,"access_hash":1,"title":"Status Pack","short_name":"StatusPack","count":1,"hash":%d,"emojis":true,"packs":[{"emoticon":"👋","documents":[%d]}]},"packs":[{"emoticon":"👋","documents":[%d]}],"documents":[{"id":%d,"access_hash":2,"file_reference":"","date":"2026-06-29T00:00:00Z","mime_type":"application/x-tgsticker","size":4,"dc_id":4,"attributes":[{"_":"DocumentAttributeImageSize","w":512,"h":512},{"_":"DocumentAttributeCustomEmoji","alt":"👋","text_color":true,"stickerset":{"id":773947703670341676,"access_hash":1}},{"_":"DocumentAttributeFilename","file_name":"AnimatedSticker.tgs"}],"thumbs":[]}]}}`, setHash, sourceID, sourceID, sourceID)
+	if err := os.WriteFile(filepath.Join(setDir, "set_info.json"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stickersDir, fmt.Sprintf("status_%d.tgs", sourceID)), []byte("tgs!"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeEffectsSeed(t *testing.T, seedDir string, sourceID int64) {
+	t.Helper()
+	docsDir := filepath.Join(seedDir, "telegram_effects_export", "documents")
+	if err := os.MkdirAll(docsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	raw := fmt.Sprintf(`{"result":{"effects":[{"id":77,"emoticon":"🔥","effect_sticker_id":%d}],"documents":[{"id":%d,"access_hash":2,"file_reference":"","date":"2026-06-29T00:00:00Z","mime_type":"application/x-tgsticker","size":4,"dc_id":4,"attributes":[{"_":"DocumentAttributeImageSize","w":512,"h":512},{"_":"DocumentAttributeFilename","file_name":"effect.tgs"}],"thumbs":[]}]}}`, sourceID, sourceID)
+	if err := os.WriteFile(filepath.Join(seedDir, "telegram_effects_export", "effects.json"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(docsDir, fmt.Sprintf("effect_%d.tgs", sourceID)), []byte("tgs!"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 

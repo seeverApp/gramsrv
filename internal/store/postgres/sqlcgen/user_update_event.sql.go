@@ -23,13 +23,17 @@ INSERT INTO user_update_events (
   dialog_filter,
   filter_order,
   folder_peers,
+  story_payload,
+  reaction_payload,
   message_box_id,
   peer_type,
   peer_id,
   filter_id,
   max_id,
   still_unread_count,
-  tags_enabled
+  channel_pts,
+  tags_enabled,
+  folder_id
 ) VALUES (
   $1,
   $2,
@@ -43,15 +47,18 @@ INSERT INTO user_update_events (
   $10::jsonb,
   $11::jsonb,
   $12::jsonb,
-  $13,
-  $14::text,
-  $15::bigint,
-  $16::int,
-  $17::int,
+  $13::jsonb,
+  $14::jsonb,
+  $15,
+  $16::text,
+  $17::bigint,
   $18::int,
-  $19::boolean
+  $19::int,
+  $20::int,
+  $21::int,
+  $22::boolean,
+  $23::int
 )
-ON CONFLICT (user_id, pts) DO NOTHING
 `
 
 type AppendUserUpdateEventParams struct {
@@ -67,13 +74,17 @@ type AppendUserUpdateEventParams struct {
 	DialogFilter     []byte
 	FilterOrder      []byte
 	FolderPeers      []byte
+	StoryPayload     []byte
+	ReactionPayload  []byte
 	MessageBoxID     *int32
 	PeerType         *string
 	PeerID           *int64
 	FilterID         int32
 	MaxID            int32
 	StillUnreadCount int32
+	ChannelPts       int32
 	TagsEnabled      bool
+	FolderID         int32
 }
 
 func (q *Queries) AppendUserUpdateEvent(ctx context.Context, arg AppendUserUpdateEventParams) error {
@@ -90,13 +101,17 @@ func (q *Queries) AppendUserUpdateEvent(ctx context.Context, arg AppendUserUpdat
 		arg.DialogFilter,
 		arg.FilterOrder,
 		arg.FolderPeers,
+		arg.StoryPayload,
+		arg.ReactionPayload,
 		arg.MessageBoxID,
 		arg.PeerType,
 		arg.PeerID,
 		arg.FilterID,
 		arg.MaxID,
 		arg.StillUnreadCount,
+		arg.ChannelPts,
 		arg.TagsEnabled,
+		arg.FolderID,
 	)
 	return err
 }
@@ -115,12 +130,16 @@ SELECT
   COALESCE(e.dialog_filter::text, '{}')::text AS dialog_filter_json,
   COALESCE(e.filter_order::text, '[]')::text AS filter_order_json,
   COALESCE(e.folder_peers::text, '[]')::text AS folder_peers_json,
+  COALESCE(e.story_payload::text, '{}')::text AS story_payload_json,
+  COALESCE(e.reaction_payload::text, '{}')::text AS reaction_payload_json,
   COALESCE(e.peer_type, '')::text AS event_peer_type,
   COALESCE(e.peer_id, 0)::bigint AS event_peer_id,
   e.filter_id,
   e.max_id,
   e.still_unread_count,
+  e.channel_pts,
   e.tags_enabled,
+  e.folder_id,
   COALESCE(m.box_id, 0)::int AS message_id,
   COALESCE(m.private_message_id, 0)::bigint AS private_message_id,
   COALESCE(m.owner_user_id, 0)::bigint AS owner_user_id,
@@ -128,6 +147,8 @@ SELECT
   COALESCE(m.peer_id, 0)::bigint AS peer_id,
   COALESCE(m.from_user_id, 0)::bigint AS from_user_id,
   COALESCE(m.message_date, 0)::int AS message_date,
+  COALESCE(m.ttl_period, 0)::int AS ttl_period,
+  COALESCE(m.expires_at, 0)::int AS expires_at,
   COALESCE(m.edit_date, 0)::int AS edit_date,
   COALESCE(m.outgoing, false)::boolean AS outgoing,
   COALESCE(m.body, '')::text AS body,
@@ -138,6 +159,7 @@ SELECT
   COALESCE(m.reply_to_peer_type, '')::text AS reply_to_peer_type,
   COALESCE(m.reply_to_peer_id, 0)::bigint AS reply_to_peer_id,
   COALESCE(m.reply_to_top_id, 0)::int AS reply_to_top_id,
+  COALESCE(m.reply_to_story_id, 0)::int AS reply_to_story_id,
   COALESCE(m.quote_text, '')::text AS quote_text,
   COALESCE(m.quote_entities::text, '[]')::text AS quote_entities_json,
   COALESCE(m.quote_offset, 0)::int AS quote_offset,
@@ -145,9 +167,20 @@ SELECT
   COALESCE(m.fwd_from_peer_id, 0)::bigint AS fwd_from_peer_id,
   COALESCE(m.fwd_from_name, '')::text AS fwd_from_name,
   COALESCE(m.fwd_date, 0)::int AS fwd_date,
+  COALESCE(m.fwd_saved_from_peer_type, '')::text AS fwd_saved_from_peer_type,
+  COALESCE(m.fwd_saved_from_peer_id, 0)::bigint AS fwd_saved_from_peer_id,
+  COALESCE(m.fwd_saved_from_msg_id, 0)::int AS fwd_saved_from_msg_id,
+  COALESCE(m.saved_peer_type, '')::text AS saved_peer_type,
+  COALESCE(m.saved_peer_id, 0)::bigint AS saved_peer_id,
   COALESCE(m.media::text, '{}')::text AS media_json,
   COALESCE(m.media_unread, false)::boolean AS media_unread,
   COALESCE(m.reaction_unread, false)::boolean AS reaction_unread,
+  COALESCE(m.pinned, false)::boolean AS pinned,
+  COALESCE(m.via_bot_id, 0)::bigint AS via_bot_id,
+  COALESCE(m.grouped_id, 0)::bigint AS grouped_id,
+  COALESCE(m.effect, 0)::bigint AS effect,
+  COALESCE(m.reply_markup::text, '{}')::text AS reply_markup_json,
+  COALESCE(m.rich_message::text, '{}')::text AS rich_message_json,
   COALESCE(peer_u.id, 0)::bigint AS peer_user_id,
   COALESCE(peer_u.access_hash, 0)::bigint AS peer_access_hash,
   COALESCE(peer_u.phone, '')::text AS peer_phone,
@@ -157,6 +190,11 @@ SELECT
   COALESCE(peer_u.country_code, '')::text AS peer_country_code,
   COALESCE(peer_u.verified, false)::boolean AS peer_verified,
   COALESCE(peer_u.support, false)::boolean AS peer_support,
+  COALESCE(peer_u.is_bot, false)::boolean AS peer_is_bot,
+  COALESCE(peer_u.bot_info_version, 0)::int AS peer_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM peer_u.premium_expires_at), 0)::bigint AS peer_premium_until,
+  COALESCE(peer_u.emoji_status_document_id, 0)::bigint AS peer_emoji_status_document_id,
+  COALESCE(peer_u.emoji_status_until, 0)::bigint AS peer_emoji_status_until,
   COALESCE(from_u.id, 0)::bigint AS from_user_user_id,
   COALESCE(from_u.access_hash, 0)::bigint AS from_user_access_hash,
   COALESCE(from_u.phone, '')::text AS from_user_phone,
@@ -166,6 +204,11 @@ SELECT
   COALESCE(from_u.country_code, '')::text AS from_user_country_code,
   COALESCE(from_u.verified, false)::boolean AS from_user_verified,
   COALESCE(from_u.support, false)::boolean AS from_user_support,
+  COALESCE(from_u.is_bot, false)::boolean AS from_user_is_bot,
+  COALESCE(from_u.bot_info_version, 0)::int AS from_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM from_u.premium_expires_at), 0)::bigint AS from_user_premium_until,
+  COALESCE(from_u.emoji_status_document_id, 0)::bigint AS from_user_emoji_status_document_id,
+  COALESCE(from_u.emoji_status_until, 0)::bigint AS from_user_emoji_status_until,
   COALESCE(fwd_u.id, 0)::bigint AS fwd_user_id,
   COALESCE(fwd_u.access_hash, 0)::bigint AS fwd_user_access_hash,
   COALESCE(fwd_u.phone, '')::text AS fwd_user_phone,
@@ -175,6 +218,11 @@ SELECT
   COALESCE(fwd_u.country_code, '')::text AS fwd_user_country_code,
   COALESCE(fwd_u.verified, false)::boolean AS fwd_user_verified,
   COALESCE(fwd_u.support, false)::boolean AS fwd_user_support,
+  COALESCE(fwd_u.is_bot, false)::boolean AS fwd_user_is_bot,
+  COALESCE(fwd_u.bot_info_version, 0)::int AS fwd_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM fwd_u.premium_expires_at), 0)::bigint AS fwd_user_premium_until,
+  COALESCE(fwd_u.emoji_status_document_id, 0)::bigint AS fwd_user_emoji_status_document_id,
+  COALESCE(fwd_u.emoji_status_until, 0)::bigint AS fwd_user_emoji_status_until,
   COALESCE(reply_u.id, 0)::bigint AS reply_user_id,
   COALESCE(reply_u.access_hash, 0)::bigint AS reply_user_access_hash,
   COALESCE(reply_u.phone, '')::text AS reply_user_phone,
@@ -184,54 +232,11 @@ SELECT
   COALESCE(reply_u.country_code, '')::text AS reply_user_country_code,
   COALESCE(reply_u.verified, false)::boolean AS reply_user_verified,
   COALESCE(reply_u.support, false)::boolean AS reply_user_support,
-  COALESCE(fwd_ch.id, 0)::bigint AS fwd_channel_id,
-  COALESCE(fwd_ch.access_hash, 0)::bigint AS fwd_channel_access_hash,
-  COALESCE(fwd_ch.creator_user_id, 0)::bigint AS fwd_channel_creator_user_id,
-  COALESCE(fwd_ch.title, '')::text AS fwd_channel_title,
-  COALESCE(fwd_ch.about, '')::text AS fwd_channel_about,
-  COALESCE(fwd_ch.username, '')::text AS fwd_channel_username,
-  COALESCE(fwd_ch.broadcast, false)::boolean AS fwd_channel_broadcast,
-  COALESCE(fwd_ch.megagroup, false)::boolean AS fwd_channel_megagroup,
-  COALESCE(fwd_ch.forum, false)::boolean AS fwd_channel_forum,
-  COALESCE(fwd_ch.noforwards, false)::boolean AS fwd_channel_noforwards,
-  COALESCE(fwd_ch.signatures, false)::boolean AS fwd_channel_signatures,
-  COALESCE(fwd_ch.pre_history_hidden, false)::boolean AS fwd_channel_pre_history_hidden,
-  COALESCE(fwd_ch.slowmode_seconds, 0)::int AS fwd_channel_slowmode_seconds,
-  COALESCE(fwd_ch.default_banned_rights::text, '{}')::text AS fwd_channel_default_banned_rights,
-  COALESCE(fwd_ch.participants_count, 0)::int AS fwd_channel_participants_count,
-  COALESCE(fwd_ch.admins_count, 0)::int AS fwd_channel_admins_count,
-  COALESCE(fwd_ch.kicked_count, 0)::int AS fwd_channel_kicked_count,
-  COALESCE(fwd_ch.banned_count, 0)::int AS fwd_channel_banned_count,
-  COALESCE(fwd_ch.top_message_id, 0)::int AS fwd_channel_top_message_id,
-  COALESCE(fwd_ch.pinned_message_id, 0)::int AS fwd_channel_pinned_message_id,
-  COALESCE(fwd_ch.pts, 0)::int AS fwd_channel_pts,
-  COALESCE(fwd_ch.ttl_period, 0)::int AS fwd_channel_ttl_period,
-  COALESCE(fwd_ch.date, 0)::int AS fwd_channel_date,
-  COALESCE(fwd_ch.deleted, false)::boolean AS fwd_channel_deleted,
-  COALESCE(reply_ch.id, 0)::bigint AS reply_channel_id,
-  COALESCE(reply_ch.access_hash, 0)::bigint AS reply_channel_access_hash,
-  COALESCE(reply_ch.creator_user_id, 0)::bigint AS reply_channel_creator_user_id,
-  COALESCE(reply_ch.title, '')::text AS reply_channel_title,
-  COALESCE(reply_ch.about, '')::text AS reply_channel_about,
-  COALESCE(reply_ch.username, '')::text AS reply_channel_username,
-  COALESCE(reply_ch.broadcast, false)::boolean AS reply_channel_broadcast,
-  COALESCE(reply_ch.megagroup, false)::boolean AS reply_channel_megagroup,
-  COALESCE(reply_ch.forum, false)::boolean AS reply_channel_forum,
-  COALESCE(reply_ch.noforwards, false)::boolean AS reply_channel_noforwards,
-  COALESCE(reply_ch.signatures, false)::boolean AS reply_channel_signatures,
-  COALESCE(reply_ch.pre_history_hidden, false)::boolean AS reply_channel_pre_history_hidden,
-  COALESCE(reply_ch.slowmode_seconds, 0)::int AS reply_channel_slowmode_seconds,
-  COALESCE(reply_ch.default_banned_rights::text, '{}')::text AS reply_channel_default_banned_rights,
-  COALESCE(reply_ch.participants_count, 0)::int AS reply_channel_participants_count,
-  COALESCE(reply_ch.admins_count, 0)::int AS reply_channel_admins_count,
-  COALESCE(reply_ch.kicked_count, 0)::int AS reply_channel_kicked_count,
-  COALESCE(reply_ch.banned_count, 0)::int AS reply_channel_banned_count,
-  COALESCE(reply_ch.top_message_id, 0)::int AS reply_channel_top_message_id,
-  COALESCE(reply_ch.pinned_message_id, 0)::int AS reply_channel_pinned_message_id,
-  COALESCE(reply_ch.pts, 0)::int AS reply_channel_pts,
-  COALESCE(reply_ch.ttl_period, 0)::int AS reply_channel_ttl_period,
-  COALESCE(reply_ch.date, 0)::int AS reply_channel_date,
-  COALESCE(reply_ch.deleted, false)::boolean AS reply_channel_deleted
+  COALESCE(reply_u.is_bot, false)::boolean AS reply_user_is_bot,
+  COALESCE(reply_u.bot_info_version, 0)::int AS reply_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM reply_u.premium_expires_at), 0)::bigint AS reply_user_premium_until,
+  COALESCE(reply_u.emoji_status_document_id, 0)::bigint AS reply_user_emoji_status_document_id,
+  COALESCE(reply_u.emoji_status_until, 0)::bigint AS reply_user_emoji_status_until
 FROM unnest($1::bigint[]) WITH ORDINALITY AS u(user_id, ord)
 JOIN unnest($2::int[]) WITH ORDINALITY AS p(pts, ord) USING (ord)
 JOIN user_update_events e ON e.user_id = u.user_id AND e.pts = p.pts
@@ -240,8 +245,6 @@ LEFT JOIN users peer_u ON m.peer_type = 'user' AND peer_u.id = m.peer_id
 LEFT JOIN users from_u ON from_u.id = m.from_user_id
 LEFT JOIN users fwd_u ON m.fwd_from_peer_type = 'user' AND fwd_u.id = m.fwd_from_peer_id
 LEFT JOIN users reply_u ON m.reply_to_peer_type = 'user' AND reply_u.id = m.reply_to_peer_id
-LEFT JOIN channels fwd_ch ON m.fwd_from_peer_type = 'channel' AND fwd_ch.id = m.fwd_from_peer_id
-LEFT JOIN channels reply_ch ON m.reply_to_peer_type = 'channel' AND reply_ch.id = m.reply_to_peer_id
 `
 
 type BatchListDispatchEventsParams struct {
@@ -250,135 +253,125 @@ type BatchListDispatchEventsParams struct {
 }
 
 type BatchListDispatchEventsRow struct {
-	UserID                          int64
-	Pts                             int32
-	PtsCount                        int32
-	Date                            int32
-	EventType                       string
-	EventBool                       bool
-	EventPeersJson                  string
-	PeerSettingsJson                string
-	MessageIdsJson                  string
-	DialogFilterJson                string
-	FilterOrderJson                 string
-	FolderPeersJson                 string
-	EventPeerType                   string
-	EventPeerID                     int64
-	FilterID                        int32
-	MaxID                           int32
-	StillUnreadCount                int32
-	TagsEnabled                     bool
-	MessageID                       int32
-	PrivateMessageID                int64
-	OwnerUserID                     int64
-	PeerType                        string
-	PeerID                          int64
-	FromUserID                      int64
-	MessageDate                     int32
-	EditDate                        int32
-	Outgoing                        bool
-	Body                            string
-	MessageEntitiesJson             string
-	Silent                          bool
-	Noforwards                      bool
-	ReplyToMsgID                    int32
-	ReplyToPeerType                 string
-	ReplyToPeerID                   int64
-	ReplyToTopID                    int32
-	QuoteText                       string
-	QuoteEntitiesJson               string
-	QuoteOffset                     int32
-	FwdFromPeerType                 string
-	FwdFromPeerID                   int64
-	FwdFromName                     string
-	FwdDate                         int32
-	MediaJson                       string
-	MediaUnread                     bool
-	ReactionUnread                  bool
-	PeerUserID                      int64
-	PeerAccessHash                  int64
-	PeerPhone                       string
-	PeerFirstName                   string
-	PeerLastName                    string
-	PeerUsername                    string
-	PeerCountryCode                 string
-	PeerVerified                    bool
-	PeerSupport                     bool
-	FromUserUserID                  int64
-	FromUserAccessHash              int64
-	FromUserPhone                   string
-	FromUserFirstName               string
-	FromUserLastName                string
-	FromUserUsername                string
-	FromUserCountryCode             string
-	FromUserVerified                bool
-	FromUserSupport                 bool
-	FwdUserID                       int64
-	FwdUserAccessHash               int64
-	FwdUserPhone                    string
-	FwdUserFirstName                string
-	FwdUserLastName                 string
-	FwdUserUsername                 string
-	FwdUserCountryCode              string
-	FwdUserVerified                 bool
-	FwdUserSupport                  bool
-	ReplyUserID                     int64
-	ReplyUserAccessHash             int64
-	ReplyUserPhone                  string
-	ReplyUserFirstName              string
-	ReplyUserLastName               string
-	ReplyUserUsername               string
-	ReplyUserCountryCode            string
-	ReplyUserVerified               bool
-	ReplyUserSupport                bool
-	FwdChannelID                    int64
-	FwdChannelAccessHash            int64
-	FwdChannelCreatorUserID         int64
-	FwdChannelTitle                 string
-	FwdChannelAbout                 string
-	FwdChannelUsername              string
-	FwdChannelBroadcast             bool
-	FwdChannelMegagroup             bool
-	FwdChannelForum                 bool
-	FwdChannelNoforwards            bool
-	FwdChannelSignatures            bool
-	FwdChannelPreHistoryHidden      bool
-	FwdChannelSlowmodeSeconds       int32
-	FwdChannelDefaultBannedRights   string
-	FwdChannelParticipantsCount     int32
-	FwdChannelAdminsCount           int32
-	FwdChannelKickedCount           int32
-	FwdChannelBannedCount           int32
-	FwdChannelTopMessageID          int32
-	FwdChannelPinnedMessageID       int32
-	FwdChannelPts                   int32
-	FwdChannelTtlPeriod             int32
-	FwdChannelDate                  int32
-	FwdChannelDeleted               bool
-	ReplyChannelID                  int64
-	ReplyChannelAccessHash          int64
-	ReplyChannelCreatorUserID       int64
-	ReplyChannelTitle               string
-	ReplyChannelAbout               string
-	ReplyChannelUsername            string
-	ReplyChannelBroadcast           bool
-	ReplyChannelMegagroup           bool
-	ReplyChannelForum               bool
-	ReplyChannelNoforwards          bool
-	ReplyChannelSignatures          bool
-	ReplyChannelPreHistoryHidden    bool
-	ReplyChannelSlowmodeSeconds     int32
-	ReplyChannelDefaultBannedRights string
-	ReplyChannelParticipantsCount   int32
-	ReplyChannelAdminsCount         int32
-	ReplyChannelKickedCount         int32
-	ReplyChannelBannedCount         int32
-	ReplyChannelTopMessageID        int32
-	ReplyChannelPinnedMessageID     int32
-	ReplyChannelPts                 int32
-	ReplyChannelTtlPeriod           int32
-	ReplyChannelDate                int32
-	ReplyChannelDeleted             bool
+	UserID                         int64
+	Pts                            int32
+	PtsCount                       int32
+	Date                           int32
+	EventType                      string
+	EventBool                      bool
+	EventPeersJson                 string
+	PeerSettingsJson               string
+	MessageIdsJson                 string
+	DialogFilterJson               string
+	FilterOrderJson                string
+	FolderPeersJson                string
+	StoryPayloadJson               string
+	ReactionPayloadJson            string
+	EventPeerType                  string
+	EventPeerID                    int64
+	FilterID                       int32
+	MaxID                          int32
+	StillUnreadCount               int32
+	ChannelPts                     int32
+	TagsEnabled                    bool
+	FolderID                       int32
+	MessageID                      int32
+	PrivateMessageID               int64
+	OwnerUserID                    int64
+	PeerType                       string
+	PeerID                         int64
+	FromUserID                     int64
+	MessageDate                    int32
+	TtlPeriod                      int32
+	ExpiresAt                      int32
+	EditDate                       int32
+	Outgoing                       bool
+	Body                           string
+	MessageEntitiesJson            string
+	Silent                         bool
+	Noforwards                     bool
+	ReplyToMsgID                   int32
+	ReplyToPeerType                string
+	ReplyToPeerID                  int64
+	ReplyToTopID                   int32
+	ReplyToStoryID                 int32
+	QuoteText                      string
+	QuoteEntitiesJson              string
+	QuoteOffset                    int32
+	FwdFromPeerType                string
+	FwdFromPeerID                  int64
+	FwdFromName                    string
+	FwdDate                        int32
+	FwdSavedFromPeerType           string
+	FwdSavedFromPeerID             int64
+	FwdSavedFromMsgID              int32
+	SavedPeerType                  string
+	SavedPeerID                    int64
+	MediaJson                      string
+	MediaUnread                    bool
+	ReactionUnread                 bool
+	Pinned                         bool
+	ViaBotID                       int64
+	GroupedID                      int64
+	Effect                         int64
+	ReplyMarkupJson                string
+	RichMessageJson                string
+	PeerUserID                     int64
+	PeerAccessHash                 int64
+	PeerPhone                      string
+	PeerFirstName                  string
+	PeerLastName                   string
+	PeerUsername                   string
+	PeerCountryCode                string
+	PeerVerified                   bool
+	PeerSupport                    bool
+	PeerIsBot                      bool
+	PeerBotInfoVersion             int32
+	PeerPremiumUntil               int64
+	PeerEmojiStatusDocumentID      int64
+	PeerEmojiStatusUntil           int64
+	FromUserUserID                 int64
+	FromUserAccessHash             int64
+	FromUserPhone                  string
+	FromUserFirstName              string
+	FromUserLastName               string
+	FromUserUsername               string
+	FromUserCountryCode            string
+	FromUserVerified               bool
+	FromUserSupport                bool
+	FromUserIsBot                  bool
+	FromUserBotInfoVersion         int32
+	FromUserPremiumUntil           int64
+	FromUserEmojiStatusDocumentID  int64
+	FromUserEmojiStatusUntil       int64
+	FwdUserID                      int64
+	FwdUserAccessHash              int64
+	FwdUserPhone                   string
+	FwdUserFirstName               string
+	FwdUserLastName                string
+	FwdUserUsername                string
+	FwdUserCountryCode             string
+	FwdUserVerified                bool
+	FwdUserSupport                 bool
+	FwdUserIsBot                   bool
+	FwdUserBotInfoVersion          int32
+	FwdUserPremiumUntil            int64
+	FwdUserEmojiStatusDocumentID   int64
+	FwdUserEmojiStatusUntil        int64
+	ReplyUserID                    int64
+	ReplyUserAccessHash            int64
+	ReplyUserPhone                 string
+	ReplyUserFirstName             string
+	ReplyUserLastName              string
+	ReplyUserUsername              string
+	ReplyUserCountryCode           string
+	ReplyUserVerified              bool
+	ReplyUserSupport               bool
+	ReplyUserIsBot                 bool
+	ReplyUserBotInfoVersion        int32
+	ReplyUserPremiumUntil          int64
+	ReplyUserEmojiStatusDocumentID int64
+	ReplyUserEmojiStatusUntil      int64
 }
 
 // 按 (user_id, pts) 精确批量取账号事件，供 outbox worker 一次性加载一批 claim 的事件详情，
@@ -405,12 +398,16 @@ func (q *Queries) BatchListDispatchEvents(ctx context.Context, arg BatchListDisp
 			&i.DialogFilterJson,
 			&i.FilterOrderJson,
 			&i.FolderPeersJson,
+			&i.StoryPayloadJson,
+			&i.ReactionPayloadJson,
 			&i.EventPeerType,
 			&i.EventPeerID,
 			&i.FilterID,
 			&i.MaxID,
 			&i.StillUnreadCount,
+			&i.ChannelPts,
 			&i.TagsEnabled,
+			&i.FolderID,
 			&i.MessageID,
 			&i.PrivateMessageID,
 			&i.OwnerUserID,
@@ -418,6 +415,8 @@ func (q *Queries) BatchListDispatchEvents(ctx context.Context, arg BatchListDisp
 			&i.PeerID,
 			&i.FromUserID,
 			&i.MessageDate,
+			&i.TtlPeriod,
+			&i.ExpiresAt,
 			&i.EditDate,
 			&i.Outgoing,
 			&i.Body,
@@ -428,6 +427,7 @@ func (q *Queries) BatchListDispatchEvents(ctx context.Context, arg BatchListDisp
 			&i.ReplyToPeerType,
 			&i.ReplyToPeerID,
 			&i.ReplyToTopID,
+			&i.ReplyToStoryID,
 			&i.QuoteText,
 			&i.QuoteEntitiesJson,
 			&i.QuoteOffset,
@@ -435,9 +435,20 @@ func (q *Queries) BatchListDispatchEvents(ctx context.Context, arg BatchListDisp
 			&i.FwdFromPeerID,
 			&i.FwdFromName,
 			&i.FwdDate,
+			&i.FwdSavedFromPeerType,
+			&i.FwdSavedFromPeerID,
+			&i.FwdSavedFromMsgID,
+			&i.SavedPeerType,
+			&i.SavedPeerID,
 			&i.MediaJson,
 			&i.MediaUnread,
 			&i.ReactionUnread,
+			&i.Pinned,
+			&i.ViaBotID,
+			&i.GroupedID,
+			&i.Effect,
+			&i.ReplyMarkupJson,
+			&i.RichMessageJson,
 			&i.PeerUserID,
 			&i.PeerAccessHash,
 			&i.PeerPhone,
@@ -447,6 +458,11 @@ func (q *Queries) BatchListDispatchEvents(ctx context.Context, arg BatchListDisp
 			&i.PeerCountryCode,
 			&i.PeerVerified,
 			&i.PeerSupport,
+			&i.PeerIsBot,
+			&i.PeerBotInfoVersion,
+			&i.PeerPremiumUntil,
+			&i.PeerEmojiStatusDocumentID,
+			&i.PeerEmojiStatusUntil,
 			&i.FromUserUserID,
 			&i.FromUserAccessHash,
 			&i.FromUserPhone,
@@ -456,6 +472,11 @@ func (q *Queries) BatchListDispatchEvents(ctx context.Context, arg BatchListDisp
 			&i.FromUserCountryCode,
 			&i.FromUserVerified,
 			&i.FromUserSupport,
+			&i.FromUserIsBot,
+			&i.FromUserBotInfoVersion,
+			&i.FromUserPremiumUntil,
+			&i.FromUserEmojiStatusDocumentID,
+			&i.FromUserEmojiStatusUntil,
 			&i.FwdUserID,
 			&i.FwdUserAccessHash,
 			&i.FwdUserPhone,
@@ -465,6 +486,11 @@ func (q *Queries) BatchListDispatchEvents(ctx context.Context, arg BatchListDisp
 			&i.FwdUserCountryCode,
 			&i.FwdUserVerified,
 			&i.FwdUserSupport,
+			&i.FwdUserIsBot,
+			&i.FwdUserBotInfoVersion,
+			&i.FwdUserPremiumUntil,
+			&i.FwdUserEmojiStatusDocumentID,
+			&i.FwdUserEmojiStatusUntil,
 			&i.ReplyUserID,
 			&i.ReplyUserAccessHash,
 			&i.ReplyUserPhone,
@@ -474,54 +500,11 @@ func (q *Queries) BatchListDispatchEvents(ctx context.Context, arg BatchListDisp
 			&i.ReplyUserCountryCode,
 			&i.ReplyUserVerified,
 			&i.ReplyUserSupport,
-			&i.FwdChannelID,
-			&i.FwdChannelAccessHash,
-			&i.FwdChannelCreatorUserID,
-			&i.FwdChannelTitle,
-			&i.FwdChannelAbout,
-			&i.FwdChannelUsername,
-			&i.FwdChannelBroadcast,
-			&i.FwdChannelMegagroup,
-			&i.FwdChannelForum,
-			&i.FwdChannelNoforwards,
-			&i.FwdChannelSignatures,
-			&i.FwdChannelPreHistoryHidden,
-			&i.FwdChannelSlowmodeSeconds,
-			&i.FwdChannelDefaultBannedRights,
-			&i.FwdChannelParticipantsCount,
-			&i.FwdChannelAdminsCount,
-			&i.FwdChannelKickedCount,
-			&i.FwdChannelBannedCount,
-			&i.FwdChannelTopMessageID,
-			&i.FwdChannelPinnedMessageID,
-			&i.FwdChannelPts,
-			&i.FwdChannelTtlPeriod,
-			&i.FwdChannelDate,
-			&i.FwdChannelDeleted,
-			&i.ReplyChannelID,
-			&i.ReplyChannelAccessHash,
-			&i.ReplyChannelCreatorUserID,
-			&i.ReplyChannelTitle,
-			&i.ReplyChannelAbout,
-			&i.ReplyChannelUsername,
-			&i.ReplyChannelBroadcast,
-			&i.ReplyChannelMegagroup,
-			&i.ReplyChannelForum,
-			&i.ReplyChannelNoforwards,
-			&i.ReplyChannelSignatures,
-			&i.ReplyChannelPreHistoryHidden,
-			&i.ReplyChannelSlowmodeSeconds,
-			&i.ReplyChannelDefaultBannedRights,
-			&i.ReplyChannelParticipantsCount,
-			&i.ReplyChannelAdminsCount,
-			&i.ReplyChannelKickedCount,
-			&i.ReplyChannelBannedCount,
-			&i.ReplyChannelTopMessageID,
-			&i.ReplyChannelPinnedMessageID,
-			&i.ReplyChannelPts,
-			&i.ReplyChannelTtlPeriod,
-			&i.ReplyChannelDate,
-			&i.ReplyChannelDeleted,
+			&i.ReplyUserIsBot,
+			&i.ReplyUserBotInfoVersion,
+			&i.ReplyUserPremiumUntil,
+			&i.ReplyUserEmojiStatusDocumentID,
+			&i.ReplyUserEmojiStatusUntil,
 		); err != nil {
 			return nil, err
 		}
@@ -535,17 +518,17 @@ func (q *Queries) BatchListDispatchEvents(ctx context.Context, arg BatchListDisp
 
 const claimDispatchOutbox = `-- name: ClaimDispatchOutbox :many
 WITH picked AS (
-  SELECT target_user_id, id
-  FROM dispatch_outbox
+  SELECT d.target_user_id, d.id
+  FROM dispatch_outbox d
   WHERE (
-      status = 'pending'
-      AND next_attempt_at <= now()
+      d.status = 'pending'
+      AND d.next_attempt_at <= now()
     )
     OR (
-      status = 'dispatching'
-      AND updated_at < now() - make_interval(secs => $1::int)
+      d.status = 'dispatching'
+      AND d.updated_at < now() - make_interval(secs => $1::int)
     )
-  ORDER BY next_attempt_at ASC, target_user_id ASC, id ASC
+  ORDER BY d.next_attempt_at ASC, d.target_user_id ASC, d.pts ASC, d.id ASC
   LIMIT $2
   FOR UPDATE SKIP LOCKED
 )
@@ -674,17 +657,6 @@ func (q *Queries) EnqueueDispatch(ctx context.Context, arg EnqueueDispatchParams
 	return err
 }
 
-const ensureUserUpdateWatermark = `-- name: EnsureUserUpdateWatermark :exec
-INSERT INTO user_update_watermarks (user_id, contiguous_pts)
-VALUES ($1, 0)
-ON CONFLICT (user_id) DO NOTHING
-`
-
-func (q *Queries) EnsureUserUpdateWatermark(ctx context.Context, userID int64) error {
-	_, err := q.db.Exec(ctx, ensureUserUpdateWatermark, userID)
-	return err
-}
-
 const getUserUpdateWatermark = `-- name: GetUserUpdateWatermark :one
 SELECT contiguous_pts
 FROM user_update_watermarks
@@ -712,12 +684,16 @@ SELECT
   COALESCE(e.dialog_filter::text, '{}')::text AS dialog_filter_json,
   COALESCE(e.filter_order::text, '[]')::text AS filter_order_json,
   COALESCE(e.folder_peers::text, '[]')::text AS folder_peers_json,
+  COALESCE(e.story_payload::text, '{}')::text AS story_payload_json,
+  COALESCE(e.reaction_payload::text, '{}')::text AS reaction_payload_json,
   COALESCE(e.peer_type, '')::text AS event_peer_type,
   COALESCE(e.peer_id, 0)::bigint AS event_peer_id,
   e.filter_id,
   e.max_id,
   e.still_unread_count,
+  e.channel_pts,
   e.tags_enabled,
+  e.folder_id,
   COALESCE(m.box_id, 0)::int AS message_id,
   COALESCE(m.private_message_id, 0)::bigint AS private_message_id,
   COALESCE(m.owner_user_id, 0)::bigint AS owner_user_id,
@@ -725,6 +701,8 @@ SELECT
   COALESCE(m.peer_id, 0)::bigint AS peer_id,
   COALESCE(m.from_user_id, 0)::bigint AS from_user_id,
   COALESCE(m.message_date, 0)::int AS message_date,
+  COALESCE(m.ttl_period, 0)::int AS ttl_period,
+  COALESCE(m.expires_at, 0)::int AS expires_at,
   COALESCE(m.edit_date, 0)::int AS edit_date,
   COALESCE(m.outgoing, false)::boolean AS outgoing,
   COALESCE(m.body, '')::text AS body,
@@ -735,6 +713,7 @@ SELECT
   COALESCE(m.reply_to_peer_type, '')::text AS reply_to_peer_type,
   COALESCE(m.reply_to_peer_id, 0)::bigint AS reply_to_peer_id,
   COALESCE(m.reply_to_top_id, 0)::int AS reply_to_top_id,
+  COALESCE(m.reply_to_story_id, 0)::int AS reply_to_story_id,
   COALESCE(m.quote_text, '')::text AS quote_text,
   COALESCE(m.quote_entities::text, '[]')::text AS quote_entities_json,
   COALESCE(m.quote_offset, 0)::int AS quote_offset,
@@ -742,9 +721,20 @@ SELECT
   COALESCE(m.fwd_from_peer_id, 0)::bigint AS fwd_from_peer_id,
   COALESCE(m.fwd_from_name, '')::text AS fwd_from_name,
   COALESCE(m.fwd_date, 0)::int AS fwd_date,
+  COALESCE(m.fwd_saved_from_peer_type, '')::text AS fwd_saved_from_peer_type,
+  COALESCE(m.fwd_saved_from_peer_id, 0)::bigint AS fwd_saved_from_peer_id,
+  COALESCE(m.fwd_saved_from_msg_id, 0)::int AS fwd_saved_from_msg_id,
+  COALESCE(m.saved_peer_type, '')::text AS saved_peer_type,
+  COALESCE(m.saved_peer_id, 0)::bigint AS saved_peer_id,
   COALESCE(m.media::text, '{}')::text AS media_json,
   COALESCE(m.media_unread, false)::boolean AS media_unread,
   COALESCE(m.reaction_unread, false)::boolean AS reaction_unread,
+  COALESCE(m.pinned, false)::boolean AS pinned,
+  COALESCE(m.via_bot_id, 0)::bigint AS via_bot_id,
+  COALESCE(m.grouped_id, 0)::bigint AS grouped_id,
+  COALESCE(m.effect, 0)::bigint AS effect,
+  COALESCE(m.reply_markup::text, '{}')::text AS reply_markup_json,
+  COALESCE(m.rich_message::text, '{}')::text AS rich_message_json,
   COALESCE(peer_u.id, 0)::bigint AS peer_user_id,
   COALESCE(peer_u.access_hash, 0)::bigint AS peer_access_hash,
   COALESCE(peer_u.phone, '')::text AS peer_phone,
@@ -754,6 +744,11 @@ SELECT
   COALESCE(peer_u.country_code, '')::text AS peer_country_code,
   COALESCE(peer_u.verified, false)::boolean AS peer_verified,
   COALESCE(peer_u.support, false)::boolean AS peer_support,
+  COALESCE(peer_u.is_bot, false)::boolean AS peer_is_bot,
+  COALESCE(peer_u.bot_info_version, 0)::int AS peer_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM peer_u.premium_expires_at), 0)::bigint AS peer_premium_until,
+  COALESCE(peer_u.emoji_status_document_id, 0)::bigint AS peer_emoji_status_document_id,
+  COALESCE(peer_u.emoji_status_until, 0)::bigint AS peer_emoji_status_until,
   COALESCE(from_u.id, 0)::bigint AS from_user_user_id,
   COALESCE(from_u.access_hash, 0)::bigint AS from_user_access_hash,
   COALESCE(from_u.phone, '')::text AS from_user_phone,
@@ -763,6 +758,11 @@ SELECT
   COALESCE(from_u.country_code, '')::text AS from_user_country_code,
   COALESCE(from_u.verified, false)::boolean AS from_user_verified,
   COALESCE(from_u.support, false)::boolean AS from_user_support,
+  COALESCE(from_u.is_bot, false)::boolean AS from_user_is_bot,
+  COALESCE(from_u.bot_info_version, 0)::int AS from_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM from_u.premium_expires_at), 0)::bigint AS from_user_premium_until,
+  COALESCE(from_u.emoji_status_document_id, 0)::bigint AS from_user_emoji_status_document_id,
+  COALESCE(from_u.emoji_status_until, 0)::bigint AS from_user_emoji_status_until,
   COALESCE(fwd_u.id, 0)::bigint AS fwd_user_id,
   COALESCE(fwd_u.access_hash, 0)::bigint AS fwd_user_access_hash,
   COALESCE(fwd_u.phone, '')::text AS fwd_user_phone,
@@ -772,6 +772,11 @@ SELECT
   COALESCE(fwd_u.country_code, '')::text AS fwd_user_country_code,
   COALESCE(fwd_u.verified, false)::boolean AS fwd_user_verified,
   COALESCE(fwd_u.support, false)::boolean AS fwd_user_support,
+  COALESCE(fwd_u.is_bot, false)::boolean AS fwd_user_is_bot,
+  COALESCE(fwd_u.bot_info_version, 0)::int AS fwd_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM fwd_u.premium_expires_at), 0)::bigint AS fwd_user_premium_until,
+  COALESCE(fwd_u.emoji_status_document_id, 0)::bigint AS fwd_user_emoji_status_document_id,
+  COALESCE(fwd_u.emoji_status_until, 0)::bigint AS fwd_user_emoji_status_until,
   COALESCE(reply_u.id, 0)::bigint AS reply_user_id,
   COALESCE(reply_u.access_hash, 0)::bigint AS reply_user_access_hash,
   COALESCE(reply_u.phone, '')::text AS reply_user_phone,
@@ -781,62 +786,17 @@ SELECT
   COALESCE(reply_u.country_code, '')::text AS reply_user_country_code,
   COALESCE(reply_u.verified, false)::boolean AS reply_user_verified,
   COALESCE(reply_u.support, false)::boolean AS reply_user_support,
-  COALESCE(fwd_ch.id, 0)::bigint AS fwd_channel_id,
-  COALESCE(fwd_ch.access_hash, 0)::bigint AS fwd_channel_access_hash,
-  COALESCE(fwd_ch.creator_user_id, 0)::bigint AS fwd_channel_creator_user_id,
-  COALESCE(fwd_ch.title, '')::text AS fwd_channel_title,
-  COALESCE(fwd_ch.about, '')::text AS fwd_channel_about,
-  COALESCE(fwd_ch.username, '')::text AS fwd_channel_username,
-  COALESCE(fwd_ch.broadcast, false)::boolean AS fwd_channel_broadcast,
-  COALESCE(fwd_ch.megagroup, false)::boolean AS fwd_channel_megagroup,
-  COALESCE(fwd_ch.forum, false)::boolean AS fwd_channel_forum,
-  COALESCE(fwd_ch.noforwards, false)::boolean AS fwd_channel_noforwards,
-  COALESCE(fwd_ch.signatures, false)::boolean AS fwd_channel_signatures,
-  COALESCE(fwd_ch.pre_history_hidden, false)::boolean AS fwd_channel_pre_history_hidden,
-  COALESCE(fwd_ch.slowmode_seconds, 0)::int AS fwd_channel_slowmode_seconds,
-  COALESCE(fwd_ch.default_banned_rights::text, '{}')::text AS fwd_channel_default_banned_rights,
-  COALESCE(fwd_ch.participants_count, 0)::int AS fwd_channel_participants_count,
-  COALESCE(fwd_ch.admins_count, 0)::int AS fwd_channel_admins_count,
-  COALESCE(fwd_ch.kicked_count, 0)::int AS fwd_channel_kicked_count,
-  COALESCE(fwd_ch.banned_count, 0)::int AS fwd_channel_banned_count,
-  COALESCE(fwd_ch.top_message_id, 0)::int AS fwd_channel_top_message_id,
-  COALESCE(fwd_ch.pinned_message_id, 0)::int AS fwd_channel_pinned_message_id,
-  COALESCE(fwd_ch.pts, 0)::int AS fwd_channel_pts,
-  COALESCE(fwd_ch.ttl_period, 0)::int AS fwd_channel_ttl_period,
-  COALESCE(fwd_ch.date, 0)::int AS fwd_channel_date,
-  COALESCE(fwd_ch.deleted, false)::boolean AS fwd_channel_deleted,
-  COALESCE(reply_ch.id, 0)::bigint AS reply_channel_id,
-  COALESCE(reply_ch.access_hash, 0)::bigint AS reply_channel_access_hash,
-  COALESCE(reply_ch.creator_user_id, 0)::bigint AS reply_channel_creator_user_id,
-  COALESCE(reply_ch.title, '')::text AS reply_channel_title,
-  COALESCE(reply_ch.about, '')::text AS reply_channel_about,
-  COALESCE(reply_ch.username, '')::text AS reply_channel_username,
-  COALESCE(reply_ch.broadcast, false)::boolean AS reply_channel_broadcast,
-  COALESCE(reply_ch.megagroup, false)::boolean AS reply_channel_megagroup,
-  COALESCE(reply_ch.forum, false)::boolean AS reply_channel_forum,
-  COALESCE(reply_ch.noforwards, false)::boolean AS reply_channel_noforwards,
-  COALESCE(reply_ch.signatures, false)::boolean AS reply_channel_signatures,
-  COALESCE(reply_ch.pre_history_hidden, false)::boolean AS reply_channel_pre_history_hidden,
-  COALESCE(reply_ch.slowmode_seconds, 0)::int AS reply_channel_slowmode_seconds,
-  COALESCE(reply_ch.default_banned_rights::text, '{}')::text AS reply_channel_default_banned_rights,
-  COALESCE(reply_ch.participants_count, 0)::int AS reply_channel_participants_count,
-  COALESCE(reply_ch.admins_count, 0)::int AS reply_channel_admins_count,
-  COALESCE(reply_ch.kicked_count, 0)::int AS reply_channel_kicked_count,
-  COALESCE(reply_ch.banned_count, 0)::int AS reply_channel_banned_count,
-  COALESCE(reply_ch.top_message_id, 0)::int AS reply_channel_top_message_id,
-  COALESCE(reply_ch.pinned_message_id, 0)::int AS reply_channel_pinned_message_id,
-  COALESCE(reply_ch.pts, 0)::int AS reply_channel_pts,
-  COALESCE(reply_ch.ttl_period, 0)::int AS reply_channel_ttl_period,
-  COALESCE(reply_ch.date, 0)::int AS reply_channel_date,
-  COALESCE(reply_ch.deleted, false)::boolean AS reply_channel_deleted
+  COALESCE(reply_u.is_bot, false)::boolean AS reply_user_is_bot,
+  COALESCE(reply_u.bot_info_version, 0)::int AS reply_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM reply_u.premium_expires_at), 0)::bigint AS reply_user_premium_until,
+  COALESCE(reply_u.emoji_status_document_id, 0)::bigint AS reply_user_emoji_status_document_id,
+  COALESCE(reply_u.emoji_status_until, 0)::bigint AS reply_user_emoji_status_until
 FROM user_update_events e
 LEFT JOIN message_boxes m ON m.owner_user_id = e.user_id AND m.box_id = e.message_box_id
 LEFT JOIN users peer_u ON m.peer_type = 'user' AND peer_u.id = m.peer_id
 LEFT JOIN users from_u ON from_u.id = m.from_user_id
 LEFT JOIN users fwd_u ON m.fwd_from_peer_type = 'user' AND fwd_u.id = m.fwd_from_peer_id
 LEFT JOIN users reply_u ON m.reply_to_peer_type = 'user' AND reply_u.id = m.reply_to_peer_id
-LEFT JOIN channels fwd_ch ON m.fwd_from_peer_type = 'channel' AND fwd_ch.id = m.fwd_from_peer_id
-LEFT JOIN channels reply_ch ON m.reply_to_peer_type = 'channel' AND reply_ch.id = m.reply_to_peer_id
 WHERE e.user_id = $1
   AND e.pts > $2
 ORDER BY e.pts ASC
@@ -850,135 +810,125 @@ type ListUserUpdateEventsAfterParams struct {
 }
 
 type ListUserUpdateEventsAfterRow struct {
-	UserID                          int64
-	Pts                             int32
-	PtsCount                        int32
-	Date                            int32
-	EventType                       string
-	EventBool                       bool
-	EventPeersJson                  string
-	PeerSettingsJson                string
-	MessageIdsJson                  string
-	DialogFilterJson                string
-	FilterOrderJson                 string
-	FolderPeersJson                 string
-	EventPeerType                   string
-	EventPeerID                     int64
-	FilterID                        int32
-	MaxID                           int32
-	StillUnreadCount                int32
-	TagsEnabled                     bool
-	MessageID                       int32
-	PrivateMessageID                int64
-	OwnerUserID                     int64
-	PeerType                        string
-	PeerID                          int64
-	FromUserID                      int64
-	MessageDate                     int32
-	EditDate                        int32
-	Outgoing                        bool
-	Body                            string
-	MessageEntitiesJson             string
-	Silent                          bool
-	Noforwards                      bool
-	ReplyToMsgID                    int32
-	ReplyToPeerType                 string
-	ReplyToPeerID                   int64
-	ReplyToTopID                    int32
-	QuoteText                       string
-	QuoteEntitiesJson               string
-	QuoteOffset                     int32
-	FwdFromPeerType                 string
-	FwdFromPeerID                   int64
-	FwdFromName                     string
-	FwdDate                         int32
-	MediaJson                       string
-	MediaUnread                     bool
-	ReactionUnread                  bool
-	PeerUserID                      int64
-	PeerAccessHash                  int64
-	PeerPhone                       string
-	PeerFirstName                   string
-	PeerLastName                    string
-	PeerUsername                    string
-	PeerCountryCode                 string
-	PeerVerified                    bool
-	PeerSupport                     bool
-	FromUserUserID                  int64
-	FromUserAccessHash              int64
-	FromUserPhone                   string
-	FromUserFirstName               string
-	FromUserLastName                string
-	FromUserUsername                string
-	FromUserCountryCode             string
-	FromUserVerified                bool
-	FromUserSupport                 bool
-	FwdUserID                       int64
-	FwdUserAccessHash               int64
-	FwdUserPhone                    string
-	FwdUserFirstName                string
-	FwdUserLastName                 string
-	FwdUserUsername                 string
-	FwdUserCountryCode              string
-	FwdUserVerified                 bool
-	FwdUserSupport                  bool
-	ReplyUserID                     int64
-	ReplyUserAccessHash             int64
-	ReplyUserPhone                  string
-	ReplyUserFirstName              string
-	ReplyUserLastName               string
-	ReplyUserUsername               string
-	ReplyUserCountryCode            string
-	ReplyUserVerified               bool
-	ReplyUserSupport                bool
-	FwdChannelID                    int64
-	FwdChannelAccessHash            int64
-	FwdChannelCreatorUserID         int64
-	FwdChannelTitle                 string
-	FwdChannelAbout                 string
-	FwdChannelUsername              string
-	FwdChannelBroadcast             bool
-	FwdChannelMegagroup             bool
-	FwdChannelForum                 bool
-	FwdChannelNoforwards            bool
-	FwdChannelSignatures            bool
-	FwdChannelPreHistoryHidden      bool
-	FwdChannelSlowmodeSeconds       int32
-	FwdChannelDefaultBannedRights   string
-	FwdChannelParticipantsCount     int32
-	FwdChannelAdminsCount           int32
-	FwdChannelKickedCount           int32
-	FwdChannelBannedCount           int32
-	FwdChannelTopMessageID          int32
-	FwdChannelPinnedMessageID       int32
-	FwdChannelPts                   int32
-	FwdChannelTtlPeriod             int32
-	FwdChannelDate                  int32
-	FwdChannelDeleted               bool
-	ReplyChannelID                  int64
-	ReplyChannelAccessHash          int64
-	ReplyChannelCreatorUserID       int64
-	ReplyChannelTitle               string
-	ReplyChannelAbout               string
-	ReplyChannelUsername            string
-	ReplyChannelBroadcast           bool
-	ReplyChannelMegagroup           bool
-	ReplyChannelForum               bool
-	ReplyChannelNoforwards          bool
-	ReplyChannelSignatures          bool
-	ReplyChannelPreHistoryHidden    bool
-	ReplyChannelSlowmodeSeconds     int32
-	ReplyChannelDefaultBannedRights string
-	ReplyChannelParticipantsCount   int32
-	ReplyChannelAdminsCount         int32
-	ReplyChannelKickedCount         int32
-	ReplyChannelBannedCount         int32
-	ReplyChannelTopMessageID        int32
-	ReplyChannelPinnedMessageID     int32
-	ReplyChannelPts                 int32
-	ReplyChannelTtlPeriod           int32
-	ReplyChannelDate                int32
-	ReplyChannelDeleted             bool
+	UserID                         int64
+	Pts                            int32
+	PtsCount                       int32
+	Date                           int32
+	EventType                      string
+	EventBool                      bool
+	EventPeersJson                 string
+	PeerSettingsJson               string
+	MessageIdsJson                 string
+	DialogFilterJson               string
+	FilterOrderJson                string
+	FolderPeersJson                string
+	StoryPayloadJson               string
+	ReactionPayloadJson            string
+	EventPeerType                  string
+	EventPeerID                    int64
+	FilterID                       int32
+	MaxID                          int32
+	StillUnreadCount               int32
+	ChannelPts                     int32
+	TagsEnabled                    bool
+	FolderID                       int32
+	MessageID                      int32
+	PrivateMessageID               int64
+	OwnerUserID                    int64
+	PeerType                       string
+	PeerID                         int64
+	FromUserID                     int64
+	MessageDate                    int32
+	TtlPeriod                      int32
+	ExpiresAt                      int32
+	EditDate                       int32
+	Outgoing                       bool
+	Body                           string
+	MessageEntitiesJson            string
+	Silent                         bool
+	Noforwards                     bool
+	ReplyToMsgID                   int32
+	ReplyToPeerType                string
+	ReplyToPeerID                  int64
+	ReplyToTopID                   int32
+	ReplyToStoryID                 int32
+	QuoteText                      string
+	QuoteEntitiesJson              string
+	QuoteOffset                    int32
+	FwdFromPeerType                string
+	FwdFromPeerID                  int64
+	FwdFromName                    string
+	FwdDate                        int32
+	FwdSavedFromPeerType           string
+	FwdSavedFromPeerID             int64
+	FwdSavedFromMsgID              int32
+	SavedPeerType                  string
+	SavedPeerID                    int64
+	MediaJson                      string
+	MediaUnread                    bool
+	ReactionUnread                 bool
+	Pinned                         bool
+	ViaBotID                       int64
+	GroupedID                      int64
+	Effect                         int64
+	ReplyMarkupJson                string
+	RichMessageJson                string
+	PeerUserID                     int64
+	PeerAccessHash                 int64
+	PeerPhone                      string
+	PeerFirstName                  string
+	PeerLastName                   string
+	PeerUsername                   string
+	PeerCountryCode                string
+	PeerVerified                   bool
+	PeerSupport                    bool
+	PeerIsBot                      bool
+	PeerBotInfoVersion             int32
+	PeerPremiumUntil               int64
+	PeerEmojiStatusDocumentID      int64
+	PeerEmojiStatusUntil           int64
+	FromUserUserID                 int64
+	FromUserAccessHash             int64
+	FromUserPhone                  string
+	FromUserFirstName              string
+	FromUserLastName               string
+	FromUserUsername               string
+	FromUserCountryCode            string
+	FromUserVerified               bool
+	FromUserSupport                bool
+	FromUserIsBot                  bool
+	FromUserBotInfoVersion         int32
+	FromUserPremiumUntil           int64
+	FromUserEmojiStatusDocumentID  int64
+	FromUserEmojiStatusUntil       int64
+	FwdUserID                      int64
+	FwdUserAccessHash              int64
+	FwdUserPhone                   string
+	FwdUserFirstName               string
+	FwdUserLastName                string
+	FwdUserUsername                string
+	FwdUserCountryCode             string
+	FwdUserVerified                bool
+	FwdUserSupport                 bool
+	FwdUserIsBot                   bool
+	FwdUserBotInfoVersion          int32
+	FwdUserPremiumUntil            int64
+	FwdUserEmojiStatusDocumentID   int64
+	FwdUserEmojiStatusUntil        int64
+	ReplyUserID                    int64
+	ReplyUserAccessHash            int64
+	ReplyUserPhone                 string
+	ReplyUserFirstName             string
+	ReplyUserLastName              string
+	ReplyUserUsername              string
+	ReplyUserCountryCode           string
+	ReplyUserVerified              bool
+	ReplyUserSupport               bool
+	ReplyUserIsBot                 bool
+	ReplyUserBotInfoVersion        int32
+	ReplyUserPremiumUntil          int64
+	ReplyUserEmojiStatusDocumentID int64
+	ReplyUserEmojiStatusUntil      int64
 }
 
 func (q *Queries) ListUserUpdateEventsAfter(ctx context.Context, arg ListUserUpdateEventsAfterParams) ([]ListUserUpdateEventsAfterRow, error) {
@@ -1003,12 +953,16 @@ func (q *Queries) ListUserUpdateEventsAfter(ctx context.Context, arg ListUserUpd
 			&i.DialogFilterJson,
 			&i.FilterOrderJson,
 			&i.FolderPeersJson,
+			&i.StoryPayloadJson,
+			&i.ReactionPayloadJson,
 			&i.EventPeerType,
 			&i.EventPeerID,
 			&i.FilterID,
 			&i.MaxID,
 			&i.StillUnreadCount,
+			&i.ChannelPts,
 			&i.TagsEnabled,
+			&i.FolderID,
 			&i.MessageID,
 			&i.PrivateMessageID,
 			&i.OwnerUserID,
@@ -1016,6 +970,8 @@ func (q *Queries) ListUserUpdateEventsAfter(ctx context.Context, arg ListUserUpd
 			&i.PeerID,
 			&i.FromUserID,
 			&i.MessageDate,
+			&i.TtlPeriod,
+			&i.ExpiresAt,
 			&i.EditDate,
 			&i.Outgoing,
 			&i.Body,
@@ -1026,6 +982,7 @@ func (q *Queries) ListUserUpdateEventsAfter(ctx context.Context, arg ListUserUpd
 			&i.ReplyToPeerType,
 			&i.ReplyToPeerID,
 			&i.ReplyToTopID,
+			&i.ReplyToStoryID,
 			&i.QuoteText,
 			&i.QuoteEntitiesJson,
 			&i.QuoteOffset,
@@ -1033,9 +990,20 @@ func (q *Queries) ListUserUpdateEventsAfter(ctx context.Context, arg ListUserUpd
 			&i.FwdFromPeerID,
 			&i.FwdFromName,
 			&i.FwdDate,
+			&i.FwdSavedFromPeerType,
+			&i.FwdSavedFromPeerID,
+			&i.FwdSavedFromMsgID,
+			&i.SavedPeerType,
+			&i.SavedPeerID,
 			&i.MediaJson,
 			&i.MediaUnread,
 			&i.ReactionUnread,
+			&i.Pinned,
+			&i.ViaBotID,
+			&i.GroupedID,
+			&i.Effect,
+			&i.ReplyMarkupJson,
+			&i.RichMessageJson,
 			&i.PeerUserID,
 			&i.PeerAccessHash,
 			&i.PeerPhone,
@@ -1045,6 +1013,11 @@ func (q *Queries) ListUserUpdateEventsAfter(ctx context.Context, arg ListUserUpd
 			&i.PeerCountryCode,
 			&i.PeerVerified,
 			&i.PeerSupport,
+			&i.PeerIsBot,
+			&i.PeerBotInfoVersion,
+			&i.PeerPremiumUntil,
+			&i.PeerEmojiStatusDocumentID,
+			&i.PeerEmojiStatusUntil,
 			&i.FromUserUserID,
 			&i.FromUserAccessHash,
 			&i.FromUserPhone,
@@ -1054,6 +1027,11 @@ func (q *Queries) ListUserUpdateEventsAfter(ctx context.Context, arg ListUserUpd
 			&i.FromUserCountryCode,
 			&i.FromUserVerified,
 			&i.FromUserSupport,
+			&i.FromUserIsBot,
+			&i.FromUserBotInfoVersion,
+			&i.FromUserPremiumUntil,
+			&i.FromUserEmojiStatusDocumentID,
+			&i.FromUserEmojiStatusUntil,
 			&i.FwdUserID,
 			&i.FwdUserAccessHash,
 			&i.FwdUserPhone,
@@ -1063,6 +1041,11 @@ func (q *Queries) ListUserUpdateEventsAfter(ctx context.Context, arg ListUserUpd
 			&i.FwdUserCountryCode,
 			&i.FwdUserVerified,
 			&i.FwdUserSupport,
+			&i.FwdUserIsBot,
+			&i.FwdUserBotInfoVersion,
+			&i.FwdUserPremiumUntil,
+			&i.FwdUserEmojiStatusDocumentID,
+			&i.FwdUserEmojiStatusUntil,
 			&i.ReplyUserID,
 			&i.ReplyUserAccessHash,
 			&i.ReplyUserPhone,
@@ -1072,54 +1055,11 @@ func (q *Queries) ListUserUpdateEventsAfter(ctx context.Context, arg ListUserUpd
 			&i.ReplyUserCountryCode,
 			&i.ReplyUserVerified,
 			&i.ReplyUserSupport,
-			&i.FwdChannelID,
-			&i.FwdChannelAccessHash,
-			&i.FwdChannelCreatorUserID,
-			&i.FwdChannelTitle,
-			&i.FwdChannelAbout,
-			&i.FwdChannelUsername,
-			&i.FwdChannelBroadcast,
-			&i.FwdChannelMegagroup,
-			&i.FwdChannelForum,
-			&i.FwdChannelNoforwards,
-			&i.FwdChannelSignatures,
-			&i.FwdChannelPreHistoryHidden,
-			&i.FwdChannelSlowmodeSeconds,
-			&i.FwdChannelDefaultBannedRights,
-			&i.FwdChannelParticipantsCount,
-			&i.FwdChannelAdminsCount,
-			&i.FwdChannelKickedCount,
-			&i.FwdChannelBannedCount,
-			&i.FwdChannelTopMessageID,
-			&i.FwdChannelPinnedMessageID,
-			&i.FwdChannelPts,
-			&i.FwdChannelTtlPeriod,
-			&i.FwdChannelDate,
-			&i.FwdChannelDeleted,
-			&i.ReplyChannelID,
-			&i.ReplyChannelAccessHash,
-			&i.ReplyChannelCreatorUserID,
-			&i.ReplyChannelTitle,
-			&i.ReplyChannelAbout,
-			&i.ReplyChannelUsername,
-			&i.ReplyChannelBroadcast,
-			&i.ReplyChannelMegagroup,
-			&i.ReplyChannelForum,
-			&i.ReplyChannelNoforwards,
-			&i.ReplyChannelSignatures,
-			&i.ReplyChannelPreHistoryHidden,
-			&i.ReplyChannelSlowmodeSeconds,
-			&i.ReplyChannelDefaultBannedRights,
-			&i.ReplyChannelParticipantsCount,
-			&i.ReplyChannelAdminsCount,
-			&i.ReplyChannelKickedCount,
-			&i.ReplyChannelBannedCount,
-			&i.ReplyChannelTopMessageID,
-			&i.ReplyChannelPinnedMessageID,
-			&i.ReplyChannelPts,
-			&i.ReplyChannelTtlPeriod,
-			&i.ReplyChannelDate,
-			&i.ReplyChannelDeleted,
+			&i.ReplyUserIsBot,
+			&i.ReplyUserBotInfoVersion,
+			&i.ReplyUserPremiumUntil,
+			&i.ReplyUserEmojiStatusDocumentID,
+			&i.ReplyUserEmojiStatusUntil,
 		); err != nil {
 			return nil, err
 		}
@@ -1129,20 +1069,6 @@ func (q *Queries) ListUserUpdateEventsAfter(ctx context.Context, arg ListUserUpd
 		return nil, err
 	}
 	return items, nil
-}
-
-const lockUserUpdateWatermark = `-- name: LockUserUpdateWatermark :one
-SELECT contiguous_pts
-FROM user_update_watermarks
-WHERE user_id = $1
-FOR UPDATE
-`
-
-func (q *Queries) LockUserUpdateWatermark(ctx context.Context, userID int64) (int32, error) {
-	row := q.db.QueryRow(ctx, lockUserUpdateWatermark, userID)
-	var contiguous_pts int32
-	err := row.Scan(&contiguous_pts)
-	return contiguous_pts, err
 }
 
 const markDispatchDelivered = `-- name: MarkDispatchDelivered :exec
@@ -1176,7 +1102,7 @@ type MarkDispatchDeliveredBatchParams struct {
 	Ids           []int64
 }
 
-// 批量删除一批已投递的 (target_user_id, id)；target_user_id 入 WHERE 保证分区裁剪。
+// 批量删除一批已投递的 (target_user_id, id)；target_user_id 入 WHERE 命中唯一索引并避免串删。
 func (q *Queries) MarkDispatchDeliveredBatch(ctx context.Context, arg MarkDispatchDeliveredBatchParams) error {
 	_, err := q.db.Exec(ctx, markDispatchDeliveredBatch, arg.TargetUserIds, arg.Ids)
 	return err
@@ -1218,102 +1144,4 @@ func (q *Queries) MaxUserPts(ctx context.Context, userID int64) (int32, error) {
 	var max_pts int32
 	err := row.Scan(&max_pts)
 	return max_pts, err
-}
-
-const nextUserPtsAfter = `-- name: NextUserPtsAfter :many
-SELECT pts, pts_count
-FROM user_update_events
-WHERE user_id = $1
-  AND pts > $2
-ORDER BY pts ASC
-LIMIT $3
-`
-
-type NextUserPtsAfterParams struct {
-	UserID     int64
-	Pts        int32
-	LimitCount int32
-}
-
-type NextUserPtsAfterRow struct {
-	Pts      int32
-	PtsCount int32
-}
-
-func (q *Queries) NextUserPtsAfter(ctx context.Context, arg NextUserPtsAfterParams) ([]NextUserPtsAfterRow, error) {
-	rows, err := q.db.Query(ctx, nextUserPtsAfter, arg.UserID, arg.Pts, arg.LimitCount)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []NextUserPtsAfterRow
-	for rows.Next() {
-		var i NextUserPtsAfterRow
-		if err := rows.Scan(&i.Pts, &i.PtsCount); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const recentUserPts = `-- name: RecentUserPts :many
-SELECT pts, pts_count
-FROM user_update_events
-WHERE user_id = $1
-ORDER BY pts DESC
-LIMIT $2
-`
-
-type RecentUserPtsParams struct {
-	UserID     int64
-	WindowSize int32
-}
-
-type RecentUserPtsRow struct {
-	Pts      int32
-	PtsCount int32
-}
-
-// 取某 user 最近的一段 pts（降序），供计算「最大连续已提交 pts」用。
-// 只看顶部窗口：瞬时空洞只可能出现在最近在途事务区，窗口足够大即可覆盖其下方连续。
-func (q *Queries) RecentUserPts(ctx context.Context, arg RecentUserPtsParams) ([]RecentUserPtsRow, error) {
-	rows, err := q.db.Query(ctx, recentUserPts, arg.UserID, arg.WindowSize)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []RecentUserPtsRow
-	for rows.Next() {
-		var i RecentUserPtsRow
-		if err := rows.Scan(&i.Pts, &i.PtsCount); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const saveUserUpdateWatermark = `-- name: SaveUserUpdateWatermark :exec
-INSERT INTO user_update_watermarks (user_id, contiguous_pts, updated_at)
-VALUES ($1, $2, now())
-ON CONFLICT (user_id) DO UPDATE SET
-  contiguous_pts = GREATEST(user_update_watermarks.contiguous_pts, EXCLUDED.contiguous_pts),
-  updated_at = now()
-`
-
-type SaveUserUpdateWatermarkParams struct {
-	UserID        int64
-	ContiguousPts int32
-}
-
-func (q *Queries) SaveUserUpdateWatermark(ctx context.Context, arg SaveUserUpdateWatermarkParams) error {
-	_, err := q.db.Exec(ctx, saveUserUpdateWatermark, arg.UserID, arg.ContiguousPts)
-	return err
 }

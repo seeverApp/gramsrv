@@ -1,9 +1,12 @@
 package langpack
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"telesrv/internal/store/memory"
 )
 
 func TestParseTDesktopFile(t *testing.T) {
@@ -33,5 +36,63 @@ func TestParseTDesktopFile(t *testing.T) {
 	plural := pack.Strings[2]
 	if !plural.Pluralized || plural.Key != "lng_items" || plural.OneValue == "" || plural.OtherValue == "" {
 		t.Fatalf("plural string = %+v", plural)
+	}
+}
+
+func TestParseClientLangPackFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "weba_en_v12000000.strings")
+	if err := os.WriteFile(path, []byte(`
+"NewMessageTitle" = "New Message";
+`), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	pack, err := ParseTDesktopFile(path)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if pack.LangPack != "weba" || pack.LangCode != "en" || pack.Version != 12000000 {
+		t.Fatalf("pack meta = %+v", pack)
+	}
+	if len(pack.Strings) != 1 || pack.Strings[0].Key != "NewMessageTitle" {
+		t.Fatalf("strings = %+v", pack.Strings)
+	}
+}
+
+func TestSeedDirectoryWalksClientSubdirs(t *testing.T) {
+	root := t.TempDir()
+	for _, item := range []struct {
+		dir  string
+		file string
+		key  string
+	}{
+		{dir: "tdesktop", file: "tdesktop_en_v1.strings", key: "lng_language_name"},
+		{dir: "weba", file: "weba_en_v2.strings", key: "NewMessageTitle"},
+	} {
+		dir := filepath.Join(root, item.dir)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("mkdir fixture: %v", err)
+		}
+		content := []byte(`"` + item.key + `" = "value";`)
+		if err := os.WriteFile(filepath.Join(dir, item.file), content, 0o600); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+	}
+
+	store := memory.NewLangPackStore()
+	service := NewService(store)
+	seeded, err := service.SeedDirectory(context.Background(), root)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if seeded != 2 {
+		t.Fatalf("seeded = %d, want 2", seeded)
+	}
+	pack, err := service.GetLangPack(context.Background(), "weba", "en")
+	if err != nil {
+		t.Fatalf("get weba pack: %v", err)
+	}
+	if pack.Version != 2 || len(pack.Strings) != 1 || pack.Strings[0].Key != "NewMessageTitle" {
+		t.Fatalf("weba pack = %+v", pack)
 	}
 }

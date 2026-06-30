@@ -45,7 +45,7 @@ func TestMessageStoreBidirectionalConcurrencyNoDeadlock(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
 	})
 
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}, &perUserCounterAllocator{}))
+	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 	date := int(time.Now().Unix())
 
 	var ridMu sync.Mutex
@@ -115,5 +115,105 @@ func TestMessageStoreBidirectionalConcurrencyNoDeadlock(t *testing.T) {
 	}
 	if failed > 0 {
 		t.Fatalf("%d/%d 反向并发操作失败", failed, rounds*4)
+	}
+}
+
+func TestMessageStoreBidirectionalRevokeDeleteNoDeadlock(t *testing.T) {
+	pool := testPool(t)
+	baseCtx := context.Background()
+	ctx, cancel := context.WithTimeout(baseCtx, 20*time.Second)
+	defer cancel()
+	suffix := randomSuffix(t)
+
+	users := NewUserStore(pool)
+	a, err := users.Create(baseCtx, domain.User{AccessHash: 73, Phone: "+1997" + suffix + "11", FirstName: "DeleteA"})
+	if err != nil {
+		t.Fatalf("create a: %v", err)
+	}
+	b, err := users.Create(baseCtx, domain.User{AccessHash: 74, Phone: "+1997" + suffix + "12", FirstName: "DeleteB"})
+	if err != nil {
+		t.Fatalf("create b: %v", err)
+	}
+	ids := []int64{a.ID, b.ID}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(baseCtx, "DELETE FROM dispatch_outbox WHERE target_user_id = ANY($1::bigint[])", ids)
+		_, _ = pool.Exec(baseCtx, "DELETE FROM user_update_events WHERE user_id = ANY($1::bigint[])", ids)
+		_, _ = pool.Exec(baseCtx, "DELETE FROM user_update_watermarks WHERE user_id = ANY($1::bigint[])", ids)
+		_, _ = pool.Exec(baseCtx, "DELETE FROM message_boxes WHERE owner_user_id = ANY($1::bigint[])", ids)
+		_, _ = pool.Exec(baseCtx, "DELETE FROM private_messages WHERE sender_user_id = ANY($1::bigint[])", ids)
+		_, _ = pool.Exec(baseCtx, "DELETE FROM dialogs WHERE user_id = ANY($1::bigint[])", ids)
+		_, _ = pool.Exec(baseCtx, "DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
+	})
+
+	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
+	date := int(time.Now().Unix())
+	type pair struct {
+		senderBoxID    int
+		recipientBoxID int
+	}
+	const count = 60
+	pairs := make([]pair, 0, count)
+	for i := 0; i < count; i++ {
+		sent, err := messages.SendPrivateText(baseCtx, domain.SendPrivateTextRequest{
+			SenderUserID:    a.ID,
+			RecipientUserID: b.ID,
+			RandomID:        time.Now().UnixNano() + int64(i),
+			Message:         "revoke-delete",
+			Date:            date,
+		})
+		if err != nil {
+			t.Fatalf("seed message %d: %v", i, err)
+		}
+		pairs = append(pairs, pair{senderBoxID: sent.SenderMessage.ID, recipientBoxID: sent.RecipientMessage.ID})
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, count*2)
+	sem := make(chan struct{}, 24)
+	submit := func(op func() error) {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if e := op(); e != nil {
+				errCh <- e
+			}
+		}()
+	}
+
+	for _, p := range pairs {
+		p := p
+		submit(func() error {
+			_, e := messages.DeleteMessages(ctx, domain.DeleteMessagesRequest{
+				OwnerUserID: a.ID,
+				IDs:         []int{p.senderBoxID},
+				Revoke:      true,
+				Date:        date,
+			})
+			return e
+		})
+		submit(func() error {
+			_, e := messages.DeleteMessages(ctx, domain.DeleteMessagesRequest{
+				OwnerUserID: b.ID,
+				IDs:         []int{p.recipientBoxID},
+				Revoke:      true,
+				Date:        date,
+			})
+			return e
+		})
+	}
+	wg.Wait()
+	close(errCh)
+
+	failed := 0
+	for e := range errCh {
+		failed++
+		if failed <= 5 {
+			t.Errorf("双端 revoke delete 失败（疑似死锁回归）: %v", e)
+		}
+	}
+	if failed > 0 {
+		t.Fatalf("%d/%d 双端 revoke delete 操作失败", failed, count*2)
 	}
 }

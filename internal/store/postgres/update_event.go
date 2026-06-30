@@ -3,10 +3,10 @@ package postgres
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
@@ -15,70 +15,76 @@ import (
 
 // UpdateEventStore 用 PostgreSQL 实现 store.UpdateEventStore。
 type UpdateEventStore struct {
-	db sqlcgen.DBTX
-	q  *sqlcgen.Queries
+	db  sqlcgen.DBTX
+	q   *sqlcgen.Queries
+	log *zap.Logger
+}
+
+type UpdateEventStoreOption func(*UpdateEventStore)
+
+// WithUpdateEventLogger 注入 durable update log 的日志器。
+func WithUpdateEventLogger(log *zap.Logger) UpdateEventStoreOption {
+	return func(s *UpdateEventStore) {
+		s.log = log
+	}
 }
 
 // NewUpdateEventStore 基于 pgx 连接池（或事务）创建 UpdateEventStore。
-func NewUpdateEventStore(db sqlcgen.DBTX) *UpdateEventStore {
-	return &UpdateEventStore{db: db, q: sqlcgen.New(db)}
+func NewUpdateEventStore(db sqlcgen.DBTX, opts ...UpdateEventStoreOption) *UpdateEventStore {
+	s := &UpdateEventStore{db: db, q: sqlcgen.New(db)}
+	for _, opt := range opts {
+		opt(s)
+	}
+	if s.log == nil {
+		s.log = zap.NewNop()
+	}
+	return s
 }
 
 func (s *UpdateEventStore) Append(ctx context.Context, userID int64, event domain.UpdateEvent) error {
-	beginner, ok := s.db.(interface {
-		Begin(context.Context) (pgx.Tx, error)
-	})
-	if !ok {
-		if err := appendUserUpdateEvent(ctx, s.q, userID, event); err != nil {
-			return fmt.Errorf("append update event: %w", err)
-		}
-		return nil
-	}
-	tx, err := beginner.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin append update event: %w", err)
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback(ctx)
-		}
-	}()
-	if err := appendUserUpdateEvent(ctx, sqlcgen.New(tx), userID, event); err != nil {
-		return fmt.Errorf("append update event: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit append update event: %w", err)
-	}
-	committed = true
-	return nil
+	_, err := s.append(ctx, userID, event, false, [8]byte{}, 0, false)
+	return err
 }
 
-// AppendWithDispatch 将账号级 update 事件与在线投递 outbox 放入同一个 PG 事务。
-// 设置类 RPC 不像消息发送那样已有业务大事务；这里至少保证“事件已持久化”与
-// “可靠在线投递任务已入队”同生共死，避免进程在手动 push 前退出造成在线通知漏投。
-func (s *UpdateEventStore) AppendWithDispatch(ctx context.Context, userID int64, event domain.UpdateEvent, excludeAuthKeyID [8]byte, excludeSessionID int64) error {
+func (s *UpdateEventStore) AppendAllocated(ctx context.Context, userID int64, event domain.UpdateEvent) (domain.UpdateEvent, error) {
+	return s.append(ctx, userID, event, false, [8]byte{}, 0, true)
+}
+
+// AppendAllocatedWithDispatch 在同一个 PG 事务里完成 pts 分配、durable event 写入与
+// dispatch outbox 入队，返回带最终 pts 的事件。
+func (s *UpdateEventStore) AppendAllocatedWithDispatch(ctx context.Context, userID int64, event domain.UpdateEvent, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, error) {
+	return s.append(ctx, userID, event, true, excludeAuthKeyID, excludeSessionID, true)
+}
+
+func (s *UpdateEventStore) append(ctx context.Context, userID int64, event domain.UpdateEvent, dispatch bool, excludeAuthKeyID [8]byte, excludeSessionID int64, allocate bool) (domain.UpdateEvent, error) {
+	if event.PtsCount <= 0 {
+		event.PtsCount = 1
+	}
 	beginner, ok := s.db.(interface {
 		Begin(context.Context) (pgx.Tx, error)
 	})
 	if !ok {
-		if err := s.Append(ctx, userID, event); err != nil {
-			return err
+		event, err := s.appendInTx(ctx, s.db, s.q, userID, event, dispatch, excludeAuthKeyID, excludeSessionID, allocate)
+		if err != nil {
+			s.logAppendFailure(ctx, userID, event, dispatch, "append", err)
+			return domain.UpdateEvent{}, err
 		}
-		if err := s.q.EnqueueDispatch(ctx, sqlcgen.EnqueueDispatchParams{
-			TargetUserID:     userID,
-			Pts:              int32(event.Pts),
-			EventType:        string(event.Type),
-			ExcludeAuthKeyID: authKeyIDToInt64(excludeAuthKeyID),
-			ExcludeSessionID: excludeSessionID,
-		}); err != nil {
-			return fmt.Errorf("enqueue dispatch: %w", err)
-		}
-		return nil
+		s.logAppendSuccess(userID, event, dispatch, excludeSessionID)
+		return event, nil
 	}
 	tx, err := beginner.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin append update dispatch: %w", err)
+		s.log.Warn("update_event_append_failed",
+			zap.String("scope", "user"),
+			zap.Int64("user_id", userID),
+			zap.Int("pts", event.Pts),
+			zap.Int("pts_count", event.PtsCount),
+			zap.String("event_type", string(event.Type)),
+			zap.String("phase", "begin"),
+			zap.Error(err),
+			zap.Error(ctx.Err()),
+		)
+		return domain.UpdateEvent{}, fmt.Errorf("begin append update event: %w", err)
 	}
 	committed := false
 	defer func() {
@@ -87,26 +93,75 @@ func (s *UpdateEventStore) AppendWithDispatch(ctx context.Context, userID int64,
 		}
 	}()
 	qtx := sqlcgen.New(tx)
-	if err := appendUserUpdateEvent(ctx, qtx, userID, event); err != nil {
-		return fmt.Errorf("append update event: %w", err)
-	}
-	if err := qtx.EnqueueDispatch(ctx, sqlcgen.EnqueueDispatchParams{
-		TargetUserID:     userID,
-		Pts:              int32(event.Pts),
-		EventType:        string(event.Type),
-		ExcludeAuthKeyID: authKeyIDToInt64(excludeAuthKeyID),
-		ExcludeSessionID: excludeSessionID,
-	}); err != nil {
-		return fmt.Errorf("enqueue dispatch: %w", err)
+	event, err = s.appendInTx(ctx, tx, qtx, userID, event, dispatch, excludeAuthKeyID, excludeSessionID, allocate)
+	if err != nil {
+		s.logAppendFailure(ctx, userID, event, dispatch, "append", err)
+		return domain.UpdateEvent{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit append update dispatch: %w", err)
+		s.logAppendFailure(ctx, userID, event, dispatch, "commit", err)
+		return domain.UpdateEvent{}, fmt.Errorf("commit append update event: %w", err)
 	}
 	committed = true
-	return nil
+	s.logAppendSuccess(userID, event, dispatch, excludeSessionID)
+	return event, nil
 }
 
-func appendUserUpdateEvent(ctx context.Context, q *sqlcgen.Queries, userID int64, event domain.UpdateEvent) error {
+func (s *UpdateEventStore) appendInTx(ctx context.Context, db sqlcgen.DBTX, q *sqlcgen.Queries, userID int64, event domain.UpdateEvent, dispatch bool, excludeAuthKeyID [8]byte, excludeSessionID int64, allocate bool) (domain.UpdateEvent, error) {
+	var err error
+	if allocate || event.Pts == 0 {
+		event.Pts, err = reserveUserPts(ctx, db, userID, event.PtsCount)
+		if err != nil {
+			return domain.UpdateEvent{}, fmt.Errorf("reserve user pts: %w", err)
+		}
+	} else if err := advanceUserPtsTo(ctx, db, userID, event.Pts, event.PtsCount); err != nil {
+		return domain.UpdateEvent{}, err
+	}
+	event.UserID = userID
+	if err := appendUserUpdateEvent(ctx, db, q, userID, event); err != nil {
+		return domain.UpdateEvent{}, fmt.Errorf("append update event: %w", err)
+	}
+	if dispatch {
+		if err := q.EnqueueDispatch(ctx, sqlcgen.EnqueueDispatchParams{
+			TargetUserID:     userID,
+			Pts:              int32(event.Pts),
+			EventType:        string(event.Type),
+			ExcludeAuthKeyID: authKeyIDToInt64(excludeAuthKeyID),
+			ExcludeSessionID: excludeSessionID,
+		}); err != nil {
+			return domain.UpdateEvent{}, fmt.Errorf("enqueue dispatch: %w", err)
+		}
+	}
+	return event, nil
+}
+
+func (s *UpdateEventStore) logAppendFailure(ctx context.Context, userID int64, event domain.UpdateEvent, dispatch bool, phase string, err error) {
+	s.log.Warn("update_event_append_failed",
+		zap.String("scope", "user"),
+		zap.Int64("user_id", userID),
+		zap.Int("pts", event.Pts),
+		zap.Int("pts_count", event.PtsCount),
+		zap.String("event_type", string(event.Type)),
+		zap.String("phase", phase),
+		zap.Bool("dispatch", dispatch),
+		zap.Error(err),
+		zap.Error(ctx.Err()),
+	)
+}
+
+func (s *UpdateEventStore) logAppendSuccess(userID int64, event domain.UpdateEvent, dispatch bool, excludeSessionID int64) {
+	s.log.Debug("update_event_appended",
+		zap.String("scope", "user"),
+		zap.Int64("user_id", userID),
+		zap.Int("pts", event.Pts),
+		zap.Int("pts_count", event.PtsCount),
+		zap.String("event_type", string(event.Type)),
+		zap.Bool("dispatch", dispatch),
+		zap.Int64("exclude_session_id", excludeSessionID),
+	)
+}
+
+func appendUserUpdateEvent(ctx context.Context, db sqlcgen.DBTX, q *sqlcgen.Queries, userID int64, event domain.UpdateEvent) error {
 	var messageID *int32
 	if event.Message.ID != 0 {
 		id := int32(event.Message.ID)
@@ -148,6 +203,14 @@ func appendUserUpdateEvent(ctx context.Context, q *sqlcgen.Queries, userID int64
 	if err != nil {
 		return err
 	}
+	storyPayload, err := encodeEventStory(event.Story)
+	if err != nil {
+		return err
+	}
+	reactionPayload, err := encodeEventReaction(event.Reaction)
+	if err != nil {
+		return err
+	}
 	if err := q.AppendUserUpdateEvent(ctx, sqlcgen.AppendUserUpdateEventParams{
 		UserID:           userID,
 		Pts:              int32(event.Pts),
@@ -161,18 +224,90 @@ func appendUserUpdateEvent(ctx context.Context, q *sqlcgen.Queries, userID int64
 		DialogFilter:     dialogFilter,
 		FilterOrder:      filterOrder,
 		FolderPeers:      folderPeers,
+		StoryPayload:     storyPayload,
+		ReactionPayload:  reactionPayload,
 		MaxID:            pgInt32NonNegative(event.MaxID),
 		StillUnreadCount: int32(event.StillUnreadCount),
+		ChannelPts:       int32(event.ChannelPts),
 		FilterID:         pgInt32NonNegative(event.FilterID),
 		TagsEnabled:      event.TagsEnabled,
+		FolderID:         pgInt32NonNegative(event.FolderID),
 		MessageBoxID:     messageID,
 		PeerType:         peerType,
 		PeerID:           peerID,
 	}); err != nil {
 		return err
 	}
-	if _, err := advanceContiguousPts(ctx, q, userID); err != nil {
-		return fmt.Errorf("advance update watermark: %w", err)
+	if err := appendQuickReplyPayload(ctx, db, userID, event); err != nil {
+		return err
+	}
+	return nil
+}
+
+func appendQuickReplyPayload(ctx context.Context, db sqlcgen.DBTX, userID int64, event domain.UpdateEvent) error {
+	switch event.Type {
+	case domain.UpdateEventQuickReplies,
+		domain.UpdateEventNewQuickReply,
+		domain.UpdateEventDeleteQuickReply,
+		domain.UpdateEventQuickReplyMessage,
+		domain.UpdateEventDeleteQuickReplyMessages:
+	default:
+		return nil
+	}
+	replies, err := json.Marshal(event.QuickReplies)
+	if err != nil {
+		return fmt.Errorf("encode quick replies: %w", err)
+	}
+	message, err := json.Marshal(event.QuickReplyMessage)
+	if err != nil {
+		return fmt.Errorf("encode quick reply message: %w", err)
+	}
+	if _, err := db.Exec(ctx, `
+UPDATE user_update_events
+SET quick_replies = $3::jsonb,
+    quick_reply_message = $4::jsonb
+WHERE user_id = $1
+  AND pts = $2`, userID, event.Pts, string(replies), string(message)); err != nil {
+		return fmt.Errorf("save quick reply update payload: %w", err)
+	}
+	return nil
+}
+
+func (s *UpdateEventStore) hydrateQuickReplyEvent(ctx context.Context, event *domain.UpdateEvent) error {
+	if event == nil {
+		return nil
+	}
+	switch event.Type {
+	case domain.UpdateEventQuickReplies,
+		domain.UpdateEventNewQuickReply,
+		domain.UpdateEventQuickReplyMessage,
+		domain.UpdateEventDeleteQuickReply:
+	default:
+		return nil
+	}
+	var repliesJSON, messageJSON string
+	if err := s.db.QueryRow(ctx, `
+SELECT
+  COALESCE(quick_replies::text, '[]')::text,
+  COALESCE(quick_reply_message::text, '{}')::text
+FROM user_update_events
+WHERE user_id = $1
+  AND pts = $2`, event.UserID, event.Pts).Scan(&repliesJSON, &messageJSON); err != nil {
+		return fmt.Errorf("get quick reply update payload: %w", err)
+	}
+	if err := json.Unmarshal([]byte(repliesJSON), &event.QuickReplies); err != nil {
+		return fmt.Errorf("decode quick replies: %w", err)
+	}
+	if err := json.Unmarshal([]byte(messageJSON), &event.QuickReplyMessage); err != nil {
+		return fmt.Errorf("decode quick reply message: %w", err)
+	}
+	if event.Type == domain.UpdateEventNewQuickReply && event.QuickReply.ID == 0 {
+		for _, item := range event.QuickReplies {
+			if item.ID == event.MaxID {
+				event.QuickReply = item
+				break
+			}
+		}
 	}
 	return nil
 }
@@ -202,6 +337,7 @@ func (s *UpdateEventStore) ListAfter(ctx context.Context, userID int64, pts, lim
 			row.ReplyToPeerType,
 			row.ReplyToPeerID,
 			row.ReplyToTopID,
+			row.ReplyToStoryID,
 			row.QuoteText,
 			row.QuoteEntitiesJson,
 			row.QuoteOffset,
@@ -209,6 +345,9 @@ func (s *UpdateEventStore) ListAfter(ctx context.Context, userID int64, pts, lim
 			row.FwdFromPeerID,
 			row.FwdFromName,
 			row.FwdDate,
+			row.FwdSavedFromPeerType,
+			row.FwdSavedFromPeerID,
+			row.FwdSavedFromMsgID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("decode message metadata: %w", err)
@@ -237,28 +376,48 @@ func (s *UpdateEventStore) ListAfter(ctx context.Context, userID int64, pts, lim
 		if err != nil {
 			return nil, fmt.Errorf("decode folder peers: %w", err)
 		}
+		story, err := decodeEventStory(row.StoryPayloadJson)
+		if err != nil {
+			return nil, fmt.Errorf("decode story payload: %w", err)
+		}
+		reaction, err := decodeEventReaction(row.ReactionPayloadJson)
+		if err != nil {
+			return nil, fmt.Errorf("decode reaction payload: %w", err)
+		}
 		media, err := decodeMessageMedia(row.MediaJson)
 		if err != nil {
 			return nil, fmt.Errorf("decode message media: %w", err)
 		}
-		out = append(out, domain.UpdateEvent{
+		markup, err := decodeReplyMarkup(row.ReplyMarkupJson)
+		if err != nil {
+			return nil, fmt.Errorf("decode message reply markup: %w", err)
+		}
+		rich, err := decodeRichMessage(row.RichMessageJson)
+		if err != nil {
+			return nil, fmt.Errorf("decode message rich message: %w", err)
+		}
+		event := domain.UpdateEvent{
 			UserID:           row.UserID,
 			Type:             domain.UpdateEventType(row.EventType),
 			Pts:              int(row.Pts),
 			PtsCount:         int(row.PtsCount),
 			Date:             int(row.Date),
 			Peer:             domain.Peer{Type: domain.PeerType(row.EventPeerType), ID: row.EventPeerID},
+			Story:            story,
 			Peers:            peers,
 			Bool:             row.EventBool,
 			Settings:         settings,
 			MessageIDs:       messageIDs,
 			MaxID:            int(row.MaxID),
 			StillUnreadCount: int(row.StillUnreadCount),
+			ChannelPts:       int(row.ChannelPts),
 			FilterID:         int(row.FilterID),
 			DialogFilter:     dialogFilter,
 			FilterOrder:      filterOrder,
 			FolderPeers:      folderPeers,
 			TagsEnabled:      row.TagsEnabled,
+			FolderID:         int(row.FolderID),
+			Reaction:         reaction,
 			Message: domain.Message{
 				ID:             int(row.MessageID),
 				UID:            row.PrivateMessageID,
@@ -275,160 +434,39 @@ func (s *UpdateEventStore) ListAfter(ctx context.Context, userID int64, pts, lim
 				ReplyTo:        reply,
 				Forward:        forward,
 				Media:          media,
+				ReplyMarkup:    markup,
+				RichMessage:    rich,
 				MediaUnread:    row.MediaUnread,
 				ReactionUnread: row.ReactionUnread,
+				ViaBotID:       row.ViaBotID,
+				GroupedID:      row.GroupedID,
+				Effect:         row.Effect,
+				Pinned:         row.Pinned,
+				SavedPeer:      savedPeerFromFields(row.SavedPeerType, row.SavedPeerID),
+				TTLPeriod:      int(row.TtlPeriod),
+				ExpiresAt:      int(row.ExpiresAt),
 			},
-			Users:    usersFromUpdateEventRow(row),
-			Channels: channelsFromUpdateEventRow(row),
-		})
+			Users: usersFromUpdateEventRow(row),
+		}
+		if err := s.hydrateQuickReplyEvent(ctx, &event); err != nil {
+			return nil, err
+		}
+		out = append(out, event)
 	}
 	return out, nil
 }
 
-func (s *UpdateEventStore) Current(ctx context.Context, userID int64) (int, error) {
-	pts, err := s.q.MaxUserPts(ctx, userID)
-	if err != nil {
-		return 0, fmt.Errorf("max user pts: %w", err)
-	}
-	return int(pts), nil
-}
-
-func (s *UpdateEventStore) AdvanceContiguousPts(ctx context.Context, userID int64) (int, error) {
-	beginner, ok := s.db.(interface {
-		Begin(context.Context) (pgx.Tx, error)
-	})
-	if !ok {
-		pts, err := advanceContiguousPts(ctx, s.q, userID)
-		if err != nil {
-			return 0, fmt.Errorf("advance update watermark: %w", err)
-		}
-		return pts, nil
-	}
-	tx, err := beginner.Begin(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("begin advance update watermark: %w", err)
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback(ctx)
-		}
-	}()
-	pts, err := advanceContiguousPts(ctx, sqlcgen.New(tx), userID)
-	if err != nil {
-		return 0, fmt.Errorf("advance update watermark: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("commit advance update watermark: %w", err)
-	}
-	committed = true
-	return pts, nil
-}
-
-// contiguousWindow 是计算最大连续 pts 时回看的顶部 pts 数量。
-// 瞬时空洞只来自最近在途的发送事务（提交即填实、回退即补 noop），单用户在途量远小于此，
-// 故窗口内若无空洞即可认定窗口下方连续。生产极端高 fan-in 可调大。
-const contiguousWindow = 4096
-
-// MaxContiguousPts 见 store.UpdateEventStore 接口说明。正常路径 O(1) 读账号水位；
-// 缺行通常来自迁移前数据，允许一次性从 durable 事件计算并补写。
+// MaxContiguousPts 见 store.UpdateEventStore 接口说明。PG 写路径保证水位与
+// durable event 同事务提交；缺行代表该账号还没有 update。
 func (s *UpdateEventStore) MaxContiguousPts(ctx context.Context, userID int64) (int, error) {
 	pts, err := s.q.GetUserUpdateWatermark(ctx, userID)
 	if err == nil {
 		return int(pts), nil
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	if err != pgx.ErrNoRows {
 		return 0, fmt.Errorf("get update watermark: %w", err)
 	}
-	return s.AdvanceContiguousPts(ctx, userID)
-}
-
-func advanceContiguousPts(ctx context.Context, q *sqlcgen.Queries, userID int64) (int, error) {
-	if err := q.EnsureUserUpdateWatermark(ctx, userID); err != nil {
-		return 0, err
-	}
-	locked, err := q.LockUserUpdateWatermark(ctx, userID)
-	if err != nil {
-		return 0, err
-	}
-	contiguous := int(locked)
-	for {
-		rows, err := q.NextUserPtsAfter(ctx, sqlcgen.NextUserPtsAfterParams{
-			UserID:     userID,
-			Pts:        int32(contiguous),
-			LimitCount: contiguousWindow,
-		})
-		if err != nil {
-			return 0, err
-		}
-		if len(rows) == 0 {
-			break
-		}
-		advanced := false
-		for _, row := range rows {
-			count := maxInt(int(row.PtsCount), 1)
-			expected := contiguous + count
-			if int(row.Pts) != expected {
-				if contiguous > int(locked) {
-					if err := saveUserUpdateWatermark(ctx, q, userID, contiguous); err != nil {
-						return 0, err
-					}
-				}
-				return contiguous, nil
-			}
-			contiguous = int(row.Pts)
-			advanced = true
-		}
-		if len(rows) < contiguousWindow || !advanced {
-			break
-		}
-	}
-	if contiguous > int(locked) {
-		if err := saveUserUpdateWatermark(ctx, q, userID, contiguous); err != nil {
-			return 0, err
-		}
-	}
-	return contiguous, nil
-}
-
-func saveUserUpdateWatermark(ctx context.Context, q *sqlcgen.Queries, userID int64, contiguous int) error {
-	return q.SaveUserUpdateWatermark(ctx, sqlcgen.SaveUserUpdateWatermarkParams{
-		UserID:        userID,
-		ContiguousPts: int32(contiguous),
-	})
-}
-
-func computeContiguousPtsFromRecent(ctx context.Context, q *sqlcgen.Queries, userID int64) (int, error) {
-	rows, err := q.RecentUserPts(ctx, sqlcgen.RecentUserPtsParams{
-		UserID:     userID,
-		WindowSize: contiguousWindow,
-	})
-	if err != nil {
-		return 0, fmt.Errorf("recent user pts: %w", err)
-	}
-	if len(rows) == 0 {
-		return 0, nil
-	}
-	nextByStart := make(map[int]int, len(rows))
-	floor := int(rows[0].Pts) - maxInt(int(rows[0].PtsCount), 1)
-	for _, p := range rows {
-		count := maxInt(int(p.PtsCount), 1)
-		v := int(p.Pts)
-		start := v - count
-		nextByStart[start] = v
-		if start < floor {
-			floor = start
-		}
-	}
-	contiguous := floor
-	for {
-		next, ok := nextByStart[contiguous]
-		if !ok {
-			break
-		}
-		contiguous = next
-	}
-	return contiguous, nil
+	return 0, nil
 }
 
 // BatchByCursor 按 (user_id, pts) 一次性批量取多条账号事件，供 outbox worker 取代逐条 ListAfter。
@@ -463,6 +501,7 @@ func (s *UpdateEventStore) BatchByCursor(ctx context.Context, cursors []store.Ev
 			row.ReplyToPeerType,
 			row.ReplyToPeerID,
 			row.ReplyToTopID,
+			row.ReplyToStoryID,
 			row.QuoteText,
 			row.QuoteEntitiesJson,
 			row.QuoteOffset,
@@ -470,6 +509,9 @@ func (s *UpdateEventStore) BatchByCursor(ctx context.Context, cursors []store.Ev
 			row.FwdFromPeerID,
 			row.FwdFromName,
 			row.FwdDate,
+			row.FwdSavedFromPeerType,
+			row.FwdSavedFromPeerID,
+			row.FwdSavedFromMsgID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("decode message metadata: %w", err)
@@ -498,28 +540,48 @@ func (s *UpdateEventStore) BatchByCursor(ctx context.Context, cursors []store.Ev
 		if err != nil {
 			return nil, fmt.Errorf("decode folder peers: %w", err)
 		}
+		story, err := decodeEventStory(row.StoryPayloadJson)
+		if err != nil {
+			return nil, fmt.Errorf("decode story payload: %w", err)
+		}
+		reaction, err := decodeEventReaction(row.ReactionPayloadJson)
+		if err != nil {
+			return nil, fmt.Errorf("decode reaction payload: %w", err)
+		}
 		media, err := decodeMessageMedia(row.MediaJson)
 		if err != nil {
 			return nil, fmt.Errorf("decode message media: %w", err)
 		}
-		out = append(out, domain.UpdateEvent{
+		markup, err := decodeReplyMarkup(row.ReplyMarkupJson)
+		if err != nil {
+			return nil, fmt.Errorf("decode message reply markup: %w", err)
+		}
+		rich, err := decodeRichMessage(row.RichMessageJson)
+		if err != nil {
+			return nil, fmt.Errorf("decode message rich message: %w", err)
+		}
+		event := domain.UpdateEvent{
 			UserID:           row.UserID,
 			Type:             domain.UpdateEventType(row.EventType),
 			Pts:              int(row.Pts),
 			PtsCount:         int(row.PtsCount),
 			Date:             int(row.Date),
 			Peer:             domain.Peer{Type: domain.PeerType(row.EventPeerType), ID: row.EventPeerID},
+			Story:            story,
 			Peers:            peers,
 			Bool:             row.EventBool,
 			Settings:         settings,
 			MessageIDs:       messageIDs,
 			MaxID:            int(row.MaxID),
 			StillUnreadCount: int(row.StillUnreadCount),
+			ChannelPts:       int(row.ChannelPts),
 			FilterID:         int(row.FilterID),
 			DialogFilter:     dialogFilter,
 			FilterOrder:      filterOrder,
 			FolderPeers:      folderPeers,
 			TagsEnabled:      row.TagsEnabled,
+			FolderID:         int(row.FolderID),
+			Reaction:         reaction,
 			Message: domain.Message{
 				ID:             int(row.MessageID),
 				UID:            row.PrivateMessageID,
@@ -536,12 +598,24 @@ func (s *UpdateEventStore) BatchByCursor(ctx context.Context, cursors []store.Ev
 				ReplyTo:        reply,
 				Forward:        forward,
 				Media:          media,
+				ReplyMarkup:    markup,
+				RichMessage:    rich,
 				MediaUnread:    row.MediaUnread,
 				ReactionUnread: row.ReactionUnread,
+				ViaBotID:       row.ViaBotID,
+				GroupedID:      row.GroupedID,
+				Effect:         row.Effect,
+				Pinned:         row.Pinned,
+				SavedPeer:      savedPeerFromFields(row.SavedPeerType, row.SavedPeerID),
+				TTLPeriod:      int(row.TtlPeriod),
+				ExpiresAt:      int(row.ExpiresAt),
 			},
-			Users:    usersFromBatchDispatchRow(row),
-			Channels: channelsFromBatchDispatchRow(row),
-		})
+			Users: usersFromBatchDispatchRow(row),
+		}
+		if err := s.hydrateQuickReplyEvent(ctx, &event); err != nil {
+			return nil, err
+		}
+		out = append(out, event)
 	}
 	return out, nil
 }
@@ -549,48 +623,68 @@ func (s *UpdateEventStore) BatchByCursor(ctx context.Context, cursors []store.Ev
 func usersFromUpdateEventRow(row sqlcgen.ListUserUpdateEventsAfterRow) []domain.User {
 	return mergeEventUsers(
 		domain.User{
-			ID:          row.PeerUserID,
-			AccessHash:  row.PeerAccessHash,
-			Phone:       row.PeerPhone,
-			FirstName:   row.PeerFirstName,
-			LastName:    row.PeerLastName,
-			Username:    row.PeerUsername,
-			CountryCode: row.PeerCountryCode,
-			Verified:    row.PeerVerified,
-			Support:     row.PeerSupport,
+			ID:                    row.PeerUserID,
+			AccessHash:            row.PeerAccessHash,
+			Phone:                 row.PeerPhone,
+			FirstName:             row.PeerFirstName,
+			LastName:              row.PeerLastName,
+			Username:              row.PeerUsername,
+			CountryCode:           row.PeerCountryCode,
+			Verified:              row.PeerVerified,
+			Support:               row.PeerSupport,
+			Bot:                   row.PeerIsBot,
+			BotInfoVersion:        int(row.PeerBotInfoVersion),
+			PremiumUntil:          int(row.PeerPremiumUntil),
+			EmojiStatusDocumentID: row.PeerEmojiStatusDocumentID,
+			EmojiStatusUntil:      int(row.PeerEmojiStatusUntil),
 		},
 		domain.User{
-			ID:          row.FromUserUserID,
-			AccessHash:  row.FromUserAccessHash,
-			Phone:       row.FromUserPhone,
-			FirstName:   row.FromUserFirstName,
-			LastName:    row.FromUserLastName,
-			Username:    row.FromUserUsername,
-			CountryCode: row.FromUserCountryCode,
-			Verified:    row.FromUserVerified,
-			Support:     row.FromUserSupport,
+			ID:                    row.FromUserUserID,
+			AccessHash:            row.FromUserAccessHash,
+			Phone:                 row.FromUserPhone,
+			FirstName:             row.FromUserFirstName,
+			LastName:              row.FromUserLastName,
+			Username:              row.FromUserUsername,
+			CountryCode:           row.FromUserCountryCode,
+			Verified:              row.FromUserVerified,
+			Support:               row.FromUserSupport,
+			Bot:                   row.FromUserIsBot,
+			BotInfoVersion:        int(row.FromUserBotInfoVersion),
+			PremiumUntil:          int(row.FromUserPremiumUntil),
+			EmojiStatusDocumentID: row.FromUserEmojiStatusDocumentID,
+			EmojiStatusUntil:      int(row.FromUserEmojiStatusUntil),
 		},
 		domain.User{
-			ID:          row.FwdUserID,
-			AccessHash:  row.FwdUserAccessHash,
-			Phone:       row.FwdUserPhone,
-			FirstName:   row.FwdUserFirstName,
-			LastName:    row.FwdUserLastName,
-			Username:    row.FwdUserUsername,
-			CountryCode: row.FwdUserCountryCode,
-			Verified:    row.FwdUserVerified,
-			Support:     row.FwdUserSupport,
+			ID:                    row.FwdUserID,
+			AccessHash:            row.FwdUserAccessHash,
+			Phone:                 row.FwdUserPhone,
+			FirstName:             row.FwdUserFirstName,
+			LastName:              row.FwdUserLastName,
+			Username:              row.FwdUserUsername,
+			CountryCode:           row.FwdUserCountryCode,
+			Verified:              row.FwdUserVerified,
+			Support:               row.FwdUserSupport,
+			Bot:                   row.FwdUserIsBot,
+			BotInfoVersion:        int(row.FwdUserBotInfoVersion),
+			PremiumUntil:          int(row.FwdUserPremiumUntil),
+			EmojiStatusDocumentID: row.FwdUserEmojiStatusDocumentID,
+			EmojiStatusUntil:      int(row.FwdUserEmojiStatusUntil),
 		},
 		domain.User{
-			ID:          row.ReplyUserID,
-			AccessHash:  row.ReplyUserAccessHash,
-			Phone:       row.ReplyUserPhone,
-			FirstName:   row.ReplyUserFirstName,
-			LastName:    row.ReplyUserLastName,
-			Username:    row.ReplyUserUsername,
-			CountryCode: row.ReplyUserCountryCode,
-			Verified:    row.ReplyUserVerified,
-			Support:     row.ReplyUserSupport,
+			ID:                    row.ReplyUserID,
+			AccessHash:            row.ReplyUserAccessHash,
+			Phone:                 row.ReplyUserPhone,
+			FirstName:             row.ReplyUserFirstName,
+			LastName:              row.ReplyUserLastName,
+			Username:              row.ReplyUserUsername,
+			CountryCode:           row.ReplyUserCountryCode,
+			Verified:              row.ReplyUserVerified,
+			Support:               row.ReplyUserSupport,
+			Bot:                   row.ReplyUserIsBot,
+			BotInfoVersion:        int(row.ReplyUserBotInfoVersion),
+			PremiumUntil:          int(row.ReplyUserPremiumUntil),
+			EmojiStatusDocumentID: row.ReplyUserEmojiStatusDocumentID,
+			EmojiStatusUntil:      int(row.ReplyUserEmojiStatusUntil),
 		},
 	)
 }
@@ -600,87 +694,69 @@ func usersFromUpdateEventRow(row sqlcgen.ListUserUpdateEventsAfterRow) []domain.
 func usersFromBatchDispatchRow(row sqlcgen.BatchListDispatchEventsRow) []domain.User {
 	return mergeEventUsers(
 		domain.User{
-			ID:          row.PeerUserID,
-			AccessHash:  row.PeerAccessHash,
-			Phone:       row.PeerPhone,
-			FirstName:   row.PeerFirstName,
-			LastName:    row.PeerLastName,
-			Username:    row.PeerUsername,
-			CountryCode: row.PeerCountryCode,
-			Verified:    row.PeerVerified,
-			Support:     row.PeerSupport,
+			ID:                    row.PeerUserID,
+			AccessHash:            row.PeerAccessHash,
+			Phone:                 row.PeerPhone,
+			FirstName:             row.PeerFirstName,
+			LastName:              row.PeerLastName,
+			Username:              row.PeerUsername,
+			CountryCode:           row.PeerCountryCode,
+			Verified:              row.PeerVerified,
+			Support:               row.PeerSupport,
+			Bot:                   row.PeerIsBot,
+			BotInfoVersion:        int(row.PeerBotInfoVersion),
+			PremiumUntil:          int(row.PeerPremiumUntil),
+			EmojiStatusDocumentID: row.PeerEmojiStatusDocumentID,
+			EmojiStatusUntil:      int(row.PeerEmojiStatusUntil),
 		},
 		domain.User{
-			ID:          row.FromUserUserID,
-			AccessHash:  row.FromUserAccessHash,
-			Phone:       row.FromUserPhone,
-			FirstName:   row.FromUserFirstName,
-			LastName:    row.FromUserLastName,
-			Username:    row.FromUserUsername,
-			CountryCode: row.FromUserCountryCode,
-			Verified:    row.FromUserVerified,
-			Support:     row.FromUserSupport,
+			ID:                    row.FromUserUserID,
+			AccessHash:            row.FromUserAccessHash,
+			Phone:                 row.FromUserPhone,
+			FirstName:             row.FromUserFirstName,
+			LastName:              row.FromUserLastName,
+			Username:              row.FromUserUsername,
+			CountryCode:           row.FromUserCountryCode,
+			Verified:              row.FromUserVerified,
+			Support:               row.FromUserSupport,
+			Bot:                   row.FromUserIsBot,
+			BotInfoVersion:        int(row.FromUserBotInfoVersion),
+			PremiumUntil:          int(row.FromUserPremiumUntil),
+			EmojiStatusDocumentID: row.FromUserEmojiStatusDocumentID,
+			EmojiStatusUntil:      int(row.FromUserEmojiStatusUntil),
 		},
 		domain.User{
-			ID:          row.FwdUserID,
-			AccessHash:  row.FwdUserAccessHash,
-			Phone:       row.FwdUserPhone,
-			FirstName:   row.FwdUserFirstName,
-			LastName:    row.FwdUserLastName,
-			Username:    row.FwdUserUsername,
-			CountryCode: row.FwdUserCountryCode,
-			Verified:    row.FwdUserVerified,
-			Support:     row.FwdUserSupport,
+			ID:                    row.FwdUserID,
+			AccessHash:            row.FwdUserAccessHash,
+			Phone:                 row.FwdUserPhone,
+			FirstName:             row.FwdUserFirstName,
+			LastName:              row.FwdUserLastName,
+			Username:              row.FwdUserUsername,
+			CountryCode:           row.FwdUserCountryCode,
+			Verified:              row.FwdUserVerified,
+			Support:               row.FwdUserSupport,
+			Bot:                   row.FwdUserIsBot,
+			BotInfoVersion:        int(row.FwdUserBotInfoVersion),
+			PremiumUntil:          int(row.FwdUserPremiumUntil),
+			EmojiStatusDocumentID: row.FwdUserEmojiStatusDocumentID,
+			EmojiStatusUntil:      int(row.FwdUserEmojiStatusUntil),
 		},
 		domain.User{
-			ID:          row.ReplyUserID,
-			AccessHash:  row.ReplyUserAccessHash,
-			Phone:       row.ReplyUserPhone,
-			FirstName:   row.ReplyUserFirstName,
-			LastName:    row.ReplyUserLastName,
-			Username:    row.ReplyUserUsername,
-			CountryCode: row.ReplyUserCountryCode,
-			Verified:    row.ReplyUserVerified,
-			Support:     row.ReplyUserSupport,
+			ID:                    row.ReplyUserID,
+			AccessHash:            row.ReplyUserAccessHash,
+			Phone:                 row.ReplyUserPhone,
+			FirstName:             row.ReplyUserFirstName,
+			LastName:              row.ReplyUserLastName,
+			Username:              row.ReplyUserUsername,
+			CountryCode:           row.ReplyUserCountryCode,
+			Verified:              row.ReplyUserVerified,
+			Support:               row.ReplyUserSupport,
+			Bot:                   row.ReplyUserIsBot,
+			BotInfoVersion:        int(row.ReplyUserBotInfoVersion),
+			PremiumUntil:          int(row.ReplyUserPremiumUntil),
+			EmojiStatusDocumentID: row.ReplyUserEmojiStatusDocumentID,
+			EmojiStatusUntil:      int(row.ReplyUserEmojiStatusUntil),
 		},
-	)
-}
-
-func channelsFromUpdateEventRow(row sqlcgen.ListUserUpdateEventsAfterRow) []domain.Channel {
-	return mergeEventChannels(
-		eventChannelFromFields(
-			row.FwdChannelID, row.FwdChannelAccessHash, row.FwdChannelCreatorUserID, row.FwdChannelTitle, row.FwdChannelAbout, row.FwdChannelUsername,
-			row.FwdChannelBroadcast, row.FwdChannelMegagroup, row.FwdChannelForum, row.FwdChannelNoforwards, row.FwdChannelSignatures, row.FwdChannelPreHistoryHidden,
-			int(row.FwdChannelSlowmodeSeconds), row.FwdChannelDefaultBannedRights, int(row.FwdChannelParticipantsCount), int(row.FwdChannelAdminsCount),
-			int(row.FwdChannelKickedCount), int(row.FwdChannelBannedCount), int(row.FwdChannelTopMessageID), int(row.FwdChannelPinnedMessageID),
-			int(row.FwdChannelPts), int(row.FwdChannelTtlPeriod), int(row.FwdChannelDate), row.FwdChannelDeleted,
-		),
-		eventChannelFromFields(
-			row.ReplyChannelID, row.ReplyChannelAccessHash, row.ReplyChannelCreatorUserID, row.ReplyChannelTitle, row.ReplyChannelAbout, row.ReplyChannelUsername,
-			row.ReplyChannelBroadcast, row.ReplyChannelMegagroup, row.ReplyChannelForum, row.ReplyChannelNoforwards, row.ReplyChannelSignatures, row.ReplyChannelPreHistoryHidden,
-			int(row.ReplyChannelSlowmodeSeconds), row.ReplyChannelDefaultBannedRights, int(row.ReplyChannelParticipantsCount), int(row.ReplyChannelAdminsCount),
-			int(row.ReplyChannelKickedCount), int(row.ReplyChannelBannedCount), int(row.ReplyChannelTopMessageID), int(row.ReplyChannelPinnedMessageID),
-			int(row.ReplyChannelPts), int(row.ReplyChannelTtlPeriod), int(row.ReplyChannelDate), row.ReplyChannelDeleted,
-		),
-	)
-}
-
-func channelsFromBatchDispatchRow(row sqlcgen.BatchListDispatchEventsRow) []domain.Channel {
-	return mergeEventChannels(
-		eventChannelFromFields(
-			row.FwdChannelID, row.FwdChannelAccessHash, row.FwdChannelCreatorUserID, row.FwdChannelTitle, row.FwdChannelAbout, row.FwdChannelUsername,
-			row.FwdChannelBroadcast, row.FwdChannelMegagroup, row.FwdChannelForum, row.FwdChannelNoforwards, row.FwdChannelSignatures, row.FwdChannelPreHistoryHidden,
-			int(row.FwdChannelSlowmodeSeconds), row.FwdChannelDefaultBannedRights, int(row.FwdChannelParticipantsCount), int(row.FwdChannelAdminsCount),
-			int(row.FwdChannelKickedCount), int(row.FwdChannelBannedCount), int(row.FwdChannelTopMessageID), int(row.FwdChannelPinnedMessageID),
-			int(row.FwdChannelPts), int(row.FwdChannelTtlPeriod), int(row.FwdChannelDate), row.FwdChannelDeleted,
-		),
-		eventChannelFromFields(
-			row.ReplyChannelID, row.ReplyChannelAccessHash, row.ReplyChannelCreatorUserID, row.ReplyChannelTitle, row.ReplyChannelAbout, row.ReplyChannelUsername,
-			row.ReplyChannelBroadcast, row.ReplyChannelMegagroup, row.ReplyChannelForum, row.ReplyChannelNoforwards, row.ReplyChannelSignatures, row.ReplyChannelPreHistoryHidden,
-			int(row.ReplyChannelSlowmodeSeconds), row.ReplyChannelDefaultBannedRights, int(row.ReplyChannelParticipantsCount), int(row.ReplyChannelAdminsCount),
-			int(row.ReplyChannelKickedCount), int(row.ReplyChannelBannedCount), int(row.ReplyChannelTopMessageID), int(row.ReplyChannelPinnedMessageID),
-			int(row.ReplyChannelPts), int(row.ReplyChannelTtlPeriod), int(row.ReplyChannelDate), row.ReplyChannelDeleted,
-		),
 	)
 }
 
@@ -702,55 +778,6 @@ func mergeEventUsers(items ...domain.User) []domain.User {
 		add(item)
 	}
 	return users
-}
-
-func eventChannelFromFields(id, accessHash, creatorUserID int64, title, about, username string, broadcast, megagroup, forum, noforwards, signatures, preHistoryHidden bool, slowmodeSeconds int, defaultRights string, participantsCount, adminsCount, kickedCount, bannedCount, topMessageID, pinnedMessageID, pts, ttlPeriod, date int, deleted bool) domain.Channel {
-	if id == 0 {
-		return domain.Channel{}
-	}
-	ch := domain.Channel{
-		ID:                id,
-		AccessHash:        accessHash,
-		CreatorUserID:     creatorUserID,
-		Title:             title,
-		About:             about,
-		Username:          username,
-		Broadcast:         broadcast,
-		Megagroup:         megagroup,
-		Forum:             forum,
-		NoForwards:        noforwards,
-		Signatures:        signatures,
-		PreHistoryHidden:  preHistoryHidden,
-		SlowmodeSeconds:   slowmodeSeconds,
-		ParticipantsCount: participantsCount,
-		AdminsCount:       adminsCount,
-		KickedCount:       kickedCount,
-		BannedCount:       bannedCount,
-		TopMessageID:      topMessageID,
-		PinnedMessageID:   pinnedMessageID,
-		Pts:               pts,
-		TTLPeriod:         ttlPeriod,
-		Date:              date,
-		Deleted:           deleted,
-	}
-	_ = json.Unmarshal([]byte(defaultRights), &ch.DefaultBannedRights)
-	return ch
-}
-
-func mergeEventChannels(items ...domain.Channel) []domain.Channel {
-	channels := make([]domain.Channel, 0, len(items))
-	seen := make(map[int64]struct{}, len(items))
-	for _, ch := range items {
-		if ch.ID == 0 {
-			continue
-		}
-		if _, ok := seen[ch.ID]; ok {
-			continue
-		}
-		seen[ch.ID] = struct{}{}
-		channels = append(channels, ch)
-	}
-	return channels
 }
 
 type eventPeerJSON struct {
@@ -882,12 +909,53 @@ func decodeEventFolderPeers(raw string) ([]domain.FolderPeerUpdate, error) {
 	return peers, nil
 }
 
+func encodeEventStory(story domain.Story) ([]byte, error) {
+	if story.Owner.ID == 0 || story.ID == 0 {
+		return []byte("{}"), nil
+	}
+	raw, err := json.Marshal(story)
+	if err != nil {
+		return nil, fmt.Errorf("marshal event story: %w", err)
+	}
+	return raw, nil
+}
+
+func decodeEventStory(raw string) (domain.Story, error) {
+	if raw == "" || raw == "{}" || raw == "null" {
+		return domain.Story{}, nil
+	}
+	var story domain.Story
+	if err := json.Unmarshal([]byte(raw), &story); err != nil {
+		return domain.Story{}, err
+	}
+	if story.Owner.ID == 0 || story.ID == 0 {
+		return domain.Story{}, nil
+	}
+	return story, nil
+}
+
+func encodeEventReaction(reaction *domain.MessageReaction) ([]byte, error) {
+	raw, err := encodeStoryReaction(reaction)
+	if err != nil {
+		return nil, fmt.Errorf("marshal event reaction: %w", err)
+	}
+	return raw, nil
+}
+
+func decodeEventReaction(raw string) (*domain.MessageReaction, error) {
+	return decodeStoryReaction(raw)
+}
+
 type peerSettingsJSON struct {
-	AddContact            bool `json:"add_contact,omitempty"`
-	BlockContact          bool `json:"block_contact,omitempty"`
-	ShareContact          bool `json:"share_contact,omitempty"`
-	NeedContactsException bool `json:"need_contacts_exception,omitempty"`
-	HiddenPeerSettingsBar bool `json:"hidden_peer_settings_bar,omitempty"`
+	AddContact            bool   `json:"add_contact,omitempty"`
+	BlockContact          bool   `json:"block_contact,omitempty"`
+	ShareContact          bool   `json:"share_contact,omitempty"`
+	NeedContactsException bool   `json:"need_contacts_exception,omitempty"`
+	HiddenPeerSettingsBar bool   `json:"hidden_peer_settings_bar,omitempty"`
+	BusinessBotID         int64  `json:"business_bot_id,omitempty"`
+	BusinessBotManageURL  string `json:"business_bot_manage_url,omitempty"`
+	BusinessBotPaused     bool   `json:"business_bot_paused,omitempty"`
+	BusinessBotCanReply   bool   `json:"business_bot_can_reply,omitempty"`
 }
 
 func encodePeerSettings(settings domain.PeerSettings) ([]byte, error) {
@@ -897,6 +965,10 @@ func encodePeerSettings(settings domain.PeerSettings) ([]byte, error) {
 		ShareContact:          settings.ShareContact,
 		NeedContactsException: settings.NeedContactsException,
 		HiddenPeerSettingsBar: settings.HiddenPeerSettingsBar,
+		BusinessBotID:         settings.BusinessBotID,
+		BusinessBotManageURL:  settings.BusinessBotManageURL,
+		BusinessBotPaused:     settings.BusinessBotPaused,
+		BusinessBotCanReply:   settings.BusinessBotCanReply,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal peer settings: %w", err)
@@ -918,6 +990,10 @@ func decodePeerSettings(raw string) (domain.PeerSettings, error) {
 		ShareContact:          wire.ShareContact,
 		NeedContactsException: wire.NeedContactsException,
 		HiddenPeerSettingsBar: wire.HiddenPeerSettingsBar,
+		BusinessBotID:         wire.BusinessBotID,
+		BusinessBotManageURL:  wire.BusinessBotManageURL,
+		BusinessBotPaused:     wire.BusinessBotPaused,
+		BusinessBotCanReply:   wire.BusinessBotCanReply,
 	}, nil
 }
 

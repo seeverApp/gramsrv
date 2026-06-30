@@ -1,6 +1,8 @@
 package rpc
 
 import (
+	"strings"
+
 	"github.com/gotd/td/tg"
 
 	"telesrv/internal/domain"
@@ -39,9 +41,165 @@ func tgMessageMedia(m *domain.MessageMedia) tg.MessageMediaClass {
 			out.TTLSeconds = m.TTLSeconds
 		}
 		return out
+	case domain.MessageMediaKindContact:
+		if m.Contact == nil {
+			return &tg.MessageMediaEmpty{}
+		}
+		return &tg.MessageMediaContact{
+			PhoneNumber: m.Contact.PhoneNumber,
+			FirstName:   m.Contact.FirstName,
+			LastName:    m.Contact.LastName,
+			Vcard:       m.Contact.Vcard,
+			UserID:      m.Contact.UserID,
+		}
+	case domain.MessageMediaKindGeo:
+		if m.Geo == nil {
+			return &tg.MessageMediaEmpty{}
+		}
+		return &tg.MessageMediaGeo{Geo: tgGeoPoint(*m.Geo)}
+	case domain.MessageMediaKindVenue:
+		if m.Venue == nil {
+			return &tg.MessageMediaEmpty{}
+		}
+		return &tg.MessageMediaVenue{
+			Geo:       tgGeoPoint(m.Venue.Geo),
+			Title:     m.Venue.Title,
+			Address:   m.Venue.Address,
+			Provider:  m.Venue.Provider,
+			VenueID:   m.Venue.VenueID,
+			VenueType: m.Venue.VenueType,
+		}
+	case domain.MessageMediaKindDice:
+		if m.Dice == nil {
+			return &tg.MessageMediaEmpty{}
+		}
+		return &tg.MessageMediaDice{Value: m.Dice.Value, Emoticon: m.Dice.Emoticon}
+	case domain.MessageMediaKindPoll:
+		if m.Poll == nil {
+			return &tg.MessageMediaEmpty{}
+		}
+		out := &tg.MessageMediaPoll{Poll: tgPoll(*m.Poll), Results: tgPollResults(*m.Poll)}
+		if m.Poll.AttachedMedia != nil {
+			out.SetAttachedMedia(tgMessageMedia(m.Poll.AttachedMedia))
+		}
+		return out
+	case domain.MessageMediaKindTodo:
+		if m.Todo == nil {
+			return &tg.MessageMediaEmpty{}
+		}
+		return tgTodoMedia(*m.Todo)
+	case domain.MessageMediaKindGeoLive:
+		if m.GeoLive == nil {
+			return &tg.MessageMediaEmpty{}
+		}
+		out := &tg.MessageMediaGeoLive{
+			Geo:    tgGeoPoint(m.GeoLive.Geo),
+			Period: m.GeoLive.Period,
+		}
+		if m.GeoLive.Heading > 0 {
+			out.SetHeading(m.GeoLive.Heading)
+		}
+		if m.GeoLive.ProximityNotificationRadius > 0 {
+			out.SetProximityNotificationRadius(m.GeoLive.ProximityNotificationRadius)
+		}
+		return out
+	case domain.MessageMediaKindStory:
+		if m.Story == nil {
+			return &tg.MessageMediaEmpty{}
+		}
+		peer := tgPeer(m.Story.Peer)
+		if peer == nil {
+			return &tg.MessageMediaEmpty{}
+		}
+		out := &tg.MessageMediaStory{
+			ViaMention: m.Story.ViaMention,
+			Peer:       peer,
+			ID:         m.Story.ID,
+		}
+		if m.Story.Story != nil {
+			out.SetStory(tgStoryItem(*m.Story.Story))
+		}
+		return out
+	case domain.MessageMediaKindWebPage:
+		if m.WebPage == nil {
+			return &tg.MessageMediaEmpty{}
+		}
+		return tgWebPageMedia(*m.WebPage)
 	default:
 		return &tg.MessageMediaEmpty{}
 	}
+}
+
+// tgWebPageMedia 把链接预览快照转成 messageMediaWebPage：外层 wrapper 携带
+// force_large/force_small/manual/safe 标志，内层按 state 投影为
+// webPagePending / webPage / webPageEmpty。
+func tgWebPageMedia(w domain.MessageWebPage) tg.MessageMediaClass {
+	return &tg.MessageMediaWebPage{
+		ForceLargeMedia: w.ForceLargeMedia,
+		ForceSmallMedia: w.ForceSmallMedia,
+		Manual:          w.Manual,
+		Safe:            w.Safe,
+		Webpage:         tgWebPage(w),
+	}
+}
+
+// tgWebPage 按链接预览快照的 state 投影出对应的 tg.WebPageClass。done 形态必须
+// 始终填齐非可选的 id/url/display_url/hash，否则客户端不渲染卡片。
+func tgWebPage(w domain.MessageWebPage) tg.WebPageClass {
+	switch w.State {
+	case domain.MessageWebPageStateDone:
+		page := &tg.WebPage{
+			ID:            w.ID,
+			URL:           w.URL,
+			DisplayURL:    w.DisplayURL,
+			Hash:          w.Hash,
+			HasLargeMedia: w.HasLargeMedia,
+		}
+		if w.Type != "" {
+			page.SetType(w.Type)
+		}
+		if w.SiteName != "" {
+			page.SetSiteName(w.SiteName)
+		}
+		if w.Title != "" {
+			page.SetTitle(w.Title)
+		}
+		if w.Description != "" {
+			page.SetDescription(w.Description)
+		}
+		if w.Author != "" {
+			page.SetAuthor(w.Author)
+		}
+		if w.Photo != nil {
+			if photo := tgPhoto(*w.Photo); photo != nil {
+				if _, empty := photo.(*tg.PhotoEmpty); !empty {
+					page.SetPhoto(photo)
+				}
+			}
+		}
+		return page
+	case domain.MessageWebPageStateEmpty:
+		page := &tg.WebPageEmpty{ID: w.ID}
+		if w.URL != "" {
+			page.SetURL(w.URL)
+		}
+		return page
+	default: // pending：webPagePending{id,date}，url 可选但客户端需它展示待解析链接。
+		page := &tg.WebPagePending{ID: w.ID, Date: w.Date}
+		if w.URL != "" {
+			page.SetURL(w.URL)
+		}
+		return page
+	}
+}
+
+// tgGeoPoint 把 domain 坐标点转成 tg.GeoPoint。
+func tgGeoPoint(g domain.MessageGeoPoint) tg.GeoPointClass {
+	out := &tg.GeoPoint{Lat: g.Lat, Long: g.Long, AccessHash: g.AccessHash}
+	if g.AccuracyRadius > 0 {
+		out.SetAccuracyRadius(g.AccuracyRadius)
+	}
+	return out
 }
 
 // tgChatPhoto 由 domain.Channel 反范式头像字段构造 ChatPhoto（频道/群头像缩略）。
@@ -81,12 +239,17 @@ func tgPhoto(p domain.Photo) tg.PhotoClass {
 	if p.ID == 0 {
 		return &tg.PhotoEmpty{}
 	}
+	sizes := tgPhotoSizes(p.Sizes)
+	if len(sizes) == 0 {
+		return &tg.PhotoEmpty{}
+	}
 	return &tg.Photo{
 		ID:            p.ID,
 		AccessHash:    p.AccessHash,
 		FileReference: p.FileReference,
 		Date:          p.Date,
-		Sizes:         tgPhotoSizes(p.Sizes),
+		Sizes:         sizes,
+		VideoSizes:    tgPhotoVideoSizes(p.Sizes),
 		DCID:          p.DCID,
 		HasStickers:   p.HasStickers,
 	}
@@ -145,6 +308,9 @@ func tgPhotoSizes(sizes []domain.PhotoSize) []tg.PhotoSizeClass {
 	}
 	out := make([]tg.PhotoSizeClass, 0, len(sizes))
 	for _, s := range sizes {
+		if isPhotoVideoSize(s.Kind) {
+			continue
+		}
 		out = append(out, tgPhotoSize(s))
 	}
 	return compactPhotoSizeClasses(out)
@@ -165,6 +331,71 @@ func tgPhotoSize(s domain.PhotoSize) tg.PhotoSizeClass {
 	default:
 		return nil
 	}
+}
+
+func tgPhotoVideoSizes(sizes []domain.PhotoSize) []tg.VideoSizeClass {
+	if len(sizes) == 0 {
+		return nil
+	}
+	out := make([]tg.VideoSizeClass, 0, len(sizes))
+	for _, s := range sizes {
+		switch s.Kind {
+		case domain.PhotoSizeKindVideo:
+			v := &tg.VideoSize{Type: s.Type, W: s.W, H: s.H, Size: s.Size}
+			if s.VideoStartTs != 0 {
+				v.SetVideoStartTs(s.VideoStartTs)
+			}
+			out = append(out, v)
+		case domain.PhotoSizeKindVideoEmojiMarkup:
+			out = append(out, &tg.VideoSizeEmojiMarkup{
+				EmojiID:          s.EmojiID,
+				BackgroundColors: append([]int(nil), s.BackgroundColors...),
+			})
+		case domain.PhotoSizeKindVideoStickerMarkup:
+			out = append(out, &tg.VideoSizeStickerMarkup{
+				Stickerset:       tgInputStickerSetFromPhotoSize(s),
+				StickerID:        s.StickerID,
+				BackgroundColors: append([]int(nil), s.BackgroundColors...),
+			})
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func tgInputStickerSetFromPhotoSize(s domain.PhotoSize) tg.InputStickerSetClass {
+	if s.StickerSetID != 0 {
+		return &tg.InputStickerSetID{ID: s.StickerSetID, AccessHash: s.StickerSetAccessHash}
+	}
+	if s.StickerSetShortName != "" {
+		return &tg.InputStickerSetShortName{ShortName: s.StickerSetShortName}
+	}
+	if input, ok := tgInputStickerSetFromSystemKey(s.StickerSetSystemKey); ok {
+		return input
+	}
+	return &tg.InputStickerSetEmpty{}
+}
+
+func tgInputStickerSetFromSystemKey(systemKey string) (tg.InputStickerSetClass, bool) {
+	switch systemKey {
+	case "animated_emoji":
+		return &tg.InputStickerSetAnimatedEmoji{}, true
+	case "animated_emoji_animations":
+		return &tg.InputStickerSetAnimatedEmojiAnimations{}, true
+	case "emoji_generic_animations":
+		return &tg.InputStickerSetEmojiGenericAnimations{}, true
+	default:
+		if strings.HasPrefix(systemKey, "dice:") {
+			return &tg.InputStickerSetDice{Emoticon: strings.TrimPrefix(systemKey, "dice:")}, true
+		}
+		return nil, false
+	}
+}
+
+func isPhotoVideoSize(kind domain.PhotoSizeKind) bool {
+	return kind == domain.PhotoSizeKindVideo || kind == domain.PhotoSizeKindVideoEmojiMarkup || kind == domain.PhotoSizeKindVideoStickerMarkup
 }
 
 func compactPhotoSizeClasses(in []tg.PhotoSizeClass) []tg.PhotoSizeClass {
@@ -281,6 +512,64 @@ func reactionDocumentIDs(reactions []domain.AvailableReaction) []int64 {
 	return out
 }
 
+// tgAvailableEffects 构造 messages.availableEffects:effects 引用文档 id,文档对象在
+// 独立 Documents 数组(去重),docByID 由 handler 预加载。
+func tgAvailableEffects(effects []domain.AvailableEffect, docByID map[int64]domain.Document, hash int) *tg.MessagesAvailableEffects {
+	out := &tg.MessagesAvailableEffects{
+		Hash:      hash,
+		Effects:   make([]tg.AvailableEffect, 0, len(effects)),
+		Documents: []tg.DocumentClass{},
+	}
+	seenDoc := make(map[int64]struct{})
+	addDoc := func(id int64) {
+		if id == 0 {
+			return
+		}
+		if _, ok := seenDoc[id]; ok {
+			return
+		}
+		if d, ok := docByID[id]; ok {
+			out.Documents = append(out.Documents, tgDocument(d))
+			seenDoc[id] = struct{}{}
+		}
+	}
+	for _, e := range effects {
+		eff := tg.AvailableEffect{
+			ID:              e.ID,
+			Emoticon:        e.Emoticon,
+			EffectStickerID: e.EffectStickerID,
+			PremiumRequired: e.PremiumRequired,
+		}
+		if e.StaticIconID != 0 {
+			eff.SetStaticIconID(e.StaticIconID)
+		}
+		if e.EffectAnimationID != 0 {
+			eff.SetEffectAnimationID(e.EffectAnimationID)
+		}
+		out.Effects = append(out.Effects, eff)
+		addDoc(e.StaticIconID)
+		addDoc(e.EffectStickerID)
+		addDoc(e.EffectAnimationID)
+	}
+	return out
+}
+
+// effectDocumentIDs 收集一组 effect 引用的全部文档 id（用于批量预加载）。
+func effectDocumentIDs(effects []domain.AvailableEffect) []int64 {
+	seen := make(map[int64]struct{})
+	out := make([]int64, 0, len(effects)*3)
+	for _, e := range effects {
+		for _, id := range e.DocumentIDs() {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // ---- sticker sets ----
 
 func tgStickerSet(set domain.StickerSet) tg.StickerSet {
@@ -367,6 +656,8 @@ func stickerSetRefFromInput(input tg.InputStickerSetClass) (domain.StickerSetRef
 		return domain.StickerSetRef{Kind: domain.StickerSetRefBySystem, SystemKey: "animated_emoji_animations"}, true
 	case *tg.InputStickerSetEmojiGenericAnimations:
 		return domain.StickerSetRef{Kind: domain.StickerSetRefBySystem, SystemKey: "emoji_generic_animations"}, true
+	case *tg.InputStickerSetEmojiDefaultStatuses:
+		return domain.StickerSetRef{Kind: domain.StickerSetRefBySystem, SystemKey: domain.StickerSetSystemKeyEmojiDefaultStatuses}, true
 	case *tg.InputStickerSetDice:
 		return domain.StickerSetRef{Kind: domain.StickerSetRefBySystem, SystemKey: "dice:" + in.Emoticon}, true
 	default:

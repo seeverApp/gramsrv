@@ -18,6 +18,25 @@ type AccountPassword struct {
 	LoginEmailPattern       string
 	SecureRandom            []byte
 	UpdatedAt               pgtype.Timestamptz
+	CurrentAlgoSalt1        []byte
+	CurrentAlgoSalt2        []byte
+	CurrentAlgoG            int32
+	CurrentAlgoP            []byte
+	SrpID                   int64
+	SrpVerifier             []byte
+	SrpBSecret              []byte
+	SrpB                    []byte
+	RecoveryEmail           string
+	RecoveryCode            string
+	RecoveryCodeExpiresAt   pgtype.Timestamptz
+	LoginEmail              string
+}
+
+type AccountPrivacyRule struct {
+	OwnerUserID int64
+	PrivacyKey  string
+	Rules       []byte
+	UpdatedAt   pgtype.Timestamptz
 }
 
 type AccountReactionSetting struct {
@@ -32,6 +51,21 @@ type AccountReactionSetting struct {
 	PaidPrivacyPeerType  *string
 	PaidPrivacyPeerID    *int64
 	UpdatedAt            pgtype.Timestamptz
+}
+
+type AccountSetting struct {
+	UserID                           int64
+	ArchiveAndMuteNewNoncontactPeers bool
+	KeepArchivedUnmuted              bool
+	KeepArchivedFolders              bool
+	HideReadMarks                    bool
+	NewNoncontactPeersRequirePremium bool
+	DisplayGiftsButton               bool
+	NoncontactPeersPaidStars         int64
+	AccountTtlDays                   int32
+	SensitiveContentEnabled          bool
+	ContactSignupSilent              bool
+	UpdatedAt                        pgtype.Timestamptz
 }
 
 type AppConfig struct {
@@ -49,18 +83,19 @@ type AuthKey struct {
 }
 
 type Authorization struct {
-	AuthKeyID     int64
-	UserID        int64
-	Hash          int64
-	Layer         int32
-	DeviceModel   string
-	Platform      string
-	SystemVersion string
-	ApiID         int32
-	AppVersion    string
-	Ip            string
-	CreatedAt     pgtype.Timestamptz
-	ActiveAt      pgtype.Timestamptz
+	AuthKeyID       int64
+	UserID          int64
+	Hash            int64
+	Layer           int32
+	DeviceModel     string
+	Platform        string
+	SystemVersion   string
+	ApiID           int32
+	AppVersion      string
+	Ip              string
+	CreatedAt       pgtype.Timestamptz
+	ActiveAt        pgtype.Timestamptz
+	PasswordPending bool
 }
 
 type AvailableReaction struct {
@@ -76,6 +111,78 @@ type AvailableReaction struct {
 	AroundAnimationID   int64
 	CenterIconID        int64
 	SortOrder           int32
+}
+
+type Bot struct {
+	BotUserID         int64
+	OwnerUserID       int64
+	TokenSecret       string
+	Description       string
+	Commands          []byte
+	BotChatHistory    bool
+	BotNochats        bool
+	InlinePlaceholder string
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
+	MenuButtonType    int16
+	MenuButtonText    string
+	MenuButtonUrl     string
+	BotInlineGeo      bool
+}
+
+type BotChatState struct {
+	BotUserID int64
+	UserID    int64
+	State     []byte
+	UpdatedAt pgtype.Timestamptz
+}
+
+type BotUserPermission struct {
+	BotUserID   int64
+	UserID      int64
+	FromRequest bool
+	CreatedAt   pgtype.Timestamptz
+	UpdatedAt   pgtype.Timestamptz
+}
+
+type BusinessAutomationDelivery struct {
+	OwnerUserID      int64
+	PeerUserID       int64
+	Kind             string
+	TriggerMessageID int32
+	ShortcutID       int32
+	SentAt           int32
+	CreatedAt        pgtype.Timestamptz
+}
+
+type BusinessChatLink struct {
+	Slug        string
+	OwnerUserID int64
+	Link        string
+	Message     string
+	Entities    []byte
+	Title       string
+	Views       int32
+	CreatedAt   pgtype.Timestamptz
+	UpdatedAt   pgtype.Timestamptz
+}
+
+type BusinessConnectedBot struct {
+	OwnerUserID int64
+	BotUserID   int64
+	Recipients  []byte
+	Rights      []byte
+	CreatedAt   pgtype.Timestamptz
+	UpdatedAt   pgtype.Timestamptz
+}
+
+type BusinessConnectedBotPeerState struct {
+	OwnerUserID int64
+	PeerUserID  int64
+	Paused      bool
+	Disabled    bool
+	CreatedAt   pgtype.Timestamptz
+	UpdatedAt   pgtype.Timestamptz
 }
 
 type Channel struct {
@@ -128,6 +235,15 @@ type Channel struct {
 	PhotoID                       int64
 	PhotoDcID                     int32
 	PhotoStripped                 []byte
+	ReadInboxTop1UserID           int64
+	ReadInboxTop1                 int32
+	ReadInboxTop2                 int32
+	ActiveCallID                  int64
+	ActiveCallAccessHash          int64
+	ActiveCallNotEmpty            bool
+	BoostsUnrestrict              int32
+	Monoforum                     bool
+	LinkedMonoforumID             int64
 }
 
 type ChannelAdminLogEvent struct {
@@ -152,6 +268,25 @@ type ChannelAdminLogEvent struct {
 	CreatedAt       pgtype.Timestamptz
 }
 
+type ChannelBoostSlot struct {
+	UserID        int64
+	Slot          int32
+	PeerType      string
+	PeerID        int64
+	AssignedAt    int32
+	ExpiresAt     int32
+	CooldownUntil int32
+	Multiplier    int32
+	Gift          bool
+	Giveaway      bool
+	Unclaimed     bool
+	GiveawayMsgID int32
+	UsedGiftSlug  string
+	Stars         int64
+	CreatedAt     pgtype.Timestamptz
+	UpdatedAt     pgtype.Timestamptz
+}
+
 type ChannelDialog struct {
 	UserID                int64
 	ChannelID             int64
@@ -172,6 +307,7 @@ type ChannelDialog struct {
 	UpdatedAt             pgtype.Timestamptz
 	DefaultSendAsPeerType *string
 	DefaultSendAsPeerID   *int64
+	HasScheduled          bool
 }
 
 type ChannelForumTopic struct {
@@ -236,6 +372,13 @@ type ChannelInviteImporter struct {
 	UpdatedAt   pgtype.Timestamptz
 }
 
+type ChannelMediaCategoryCount struct {
+	ChannelID  int64
+	Category   int16
+	MediaCount int32
+	UpdatedAt  pgtype.Timestamptz
+}
+
 type ChannelMember struct {
 	ChannelID            int64
 	UserID               int64
@@ -289,6 +432,33 @@ type ChannelMessage struct {
 	UpdatedAt           pgtype.Timestamptz
 	ViewsCount          int32
 	Media               []byte
+	TtlPeriod           int32
+	ExpiresAt           int32
+	PostAuthor          string
+	Pinned              bool
+	ViaBotID            int64
+	ReplyMarkup         []byte
+	FromBoostsApplied   int32
+	RichMessage         []byte
+	GroupedID           int64
+	SavedPeerType       string
+	SavedPeerID         int64
+}
+
+type ChannelMessageMedium struct {
+	ChannelID   int64
+	ID          int32
+	Category    int16
+	MessageDate int32
+}
+
+type ChannelMessagePaidReaction struct {
+	ChannelID     int64
+	MessageID     int32
+	ReactorUserID int64
+	Stars         int64
+	Anonymous     bool
+	ReactionDate  int32
 }
 
 type ChannelMessageReaction struct {
@@ -314,6 +484,16 @@ type ChannelMessageViewer struct {
 	CreatedAt    pgtype.Timestamptz
 }
 
+type ChannelTopicRead struct {
+	ChannelID       int64
+	UserID          int64
+	TopicID         int32
+	ReadInboxMaxID  int32
+	ReadOutboxMaxID int32
+	ReadInboxDate   int32
+	UpdatedAt       pgtype.Timestamptz
+}
+
 type ChannelUnreadMention struct {
 	UserID       int64
 	ChannelID    int64
@@ -321,6 +501,14 @@ type ChannelUnreadMention struct {
 	TopMessageID int32
 	CreatedAt    pgtype.Timestamptz
 	MediaUnread  bool
+	Unread       bool
+}
+
+type ChannelUnreadMentionIndex struct {
+	ChannelID int64
+	MessageID int32
+	UserID    int64
+	CreatedAt pgtype.Timestamptz
 }
 
 type ChannelUpdateEvent struct {
@@ -344,18 +532,20 @@ type ChannelUsername struct {
 }
 
 type Contact struct {
-	UserID           int64
-	ContactUserID    int64
-	Mutual           bool
-	CreatedAt        pgtype.Timestamptz
-	UpdatedAt        pgtype.Timestamptz
-	ContactPhone     string
-	ContactFirstName string
-	ContactLastName  string
-	Note             string
-	NoteEntities     []byte
-	CloseFriend      bool
-	StoriesHidden    bool
+	UserID            int64
+	ContactUserID     int64
+	Mutual            bool
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
+	ContactPhone      string
+	ContactFirstName  string
+	ContactLastName   string
+	Note              string
+	NoteEntities      []byte
+	CloseFriend       bool
+	StoriesHidden     bool
+	PersonalPhotoID   int64
+	PersonalPhotoDate int32
 }
 
 type ContactBlock struct {
@@ -400,6 +590,9 @@ type Dialog struct {
 	UnreadMark            bool
 	HiddenPeerSettingsBar bool
 	FolderID              int32
+	TtlPeriod             int32
+	HasScheduled          bool
+	ThemeEmoticon         string
 }
 
 type DialogDraft struct {
@@ -424,9 +617,11 @@ type DialogFilter struct {
 }
 
 type DialogFilterSetting struct {
-	UserID      int64
-	TagsEnabled bool
-	UpdatedAt   pgtype.Timestamptz
+	UserID             int64
+	TagsEnabled        bool
+	UpdatedAt          pgtype.Timestamptz
+	ArchivePinned      bool
+	ArchivePinnedOrder int32
 }
 
 type DispatchOutbox struct {
@@ -435,13 +630,13 @@ type DispatchOutbox struct {
 	Pts              int32
 	EventType        string
 	ExcludeSessionID int64
+	ExcludeAuthKeyID int64
 	Status           string
 	Attempts         int32
 	NextAttemptAt    pgtype.Timestamptz
 	LastError        string
 	CreatedAt        pgtype.Timestamptz
 	UpdatedAt        pgtype.Timestamptz
-	ExcludeAuthKeyID int64
 }
 
 type Document struct {
@@ -457,6 +652,50 @@ type Document struct {
 	CreatedAt     pgtype.Timestamptz
 }
 
+type EncryptedFile struct {
+	ID             int64
+	AccessHash     int64
+	OwnerUserID    int64
+	Size           int64
+	DcID           int32
+	KeyFingerprint int32
+	CreatedAt      pgtype.Timestamptz
+}
+
+type EncryptedMessageQueue struct {
+	ReceiverAuthKeyID  int64
+	Qts                int32
+	ReceiverUserID     int64
+	ChatID             int32
+	RandomID           int64
+	Date               int32
+	IsService          bool
+	Bytes              []byte
+	FileID             *int64
+	FileAccessHash     *int64
+	FileSize           *int64
+	FileDcID           *int32
+	FileKeyFingerprint *int32
+	Acked              bool
+	CreatedAt          pgtype.Timestamptz
+}
+
+type EncryptedStateEvent struct {
+	ID              int64
+	TargetUserID    int64
+	TargetAuthKeyID int64
+	ChatID          int32
+	EventType       int16
+	MaxDate         int32
+	Date            int32
+	CreatedAt       pgtype.Timestamptz
+}
+
+type EncryptedStateEventDelivery struct {
+	EventID   int64
+	AuthKeyID int64
+}
+
 type FileBlob struct {
 	LocationKey string
 	Backend     string
@@ -465,6 +704,46 @@ type FileBlob struct {
 	Sha256      []byte
 	MimeType    string
 	CreatedAt   pgtype.Timestamptz
+}
+
+type GroupCall struct {
+	CallID            int64
+	AccessHash        int64
+	ChannelID         int64
+	CreatorUserID     int64
+	State             string
+	Title             string
+	JoinMuted         bool
+	Version           int32
+	ParticipantsCount int32
+	CreatedAt         int32
+	DiscardedAt       int32
+	Duration          int32
+	StartedMsgID      int32
+}
+
+type GroupCallParticipant struct {
+	CallID           int64
+	UserID           int64
+	Ssrc             int64
+	JoinDate         int32
+	ActiveDate       int32
+	Muted            bool
+	MutedByAdmin     bool
+	VolumeByAdmin    int32
+	RaiseHandRating  int64
+	VideoJson        []byte
+	PresentationJson []byte
+	LeftCall         bool
+	LastCheckDate    int32
+}
+
+type GroupCallParticipantOverride struct {
+	CallID       int64
+	SetterUserID int64
+	TargetUserID int64
+	MutedByYou   bool
+	Volume       int32
 }
 
 type LangPack struct {
@@ -493,37 +772,85 @@ type LangPackString struct {
 }
 
 type MessageBox struct {
-	OwnerUserID      int64
-	BoxID            int32
-	PrivateMessageID int64
-	MessageSenderID  int64
-	PeerType         string
-	PeerID           int64
-	FromUserID       int64
-	MessageDate      int32
-	Outgoing         bool
-	Body             string
-	Entities         []byte
-	Pts              int32
-	Deleted          bool
-	CreatedAt        pgtype.Timestamptz
-	EditDate         int32
-	Silent           bool
-	Noforwards       bool
-	ReplyToMsgID     int32
-	ReplyToPeerType  string
-	ReplyToPeerID    int64
-	ReplyToTopID     int32
-	QuoteText        string
-	QuoteEntities    []byte
-	QuoteOffset      int32
-	FwdFromPeerType  string
-	FwdFromPeerID    int64
-	FwdFromName      string
-	FwdDate          int32
-	Media            []byte
-	MediaUnread      bool
-	ReactionUnread   bool
+	OwnerUserID          int64
+	BoxID                int32
+	PrivateMessageID     int64
+	MessageSenderID      int64
+	PeerType             string
+	PeerID               int64
+	FromUserID           int64
+	MessageDate          int32
+	Outgoing             bool
+	Body                 string
+	Entities             []byte
+	Pts                  int32
+	Deleted              bool
+	CreatedAt            pgtype.Timestamptz
+	EditDate             int32
+	Silent               bool
+	Noforwards           bool
+	ReplyToMsgID         int32
+	ReplyToPeerType      string
+	ReplyToPeerID        int64
+	ReplyToTopID         int32
+	QuoteText            string
+	QuoteEntities        []byte
+	QuoteOffset          int32
+	FwdFromPeerType      string
+	FwdFromPeerID        int64
+	FwdFromName          string
+	FwdDate              int32
+	Media                []byte
+	MediaUnread          bool
+	ReactionUnread       bool
+	TtlPeriod            int32
+	ExpiresAt            int32
+	Pinned               bool
+	SavedPeerType        string
+	SavedPeerID          int64
+	FwdSavedFromPeerType string
+	FwdSavedFromPeerID   int64
+	FwdSavedFromMsgID    int32
+	ReplyMarkup          []byte
+	ViaBotID             int64
+	RichMessage          []byte
+	GroupedID            int64
+	ReplyToStoryID       int32
+	Effect               int64
+}
+
+type MessageBoxMedium struct {
+	OwnerUserID int64
+	BoxID       int32
+	PeerID      int64
+	Category    int16
+	MessageDate int32
+}
+
+type NotifySetting struct {
+	OwnerUserID       int64
+	ScopeKind         string
+	PeerType          string
+	PeerID            int64
+	TopicID           int32
+	ShowPreviews      *bool
+	Silent            *bool
+	MuteUntil         *int32
+	StoriesMuted      *bool
+	StoriesHideSender *bool
+	UpdatedAt         pgtype.Timestamptz
+}
+
+type PasskeyCredential struct {
+	CredentialID []byte
+	UserID       int64
+	PublicKey    []byte
+	SignCount    int64
+	Aaguid       []byte
+	Name         string
+	Transports   []string
+	CreatedAt    pgtype.Timestamptz
+	LastUsedAt   pgtype.Timestamptz
 }
 
 type Photo struct {
@@ -535,6 +862,40 @@ type Photo struct {
 	HasStickers   bool
 	Sizes         []byte
 	CreatedAt     pgtype.Timestamptz
+}
+
+type Poll struct {
+	PollID           int64
+	CreatorUserID    int64
+	MultipleChoice   bool
+	Quiz             bool
+	PublicVoters     bool
+	RevotingDisabled bool
+	HideResults      bool
+	Closed           bool
+	ClosePeriod      int32
+	CloseDate        int32
+	Options          []byte
+	CorrectOptions   []byte
+	Solution         string
+	SolutionEntities []byte
+	CreatedAt        pgtype.Timestamptz
+}
+
+type PollVote struct {
+	PollID    int64
+	UserID    int64
+	Options   []byte
+	VoteDate  int32
+	CreatedAt pgtype.Timestamptz
+}
+
+type PrivateMediaCategoryCount struct {
+	OwnerUserID int64
+	PeerID      int64
+	Category    int16
+	MediaCount  int32
+	UpdatedAt   pgtype.Timestamptz
 }
 
 type PrivateMessage struct {
@@ -561,6 +922,14 @@ type PrivateMessage struct {
 	FwdFromName     string
 	FwdDate         int32
 	Media           []byte
+	TtlPeriod       int32
+	ExpiresAt       int32
+	ReplyMarkup     []byte
+	ViaBotID        int64
+	RichMessage     []byte
+	GroupedID       int64
+	ReplyToStoryID  int32
+	Effect          int64
 }
 
 type PrivateMessageReaction struct {
@@ -584,6 +953,135 @@ type ProfilePhoto struct {
 	Active        bool
 	SortOrder     int64
 	CreatedAt     pgtype.Timestamptz
+	Kind          string
+}
+
+type QuickReply struct {
+	OwnerUserID int64
+	ShortcutID  int32
+	Shortcut    string
+	SortOrder   int32
+	CreatedAt   pgtype.Timestamptz
+	UpdatedAt   pgtype.Timestamptz
+}
+
+type QuickReplyMessage struct {
+	OwnerUserID int64
+	ShortcutID  int32
+	MessageID   int32
+	RandomID    int64
+	MessageDate int32
+	Body        string
+	Entities    []byte
+	CreatedAt   pgtype.Timestamptz
+	UpdatedAt   pgtype.Timestamptz
+}
+
+type ReadModelVersion struct {
+	Model       string
+	OwnerUserID int64
+	PeerType    string
+	PeerID      int64
+	Version     int64
+	UpdatedAt   pgtype.Timestamptz
+	Hash        int64
+}
+
+type SavedDialogPin struct {
+	UserID      int64
+	PeerType    string
+	PeerID      int64
+	PinnedOrder int32
+	CreatedAt   pgtype.Timestamptz
+}
+
+type SavedMusic struct {
+	UserID     int64
+	DocumentID int64
+	SortOrder  int32
+	CreatedAt  pgtype.Timestamptz
+	UpdatedAt  pgtype.Timestamptz
+}
+
+type ScheduledMessage struct {
+	OwnerUserID          int64
+	ScheduledID          int32
+	PeerType             string
+	PeerID               int64
+	RandomID             int64
+	MessageDate          int32
+	Body                 string
+	Entities             []byte
+	Media                []byte
+	Silent               bool
+	Noforwards           bool
+	ReplyToMsgID         int32
+	ReplyToPeerType      string
+	ReplyToPeerID        int64
+	ReplyToTopID         int32
+	QuoteText            string
+	QuoteEntities        []byte
+	QuoteOffset          int32
+	FwdFromPeerType      string
+	FwdFromPeerID        int64
+	FwdFromName          string
+	FwdDate              int32
+	SendAsPeerType       string
+	SendAsPeerID         int64
+	ScheduleDate         int32
+	ScheduleRepeatPeriod int32
+	State                string
+	LeaseUntil           int32
+	SentMessageID        int32
+	LastError            string
+	CreatedAt            int32
+	UpdatedAt            int32
+}
+
+type SecretChat struct {
+	ChatID                int32
+	AdminAccessHash       int64
+	ParticipantAccessHash int64
+	AdminUserID           int64
+	AdminAuthKeyID        int64
+	ParticipantUserID     int64
+	ParticipantAuthKeyID  int64
+	State                 string
+	GA                    []byte
+	GB                    []byte
+	KeyFingerprint        int64
+	Layer                 int32
+	FolderID              int32
+	HistoryDeleted        bool
+	RandomID              int32
+	Date                  int32
+	CreatedAt             pgtype.Timestamptz
+}
+
+type SecretQtsWatermark struct {
+	AuthKeyID    int64
+	ReservedQts  int32
+	ConfirmedQts int32
+	UpdatedAt    pgtype.Timestamptz
+}
+
+type StarsBalance struct {
+	UserID    int64
+	Balance   int64
+	Granted   bool
+	UpdatedAt pgtype.Timestamptz
+}
+
+type StarsTransaction struct {
+	ID          int64
+	UserID      int64
+	PeerType    string
+	PeerID      int64
+	Amount      int64
+	Reason      string
+	Title       string
+	Description string
+	Date        int32
 }
 
 type StickerSet struct {
@@ -613,6 +1111,60 @@ type StickerSet struct {
 	CreatedAt       pgtype.Timestamptz
 }
 
+type Story struct {
+	OwnerPeerType    string
+	OwnerPeerID      int64
+	StoryID          int32
+	RandomID         int64
+	Date             int32
+	ExpireDate       int32
+	Deleted          bool
+	Pinned           bool
+	Public           bool
+	CloseFriends     bool
+	Contacts         bool
+	SelectedContacts bool
+	Noforwards       bool
+	Edited           bool
+	PrivacyRules     []byte
+	AllowUserIds     []int64
+	DisallowUserIds  []int64
+	Caption          string
+	Entities         []byte
+	Media            []byte
+	MediaAreas       []byte
+	CreatedAt        pgtype.Timestamptz
+	UpdatedAt        pgtype.Timestamptz
+	PinnedToTopOrder int32
+	FwdFrom          []byte
+}
+
+type StoryHiddenPeer struct {
+	ViewerUserID  int64
+	OwnerPeerType string
+	OwnerPeerID   int64
+	UpdatedAt     pgtype.Timestamptz
+}
+
+type StoryReadState struct {
+	ViewerUserID  int64
+	OwnerPeerType string
+	OwnerPeerID   int64
+	MaxReadID     int32
+	Date          int32
+	UpdatedAt     pgtype.Timestamptz
+}
+
+type StoryView struct {
+	OwnerPeerType string
+	OwnerPeerID   int64
+	StoryID       int32
+	ViewerUserID  int64
+	Date          int32
+	Reaction      []byte
+	UpdatedAt     pgtype.Timestamptz
+}
+
 type TempAuthKeyBinding struct {
 	TempAuthKeyID    int64
 	PermAuthKeyID    int64
@@ -621,6 +1173,27 @@ type TempAuthKeyBinding struct {
 	EncryptedMessage []byte
 	CreatedAt        pgtype.Timestamptz
 	TempSessionID    int64
+}
+
+type Theme struct {
+	ID            int64
+	AccessHash    int64
+	CreatorUserID int64
+	Slug          string
+	Title         string
+	Emoticon      string
+	ForChat       bool
+	DocumentID    int64
+	Settings      []byte
+	InstallsCount int32
+	CreatedAt     pgtype.Timestamptz
+}
+
+type ThemeUserInstall struct {
+	UserID      int64
+	ThemeID     int64
+	Dark        bool
+	InstalledAt pgtype.Timestamptz
 }
 
 type UpdateState struct {
@@ -639,34 +1212,68 @@ type UploadPart struct {
 	Part        int32
 	TotalParts  int32
 	IsBig       bool
-	Bytes       []byte
 	CreatedAt   pgtype.Timestamptz
+	Backend     string
+	ObjectKey   string
+	Size        int64
+	Sha256      []byte
 }
 
 type User struct {
-	ID          int64
-	AccessHash  int64
-	Phone       string
-	FirstName   string
-	LastName    string
-	Username    string
-	CountryCode string
-	CreatedAt   pgtype.Timestamptz
-	UpdatedAt   pgtype.Timestamptz
-	Verified    bool
-	Support     bool
-	About       string
-	LastSeenAt  int64
+	ID                            int64
+	AccessHash                    int64
+	Phone                         string
+	FirstName                     string
+	LastName                      string
+	Username                      string
+	CountryCode                   string
+	CreatedAt                     pgtype.Timestamptz
+	UpdatedAt                     pgtype.Timestamptz
+	Verified                      bool
+	Support                       bool
+	About                         string
+	LastSeenAt                    int64
+	DefaultHistoryTtlPeriod       int32
+	IsBot                         bool
+	BotInfoVersion                int32
+	PremiumExpiresAt              pgtype.Timestamptz
+	EmojiStatusDocumentID         int64
+	EmojiStatusUntil              int64
+	ColorSet                      bool
+	Color                         int32
+	ColorBackgroundEmojiID        int64
+	ProfileColorSet               bool
+	ProfileColor                  int32
+	ProfileColorBackgroundEmojiID int64
+	BirthdayDay                   int32
+	BirthdayMonth                 int32
+	BirthdayYear                  int32
+	PersonalChannelID             int64
+}
+
+type UserBusinessProfile struct {
+	UserID          int64
+	WorkHours       []byte
+	Location        []byte
+	Intro           []byte
+	GreetingMessage []byte
+	AwayMessage     []byte
+	UpdatedAt       pgtype.Timestamptz
 }
 
 type UserChannelMemberIndex struct {
-	UserID    int64
-	ChannelID int64
-	Status    string
-	Megagroup bool
-	Broadcast bool
-	Deleted   bool
-	UpdatedAt pgtype.Timestamptz
+	UserID         int64
+	ChannelID      int64
+	Status         string
+	Megagroup      bool
+	Broadcast      bool
+	Deleted        bool
+	UpdatedAt      pgtype.Timestamptz
+	Role           string
+	LeftAt         int32
+	Forum          bool
+	PublicUsername bool
+	CanPinMessages bool
 }
 
 type UserRecentReaction struct {
@@ -688,6 +1295,27 @@ type UserSavedReactionTag struct {
 	UpdatedAt     pgtype.Timestamptz
 }
 
+type UserStarGift struct {
+	ID           int64
+	OwnerUserID  int64
+	FromUserID   int64
+	GiftID       int64
+	MsgID        int32
+	GiftDate     int32
+	NameHidden   bool
+	Unsaved      bool
+	Converted    bool
+	ConvertStars int64
+	Message      string
+}
+
+type UserStickerCollection struct {
+	OwnerUserID int64
+	Kind        string
+	DocumentID  int64
+	UsedAt      int32
+}
+
 type UserTopReaction struct {
 	UserID        int64
 	ReactionType  string
@@ -699,30 +1327,45 @@ type UserTopReaction struct {
 }
 
 type UserUpdateEvent struct {
-	UserID           int64
-	Pts              int32
-	PtsCount         int32
-	Date             int32
-	EventType        string
-	MessageBoxID     *int32
-	PeerType         *string
-	PeerID           *int64
-	MaxID            int32
-	StillUnreadCount int32
-	CreatedAt        pgtype.Timestamptz
-	EventBool        bool
-	EventPeers       []byte
-	PeerSettings     []byte
-	MessageIds       []byte
-	DialogFilter     []byte
-	FilterOrder      []byte
-	FolderPeers      []byte
-	FilterID         int32
-	TagsEnabled      bool
+	UserID            int64
+	Pts               int32
+	PtsCount          int32
+	Date              int32
+	EventType         string
+	MessageBoxID      *int32
+	PeerType          *string
+	PeerID            *int64
+	MaxID             int32
+	StillUnreadCount  int32
+	CreatedAt         pgtype.Timestamptz
+	EventBool         bool
+	EventPeers        []byte
+	PeerSettings      []byte
+	MessageIds        []byte
+	DialogFilter      []byte
+	FilterOrder       []byte
+	FolderPeers       []byte
+	FilterID          int32
+	TagsEnabled       bool
+	ChannelPts        int32
+	FolderID          int32
+	QuickReplies      []byte
+	QuickReplyMessage []byte
+	StoryPayload      []byte
+	ReactionPayload   []byte
 }
 
 type UserUpdateWatermark struct {
 	UserID        int64
 	ContiguousPts int32
 	UpdatedAt     pgtype.Timestamptz
+}
+
+type WebPage struct {
+	UrlHash     int64
+	WebPageID   int64
+	State       string
+	Snapshot    []byte
+	CreatedAt   int64
+	RefreshedAt int64
 }

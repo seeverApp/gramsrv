@@ -1,56 +1,21 @@
 package rpc
 
-import (
-	"context"
-	"fmt"
-	"time"
+import "context"
 
-	"go.uber.org/zap"
-
-	"github.com/gotd/td/bin"
-)
-
-// dispatchCompat handles explicitly allowlisted legacy TL constructors that are
-// still emitted by supported clients but are absent from gotd's pinned schema.
-func (r *Router) dispatchCompat(ctx context.Context, b *bin.Buffer, id uint32) (bin.Encoder, bool, error) {
-	start := time.Now()
-	var (
-		enc  bin.Encoder
-		name string
-		err  error
-	)
-
-	switch id {
-	case legacyAccountRegisterDeviceTypeID:
-		name = "account.registerDevice#637ea878"
-		enc, err = r.handleLegacyAccountRegisterDevice(ctx, b)
-	case legacyUpdatesGetDifferenceTypeID:
-		name = "updates.getDifference#25939651"
-		enc, err = r.handleLegacyUpdatesGetDifference(ctx, b)
-	case legacyLangpackGetLangPackTypeID:
-		name = "langpack.getLangPack#9ab5c58e"
-		enc, err = r.handleLegacyLangpackGetLangPack(ctx, b)
-	case legacyLangpackGetStringsTypeID:
-		name = "langpack.getStrings#2e1ee318"
-		enc, err = r.handleLegacyLangpackGetStrings(ctx, b)
-	case legacyLangpackGetLanguagesTypeID:
-		name = "langpack.getLanguages#800fd57d"
-		enc, err = r.handleLegacyLangpackGetLanguages(ctx, b)
-	default:
-		return nil, false, nil
+// withAndroidCompatMetadata 为「客户端构造器漂移」请求**仅在当前 ctx 内**兜底 client 层/类型。
+// 这类请求多来自未完整走 initConnection 的 DrKLO Android；当 layer/ClientType 仍未知时
+// 按 android 处理，使下游（createChat 的 legacy 响应、langpack 的 lang_pack 派生）行为正确。
+//
+// 关键：**绝不把这个兜底值写回持久缓存**（不调 rememberClientLayer/rememberClientInfo）。
+// 缓存是 invokeWithLayer/initConnection 的权威产物；条目被驱逐时该兜底会拿不到真实值而误判
+// 227/android，若写回就把长连接老客户端的真实 layer/类型永久覆盖（与 NegotiatedLayer 的
+// 「驱逐时不覆盖」契约矛盾）。出站 layer 由 Conn.clientLayer 承载（非覆盖），与本兜底无关。
+func (r *Router) withAndroidCompatMetadata(ctx context.Context) context.Context {
+	if LayerFrom(ctx) == 0 {
+		ctx = WithLayer(ctx, currentClientLayer)
 	}
-
-	fields := append([]zap.Field{
-		zap.String("method", name),
-		zap.String("type_id", fmt.Sprintf("%#x", id)),
-		zap.Bool("compat", true),
-		zap.Duration("dur", time.Since(start)),
-	}, r.contextLogFields(ctx)...)
-	if err != nil {
-		fields = append(fields, zap.Error(err))
-		r.log.Info("RPC compat handled", fields...)
-	} else {
-		r.log.Debug("RPC compat handled", fields...)
+	if ClientTypeFrom(ctx) == ClientTypeUnknown {
+		ctx = WithClientInfo(ctx, ClientInfo{LangPack: string(ClientTypeAndroid), Type: ClientTypeAndroid})
 	}
-	return enc, true, err
+	return ctx
 }

@@ -22,35 +22,34 @@ func (s *Service) SeedDirectory(ctx context.Context, root string) (int, error) {
 		}
 		return 0, fmt.Errorf("stat langpack seed dir: %w", err)
 	}
-	tdesktopDir := filepath.Join(dir, "tdesktop")
-	if info, err := os.Stat(tdesktopDir); err == nil && info.IsDir() {
-		dir = tdesktopDir
-	}
 
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return 0, fmt.Errorf("read langpack seed dir: %w", err)
-	}
 	seeded := 0
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".strings") {
-			continue
-		}
-		pack, err := ParseTDesktopFile(filepath.Join(dir, entry.Name()))
+	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
-			return seeded, err
+			return err
+		}
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".strings") {
+			return nil
+		}
+		pack, err := ParseTDesktopFile(path)
+		if err != nil {
+			return err
 		}
 		existing, err := s.packs.GetPack(ctx, pack.LangPack, pack.LangCode, pack.Version)
 		if err != nil {
-			return seeded, err
+			return err
 		}
 		if existing.Version >= pack.Version {
-			continue
+			return nil
 		}
 		if err := s.packs.UpsertPack(ctx, pack); err != nil {
-			return seeded, err
+			return err
 		}
 		seeded += len(pack.Strings)
+		return nil
+	})
+	if err != nil {
+		return seeded, fmt.Errorf("walk langpack seed dir: %w", err)
 	}
 	return seeded, nil
 }

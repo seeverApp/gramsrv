@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"telesrv/internal/app/userprojection"
@@ -20,10 +21,15 @@ type ProfilePhotoProvider = userprojection.ProfilePhotoProvider
 // Service 提供用户查询。
 type Service struct {
 	users     store.UserStore
+	cache     store.UserCache
 	contacts  store.ContactStore
 	photos    ProfilePhotoProvider
 	privacy   userprojection.PrivacyEvaluator
 	projector *userprojection.Projector
+}
+
+type usernameAvailabilityStore interface {
+	CheckUsername(ctx context.Context, userID int64, username string) (bool, error)
 }
 
 // Option 调整用户服务可选依赖。
@@ -32,6 +38,11 @@ type Option func(*Service)
 // WithPhotoProvider 注入头像富化能力（缺省则用户不带头像）。
 func WithPhotoProvider(p ProfilePhotoProvider) Option {
 	return func(s *Service) { s.photos = p }
+}
+
+// WithBaseUserCache injects a viewer-independent user base cache.
+func WithBaseUserCache(c store.UserCache) Option {
+	return func(s *Service) { s.cache = c }
 }
 
 // WithContactStore enables viewer-specific contact name/phone projection.
@@ -45,11 +56,15 @@ func WithPrivacyEvaluator(p userprojection.PrivacyEvaluator) Option {
 }
 
 const (
-	minUsernameLen       = 5
-	maxUsernameLen       = 32
-	maxProfileNameRunes  = 64
-	maxProfileAboutRunes = 70
-	maxBatchUsers        = 1000
+	minUsernameLen      = 5
+	maxUsernameLen      = 32
+	maxProfileNameRunes = 64
+	// bio 长度双档，对齐 appConfig about_length_limit_default=70 /
+	// about_length_limit_premium=140；客户端按 self premium flag 选档，
+	// 服务端档位必须 ≥ 客户端宣告档位。
+	maxProfileAboutRunes        = 70
+	maxProfileAboutRunesPremium = 140
+	maxBatchUsers               = 1000
 )
 
 // NewService 创建用户服务。
@@ -71,7 +86,7 @@ func (s *Service) loadSelf(ctx context.Context, userID int64) (domain.User, erro
 	if userID == 0 {
 		return domain.User{}, ErrNotAuthorized
 	}
-	u, found, err := s.users.ByID(ctx, userID)
+	u, found, err := s.loadBaseUserByID(ctx, userID)
 	if err != nil {
 		return domain.User{}, err
 	}
@@ -95,7 +110,7 @@ func (s *Service) ByID(ctx context.Context, currentUserID, userID int64) (domain
 	if currentUserID == 0 {
 		return domain.User{}, false, ErrNotAuthorized
 	}
-	u, found, err := s.users.ByID(ctx, userID)
+	u, found, err := s.loadBaseUserByID(ctx, userID)
 	if err != nil {
 		return domain.User{}, false, err
 	}
@@ -107,6 +122,14 @@ func (s *Service) ByID(ctx context.Context, currentUserID, userID int64) (domain
 		return domain.User{}, false, err
 	}
 	return u, true, nil
+}
+
+// AdminUser 返回 viewer 无关的账号基础事实，供管理用例做 dry-run 与审计。
+func (s *Service) AdminUser(ctx context.Context, userID int64) (domain.User, bool, error) {
+	if userID == 0 {
+		return domain.User{}, false, nil
+	}
+	return s.loadBaseUserByID(ctx, userID)
 }
 
 // ByIDs 批量返回指定用户。调用方必须已登录；缺失用户不会出现在结果中。
@@ -132,11 +155,30 @@ func (s *Service) ByIDs(ctx context.Context, currentUserID int64, userIDs []int6
 			break
 		}
 	}
-	users, err := s.users.ByIDs(ctx, ids)
+	users, err := s.loadBaseUsersByIDs(ctx, ids)
 	if err != nil {
 		return nil, err
 	}
 	return s.projectUsers(ctx, currentUserID, users)
+}
+
+// ByIDsForViewers 跨多个 viewer 批量投影同一组 user（fan-out 模板化）：base user 只加载一次，
+// 隐私/改名/头像投影经 userprojection.ForViewers 压成 O(owner) 查询。返回 map[viewerID][]User，
+// 每个切片与 ByIDs(viewer, ids) 字节等价——**唯一例外是 personal photo overlay**（ForViewers v1
+// 跳过，客户端下次 getChannelDifference/getHistory 自愈）。供 channel fan-out 预热每 viewer 投影，
+// 把 per-recipient 的 ByIDs(=ForViewer) 折叠成一次跨 viewer 投影。不做 ByIDs 的单 caller 鉴权
+// （viewer 是 fan-out 收件人集合，非 RPC 调用方）。
+func (s *Service) ByIDsForViewers(ctx context.Context, viewerUserIDs []int64, userIDs []int64) (map[int64][]domain.User, error) {
+	if len(viewerUserIDs) == 0 || len(userIDs) == 0 {
+		return map[int64][]domain.User{}, nil
+	}
+	ids := uniqueUserIDs(userIDs, maxBatchUsers)
+	base, err := s.loadBaseUsersByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	// projector 为 nil 时 ForViewers 返回各 viewer 的原始 base 副本（与 projectUsers 的 nil 分支一致）。
+	return s.projector.ForViewers(ctx, viewerUserIDs, base)
 }
 
 // CheckUsername 校验当前用户是否可以占用 username。
@@ -149,11 +191,18 @@ func (s *Service) CheckUsername(ctx context.Context, userID int64, username stri
 	if !validUsername(username) {
 		return false, domain.ErrUsernameInvalid
 	}
+	return s.checkUsernameAvailable(ctx, self.ID, username)
+}
+
+func (s *Service) checkUsernameAvailable(ctx context.Context, selfID int64, username string) (bool, error) {
+	if checker, ok := s.users.(usernameAvailabilityStore); ok {
+		return checker.CheckUsername(ctx, selfID, username)
+	}
 	u, found, err := s.users.ByUsername(ctx, username)
 	if err != nil {
 		return false, err
 	}
-	return !found || u.ID == self.ID, nil
+	return !found || u.ID == selfID, nil
 }
 
 // UpdateUsername 修改当前用户的主 username。空字符串表示删除 username。
@@ -167,11 +216,11 @@ func (s *Service) UpdateUsername(ctx context.Context, userID int64, username str
 		if !validUsername(username) {
 			return domain.User{}, domain.ErrUsernameInvalid
 		}
-		u, found, err := s.users.ByUsername(ctx, username)
+		ok, err := s.checkUsernameAvailable(ctx, self.ID, username)
 		if err != nil {
 			return domain.User{}, err
 		}
-		if found && u.ID != self.ID {
+		if !ok {
 			return domain.User{}, domain.ErrUsernameOccupied
 		}
 	}
@@ -182,6 +231,7 @@ func (s *Service) UpdateUsername(ctx context.Context, userID int64, username str
 	if err != nil {
 		return domain.User{}, err
 	}
+	s.refreshCachedUsers(ctx, u)
 	return u, nil
 }
 
@@ -206,13 +256,22 @@ func (s *Service) UpdateProfile(ctx context.Context, userID int64, update domain
 	if firstName == "" || utf8.RuneCountInString(firstName) > maxProfileNameRunes || utf8.RuneCountInString(lastName) > maxProfileNameRunes {
 		return domain.User{}, domain.ErrFirstNameInvalid
 	}
-	if utf8.RuneCountInString(about) > maxProfileAboutRunes {
+	aboutLimit := maxProfileAboutRunes
+	if self.PremiumActiveAt(time.Now().Unix()) {
+		aboutLimit = maxProfileAboutRunesPremium
+	}
+	if utf8.RuneCountInString(about) > aboutLimit {
 		return domain.User{}, domain.ErrAboutTooLong
 	}
 	if firstName == self.FirstName && lastName == self.LastName && about == self.About {
 		return self, nil
 	}
-	return s.users.UpdateProfile(ctx, self.ID, firstName, lastName, about)
+	u, err := s.users.UpdateProfile(ctx, self.ID, firstName, lastName, about)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, u)
+	return u, nil
 }
 
 // UpdateLastSeen records the latest visible account activity time.
@@ -223,7 +282,165 @@ func (s *Service) UpdateLastSeen(ctx context.Context, userID int64, lastSeenAt i
 	if lastSeenAt <= 0 {
 		return nil
 	}
-	return s.users.UpdateLastSeen(ctx, userID, lastSeenAt)
+	if err := s.users.UpdateLastSeen(ctx, userID, lastSeenAt); err != nil {
+		return err
+	}
+	s.dropCachedUsers(ctx, userID)
+	return nil
+}
+
+// PremiumActive 报告用户当前是否有效会员。走基础用户缓存路径、不做 viewer
+// 投影，供限额双档判断（pin 上限、reaction 上限、bio 长度等）低成本调用。
+func (s *Service) PremiumActive(ctx context.Context, userID int64) bool {
+	if s == nil || userID == 0 {
+		return false
+	}
+	u, found, err := s.loadBaseUserByID(ctx, userID)
+	if err != nil || !found {
+		return false
+	}
+	return u.PremiumActiveAt(time.Now().Unix())
+}
+
+// GrantPremium 授予/续期会员：未过期则在现有到期时间上累加 months 个月，
+// 已过期或首次则从当前时刻起算（对齐官方续期语义）。months<=0 清除会员。
+// bot 永不可成为会员。
+func (s *Service) GrantPremium(ctx context.Context, userID int64, months int) (domain.User, error) {
+	if userID == 0 {
+		return domain.User{}, ErrNotAuthorized
+	}
+	u, found, err := s.users.ByID(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if !found {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	if u.Bot {
+		return domain.User{}, domain.ErrPremiumBotUnsupported
+	}
+	until := 0
+	if months > 0 {
+		now := time.Now()
+		base := now
+		if u.PremiumUntil > 0 && int64(u.PremiumUntil) > now.Unix() {
+			base = time.Unix(int64(u.PremiumUntil), 0)
+		}
+		until = int(base.AddDate(0, months, 0).Unix())
+	}
+	updated, err := s.users.SetPremiumUntil(ctx, userID, until)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, updated)
+	return updated, nil
+}
+
+// SetVerified 设置/取消用户认证标记。认证是账号基础事实，所有 user 投影统一消费该字段。
+func (s *Service) SetVerified(ctx context.Context, userID int64, verified bool) (domain.User, error) {
+	if userID == 0 {
+		return domain.User{}, ErrNotAuthorized
+	}
+	u, found, err := s.users.ByID(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if !found {
+		return domain.User{}, domain.ErrUserNotFound
+	}
+	if u.Verified == verified {
+		return u, nil
+	}
+	updated, err := s.users.SetVerified(ctx, userID, verified)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, updated)
+	return updated, nil
+}
+
+// SweepExpiredPremium 清理到期会员（store 把过期行清 NULL）并失效用户缓存，
+// 返回清理后的用户，供 RPC 层向本人在线 session 推 updateUser。premium 下发
+// 正确性由读取路径即时派生保证，这里只做收尾与通知。
+func (s *Service) SweepExpiredPremium(ctx context.Context, now int64, limit int) ([]domain.User, error) {
+	users, err := s.users.SweepExpiredPremium(ctx, now, limit)
+	if err != nil || len(users) == 0 {
+		return users, err
+	}
+	ids := make([]int64, 0, len(users))
+	for _, u := range users {
+		ids = append(ids, u.ID)
+	}
+	s.dropCachedUsers(ctx, ids...)
+	return users, nil
+}
+
+// UpdateEmojiStatus 更新当前用户 emoji status（premium 专属；documentID=0 清除）。
+// 清除不要求会员（到期降级后客户端仍可显式清掉残留状态）。
+func (s *Service) UpdateEmojiStatus(ctx context.Context, userID int64, documentID int64, until int) (domain.User, error) {
+	self, err := s.loadSelf(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if documentID != 0 && !self.PremiumActiveAt(time.Now().Unix()) {
+		return domain.User{}, domain.ErrPremiumRequired
+	}
+	u, err := s.users.UpdateEmojiStatus(ctx, self.ID, documentID, until)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, u)
+	return u, nil
+}
+
+// UpdateBirthday 设置/清除用户生日（account.updateBirthday）。零值 Birthday 表示清除。
+func (s *Service) UpdateBirthday(ctx context.Context, userID int64, birthday domain.Birthday) (domain.User, error) {
+	self, err := s.loadSelf(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if birthday.IsSet() {
+		if !domain.ValidBirthday(birthday) {
+			return domain.User{}, domain.ErrBirthdayInvalid
+		}
+	} else {
+		birthday = domain.Birthday{} // 归一化为清除
+	}
+	u, err := s.users.UpdateBirthday(ctx, self.ID, birthday)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, u)
+	return u, nil
+}
+
+// UpdatePersonalChannel 设置/清除资料页个人频道（account.updatePersonalChannel）；
+// channelID=0 表示清除。频道存在性与「调用者是其成员」由 RPC 层在调用前校验。
+func (s *Service) UpdatePersonalChannel(ctx context.Context, userID int64, channelID int64) (domain.User, error) {
+	self, err := s.loadSelf(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	u, err := s.users.UpdatePersonalChannel(ctx, self.ID, channelID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, u)
+	return u, nil
+}
+
+// UpdateColor updates the user's message accent or profile background color.
+func (s *Service) UpdateColor(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor) (domain.User, error) {
+	self, err := s.loadSelf(ctx, userID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	u, err := s.users.UpdateColor(ctx, self.ID, forProfile, color)
+	if err != nil {
+		return domain.User{}, err
+	}
+	s.refreshCachedUsers(ctx, u)
+	return u, nil
 }
 
 // ResolveUsername 解析 username 到用户；调用方必须已登录。
@@ -239,6 +456,7 @@ func (s *Service) ResolveUsername(ctx context.Context, currentUserID int64, user
 	if err != nil || !found {
 		return u, found, err
 	}
+	s.putCachedUsers(ctx, u)
 	u, err = s.projectOne(ctx, currentUserID, u)
 	if err != nil {
 		return domain.User{}, false, err
@@ -259,6 +477,7 @@ func (s *Service) ResolvePhone(ctx context.Context, currentUserID int64, phone s
 	if err != nil || !found {
 		return u, found, err
 	}
+	s.putCachedUsers(ctx, u)
 	u, err = s.projectOne(ctx, currentUserID, u)
 	if err != nil {
 		return domain.User{}, false, err
@@ -271,6 +490,107 @@ func (s *Service) projectUsers(ctx context.Context, viewerUserID int64, users []
 		return users, nil
 	}
 	return s.projector.ForViewer(ctx, viewerUserID, users)
+}
+
+func (s *Service) loadBaseUserByID(ctx context.Context, userID int64) (domain.User, bool, error) {
+	users, err := s.loadBaseUsersByIDs(ctx, []int64{userID})
+	if err != nil {
+		return domain.User{}, false, err
+	}
+	if len(users) == 0 {
+		return domain.User{}, false, nil
+	}
+	return users[0], true, nil
+}
+
+func (s *Service) loadBaseUsersByIDs(ctx context.Context, userIDs []int64) ([]domain.User, error) {
+	ids := uniqueUserIDs(userIDs, maxBatchUsers)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	loaded := make(map[int64]domain.User, len(ids))
+	misses := append([]int64(nil), ids...)
+	if s.cache != nil {
+		if cached, err := s.cache.GetByIDs(ctx, ids); err == nil && len(cached) > 0 {
+			for id, u := range cached {
+				if u.ID != 0 {
+					loaded[id] = u
+				}
+			}
+			misses = make([]int64, 0, len(ids))
+			for _, id := range ids {
+				if _, ok := loaded[id]; !ok {
+					misses = append(misses, id)
+				}
+			}
+		}
+	}
+	if len(misses) > 0 {
+		users, err := s.users.ByIDs(ctx, misses)
+		if err != nil {
+			return nil, err
+		}
+		for _, u := range users {
+			if u.ID != 0 {
+				loaded[u.ID] = u
+			}
+		}
+		s.putCachedUsers(ctx, users...)
+	}
+	out := make([]domain.User, 0, len(ids))
+	for _, id := range ids {
+		if u, ok := loaded[id]; ok {
+			out = append(out, u)
+		}
+	}
+	return out, nil
+}
+
+func (s *Service) refreshCachedUsers(ctx context.Context, users ...domain.User) {
+	ids := make([]int64, 0, len(users))
+	for _, u := range users {
+		if u.ID != 0 {
+			ids = append(ids, u.ID)
+		}
+	}
+	s.dropCachedUsers(ctx, ids...)
+	s.putCachedUsers(ctx, users...)
+}
+
+func (s *Service) putCachedUsers(ctx context.Context, users ...domain.User) {
+	if s.cache == nil || len(users) == 0 {
+		return
+	}
+	_ = s.cache.PutMany(ctx, users)
+}
+
+func (s *Service) dropCachedUsers(ctx context.Context, userIDs ...int64) {
+	if s.cache == nil || len(userIDs) == 0 {
+		return
+	}
+	_ = s.cache.Delete(ctx, userIDs)
+}
+
+func uniqueUserIDs(ids []int64, limit int) []int64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]int64, 0, len(ids))
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id == 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
 }
 
 func (s *Service) projectOne(ctx context.Context, viewerUserID int64, user domain.User) (domain.User, error) {

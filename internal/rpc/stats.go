@@ -82,11 +82,21 @@ func (r *Router) onStatsLoadAsyncGraph(_ context.Context, req *tg.StatsLoadAsync
 }
 
 func (r *Router) onStatsGetStoryStats(ctx context.Context, req *tg.StatsGetStoryStatsRequest) (*tg.StatsStoryStats, error) {
-	if req.ID <= 0 || req.ID > domain.MaxMessageBoxID {
-		return nil, messageIDInvalidErr()
+	if req.ID <= 0 || req.ID > domain.MaxStoryID {
+		return nil, storyIDInvalidErr()
 	}
-	if err := r.validateStatsPeer(ctx, req.Peer); err != nil {
+	userID, _, err := r.currentUserID(ctx)
+	if err != nil {
+		return nil, internalErr()
+	}
+	peer, err := r.checkedDomainPeerFromInputPeer(ctx, userID, req.Peer)
+	if err != nil {
 		return nil, err
+	}
+	if r.deps.Stories != nil {
+		if err := r.deps.Stories.CanViewStoryStats(ctx, userID, peer); err != nil {
+			return nil, storyErr(err)
+		}
 	}
 	return &tg.StatsStoryStats{
 		ViewsGraph:              r.emptyStatsGraph("Views"),
@@ -95,16 +105,61 @@ func (r *Router) onStatsGetStoryStats(ctx context.Context, req *tg.StatsGetStory
 }
 
 func (r *Router) onStatsGetStoryPublicForwards(ctx context.Context, req *tg.StatsGetStoryPublicForwardsRequest) (*tg.StatsPublicForwards, error) {
-	if req.ID <= 0 || req.ID > domain.MaxMessageBoxID {
-		return nil, messageIDInvalidErr()
+	if req.ID <= 0 || req.ID > domain.MaxStoryID {
+		return nil, storyIDInvalidErr()
 	}
 	if req.Limit < 0 || req.Limit > maxStatsPublicForwardsLimit || len(req.Offset) > maxStatsOffsetLength {
 		return nil, limitInvalidErr()
 	}
-	if err := r.validateStatsPeer(ctx, req.Peer); err != nil {
+	if err := domain.ValidateStoryInteractionOffset(req.Offset, false); err != nil {
+		return nil, storyErr(err)
+	}
+	userID, _, err := r.currentUserID(ctx)
+	if err != nil {
+		return nil, internalErr()
+	}
+	peer, err := r.checkedDomainPeerFromInputPeer(ctx, userID, req.Peer)
+	if err != nil {
 		return nil, err
 	}
-	return emptyStatsPublicForwards(), nil
+	if r.deps.Stories == nil || userID == 0 {
+		return emptyStatsPublicForwards(), nil
+	}
+	limit := req.Limit
+	if limit <= 0 || limit > domain.MaxStoryInteractionListLimit {
+		limit = domain.MaxStoryInteractionListLimit
+	}
+	storyForwards, err := r.deps.Stories.GetStoryPublicForwards(ctx, userID, domain.StoryPublicForwardListRequest{
+		ViewerUserID: userID,
+		Owner:        peer,
+		StoryID:      req.ID,
+		Offset:       req.Offset,
+		Limit:        limit,
+	})
+	if err != nil {
+		return nil, storyErr(err)
+	}
+	messageForwards := domain.StoryMessageForwardList{}
+	if r.deps.Channels != nil {
+		messageForwards, err = r.deps.Channels.ListStoryMessageForwards(ctx, userID, domain.StoryMessageForwardListRequest{
+			ViewerUserID:  userID,
+			Owner:         peer,
+			StoryID:       req.ID,
+			Offset:        req.Offset,
+			Limit:         limit,
+			ForwardsFirst: true,
+		})
+		if err != nil {
+			return nil, storyErr(err)
+		}
+	}
+	hasMore := storyInteractionSourcesHaveMore(len(storyForwards.Forwards), len(messageForwards.Forwards), limit, storyForwards.NextOffset != "" || messageForwards.NextOffset != "")
+	forwards := mergeStoryInteractionViews(storyForwards.Forwards, messageForwards.Forwards, limit, false, true)
+	return r.tgStatsPublicForwards(ctx, userID, domain.StoryPublicForwardList{
+		Count:      storyForwards.Count + messageForwards.Count,
+		Forwards:   forwards,
+		NextOffset: nextStoryInteractionOffset(forwards, limit, false, true, hasMore),
+	}), nil
 }
 
 func (r *Router) onStatsGetPollStats(ctx context.Context, req *tg.StatsGetPollStatsRequest) (*tg.StatsPollStats, error) {
@@ -208,4 +263,46 @@ func emptyStatsPublicForwards() *tg.StatsPublicForwards {
 		Chats:    []tg.ChatClass{},
 		Users:    []tg.UserClass{},
 	}
+}
+
+func (r *Router) tgStatsPublicForwards(ctx context.Context, viewerUserID int64, list domain.StoryPublicForwardList) *tg.StatsPublicForwards {
+	users := r.domainUsersForIDs(ctx, viewerUserID, storyViewUserIDs(list.Forwards))
+	peerUsers, peerChannels := r.storyPeerObjects(ctx, viewerUserID, storyViewPeers(list.Forwards))
+	users = mergeDomainUsers(users, peerUsers...)
+	out := &tg.StatsPublicForwards{
+		Count:    list.Count,
+		Forwards: tgPublicForwardItems(viewerUserID, list.Forwards),
+		Chats:    tgChannels(viewerUserID, peerChannels),
+		Users:    tgUsersForViewer(viewerUserID, users),
+	}
+	if list.NextOffset != "" {
+		out.SetNextOffset(list.NextOffset)
+	}
+	r.applyStoryMaxIDsToPeerObjects(ctx, viewerUserID, out.Users, out.Chats)
+	return out
+}
+
+func tgPublicForwardItems(viewerUserID int64, views []domain.StoryView) []tg.PublicForwardClass {
+	out := make([]tg.PublicForwardClass, 0, len(views))
+	for _, view := range views {
+		if view.PublicForward != nil {
+			msg := tgChannelMessage(viewerUserID, view.PublicForward.Message)
+			if msg == nil {
+				continue
+			}
+			out = append(out, &tg.PublicForwardMessage{Message: msg})
+			continue
+		}
+		if view.Repost != nil {
+			peer := tgPeer(view.Repost.Owner)
+			if peer == nil {
+				continue
+			}
+			out = append(out, &tg.PublicForwardStory{
+				Peer:  peer,
+				Story: tgStoryItem(*view.Repost),
+			})
+		}
+	}
+	return out
 }

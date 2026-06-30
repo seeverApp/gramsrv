@@ -2,13 +2,17 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/gotd/td/clock"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"go.uber.org/zap/zaptest"
 
 	appmessages "telesrv/internal/app/messages"
+	apppolls "telesrv/internal/app/polls"
+	appstories "telesrv/internal/app/stories"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
 	"telesrv/internal/store/memory"
@@ -16,10 +20,34 @@ import (
 
 // fakeFiles 是 FilesService 的最小测试替身：贴纸文档可解析，上传图片返回固定 Photo。
 type fakeFiles struct {
-	docs      map[int64]domain.Document
-	photos    map[int64]domain.Photo
-	reactions []domain.AvailableReaction
-	sets      map[domain.StickerSetKind][]domain.StickerSet
+	docs               map[int64]domain.Document
+	photos             map[int64]domain.Photo
+	profile            map[fakeProfilePhotoKey]int64
+	reactions          []domain.AvailableReaction
+	effects            []domain.AvailableEffect
+	sets               map[domain.StickerSetKind][]domain.StickerSet
+	profilePhotos      []domain.Photo
+	profilePhotosTotal int
+	lastProfileOffset  int
+	lastProfileLimit   int
+	lastProfileMaxID   int64
+	resolveWebPageFn   func(string) (domain.MessageWebPage, error)
+	lookupWebPageFn    func(string) (domain.MessageWebPage, bool)
+	webPagePreviewOn   bool
+}
+
+type fakeProfilePhotoKey struct {
+	ownerType domain.PeerType
+	ownerID   int64
+	kind      domain.ProfilePhotoKind
+}
+
+func (f *fakeFiles) putPhoto(photo domain.Photo) domain.Photo {
+	if f.photos == nil {
+		f.photos = map[int64]domain.Photo{}
+	}
+	f.photos[photo.ID] = photo
+	return photo
 }
 
 func (f *fakeFiles) SaveFilePart(context.Context, int64, int64, int, []byte) (bool, error) {
@@ -31,8 +59,21 @@ func (f *fakeFiles) SaveBigFilePart(context.Context, int64, int64, int, int, []b
 func (f *fakeFiles) GetFile(context.Context, domain.FileDownloadRequest) (domain.FileChunk, bool, error) {
 	return domain.FileChunk{}, false, nil
 }
+func (f *fakeFiles) CreateEncryptedFileFromUpload(context.Context, domain.UploadedFileRef, int) (domain.EncryptedFileRef, error) {
+	return domain.EncryptedFileRef{ID: 9001, AccessHash: 9002, Size: 16, DCID: 2, KeyFingerprint: 7}, nil
+}
+func (f *fakeFiles) GeoMapTile(lat, long float64, w, h, zoom, scale int) ([]byte, string) {
+	return []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4}, "image/png"
+}
 func (f *fakeFiles) ListAvailableReactions(context.Context) ([]domain.AvailableReaction, error) {
 	return append([]domain.AvailableReaction(nil), f.reactions...), nil
+}
+func (f *fakeFiles) AvailableEffects(context.Context) ([]domain.AvailableEffect, int, error) {
+	hash := 0
+	for _, e := range f.effects {
+		hash = hash*31 + int(e.ID&0x7fffffff)
+	}
+	return append([]domain.AvailableEffect(nil), f.effects...), hash & 0x7fffffff, nil
 }
 func (f *fakeFiles) GetDocuments(_ context.Context, ids []int64) ([]domain.Document, error) {
 	out := make([]domain.Document, 0, len(ids))
@@ -43,7 +84,30 @@ func (f *fakeFiles) GetDocuments(_ context.Context, ids []int64) ([]domain.Docum
 	}
 	return out, nil
 }
-func (f *fakeFiles) ResolveStickerSet(context.Context, domain.StickerSetRef) (domain.StickerSet, []domain.Document, bool, error) {
+func (f *fakeFiles) ResolveStickerSet(_ context.Context, ref domain.StickerSetRef) (domain.StickerSet, []domain.Document, bool, error) {
+	for _, sets := range f.sets {
+		for _, set := range sets {
+			match := false
+			switch ref.Kind {
+			case domain.StickerSetRefByID:
+				match = set.ID == ref.ID
+			case domain.StickerSetRefByShortName:
+				match = set.ShortName == ref.ShortName
+			case domain.StickerSetRefBySystem:
+				match = set.SystemKey == ref.SystemKey
+			}
+			if !match {
+				continue
+			}
+			docs := make([]domain.Document, 0, len(set.DocumentIDs))
+			for _, id := range set.DocumentIDs {
+				if doc, ok := f.docs[id]; ok {
+					docs = append(docs, doc)
+				}
+			}
+			return set, docs, true, nil
+		}
+	}
 	return domain.StickerSet{}, nil, false, nil
 }
 func (f *fakeFiles) ListStickerSets(_ context.Context, kind domain.StickerSetKind) ([]domain.StickerSet, error) {
@@ -51,14 +115,96 @@ func (f *fakeFiles) ListStickerSets(_ context.Context, kind domain.StickerSetKin
 	return append([]domain.StickerSet(nil), sets...), nil
 }
 func (f *fakeFiles) CreatePhotoFromUpload(_ context.Context, _ domain.UploadedFileRef) (domain.Photo, error) {
-	return domain.Photo{ID: 777, AccessHash: 7, DCID: 2, Sizes: []domain.PhotoSize{{Kind: domain.PhotoSizeKindDefault, Type: "x", W: 800, H: 600}}}, nil
+	photo := domain.Photo{ID: 777, AccessHash: 7, DCID: 2, Sizes: []domain.PhotoSize{{Kind: domain.PhotoSizeKindDefault, Type: "x", W: 800, H: 600}}}
+	return f.putPhoto(photo), nil
+}
+func (f *fakeFiles) CreatePhotoFromBytes(_ context.Context, data []byte) (domain.Photo, error) {
+	photo := domain.Photo{
+		ID:         8300 + int64(len(f.photos)),
+		AccessHash: 83,
+		DCID:       2,
+		Sizes:      []domain.PhotoSize{{Kind: domain.PhotoSizeKindDefault, Type: "x", W: 320, H: 200, Size: len(data)}},
+	}
+	return f.putPhoto(photo), nil
 }
 func (f *fakeFiles) CreateAvatarFromUpload(_ context.Context, _ domain.UploadedFileRef) (domain.Photo, error) {
-	return domain.Photo{ID: 778, AccessHash: 7, DCID: 2, Sizes: []domain.PhotoSize{{Kind: domain.PhotoSizeKindDefault, Type: "a", W: 160, H: 160}, {Kind: domain.PhotoSizeKindDefault, Type: "c", W: 640, H: 640}}}, nil
+	photo := domain.Photo{ID: 778, AccessHash: 7, DCID: 2, Sizes: []domain.PhotoSize{{Kind: domain.PhotoSizeKindDefault, Type: "a", W: 160, H: 160}, {Kind: domain.PhotoSizeKindDefault, Type: "c", W: 640, H: 640}}}
+	return f.putPhoto(photo), nil
+}
+func (f *fakeFiles) CreateAvatarVideoFromUpload(_ context.Context, _ domain.UploadedFileRef, videoStartTs float64) (domain.Photo, error) {
+	photo := domain.Photo{ID: 779, AccessHash: 7, DCID: 2, Sizes: append(fakeAvatarStaticSizes(), domain.PhotoSize{Kind: domain.PhotoSizeKindVideo, Type: "u", W: 640, H: 640, Size: 1024, VideoStartTs: videoStartTs})}
+	return f.putPhoto(photo), nil
+}
+func (f *fakeFiles) CreateAvatarVideoMarkupFromUpload(_ context.Context, _ domain.UploadedFileRef, videoStartTs float64, markup domain.PhotoSize) (domain.Photo, error) {
+	sizes := append(fakeAvatarStaticSizes(), domain.PhotoSize{Kind: domain.PhotoSizeKindVideo, Type: "u", W: 640, H: 640, Size: 1024, VideoStartTs: videoStartTs})
+	sizes = append(sizes, markup)
+	photo := domain.Photo{ID: 781, AccessHash: 7, DCID: 2, Sizes: sizes}
+	return f.putPhoto(photo), nil
+}
+func (f *fakeFiles) CreateAvatarMarkup(_ context.Context, size domain.PhotoSize) (domain.Photo, error) {
+	photo := domain.Photo{ID: 780, AccessHash: 7, DCID: 2, Sizes: append(fakeAvatarStaticSizes(), size)}
+	return f.putPhoto(photo), nil
+}
+
+func fakeAvatarStaticSizes() []domain.PhotoSize {
+	return []domain.PhotoSize{
+		{Kind: domain.PhotoSizeKindDefault, Type: "a", W: 160, H: 160, Size: 1024},
+		{Kind: domain.PhotoSizeKindDefault, Type: "c", W: 640, H: 640, Size: 1024},
+	}
 }
 func (f *fakeFiles) CreateDocumentFromUpload(_ context.Context, _ domain.UploadedFileRef, spec domain.DocumentSpec) (domain.Document, error) {
 	return domain.Document{ID: 888, AccessHash: 8, DCID: 2, MimeType: spec.MimeType, Attributes: spec.Attributes}, nil
 }
+func (f *fakeFiles) CreateDocumentFromBytes(_ context.Context, data []byte, spec domain.DocumentSpec) (domain.Document, error) {
+	doc := domain.Document{
+		ID:         8400 + int64(len(f.docs)),
+		AccessHash: 84,
+		DCID:       2,
+		MimeType:   spec.MimeType,
+		Size:       int64(len(data)),
+		Attributes: append([]domain.DocumentAttribute(nil), spec.Attributes...),
+	}
+	if f.docs == nil {
+		f.docs = map[int64]domain.Document{}
+	}
+	f.docs[doc.ID] = doc
+	return doc, nil
+}
+func (f *fakeFiles) CreatePhotoFromURL(_ context.Context, rawURL string) (domain.Photo, error) {
+	if rawURL == "" {
+		return domain.Photo{}, domain.ErrPhotoInvalid
+	}
+	return f.putPhoto(domain.Photo{ID: 9100, AccessHash: 91, DCID: 2, Sizes: []domain.PhotoSize{{Kind: domain.PhotoSizeKindDefault, Type: "x", W: 320, H: 200}}}), nil
+}
+
+func (f *fakeFiles) ResolveWebPage(_ context.Context, rawURL string) (domain.MessageWebPage, error) {
+	if f.resolveWebPageFn != nil {
+		return f.resolveWebPageFn(rawURL)
+	}
+	return domain.MessageWebPage{}, errors.New("web page preview unavailable")
+}
+
+func (f *fakeFiles) WebPagePreviewEnabled() bool { return f.webPagePreviewOn }
+
+func (f *fakeFiles) LookupWebPage(_ context.Context, rawURL string) (domain.MessageWebPage, bool) {
+	if f.lookupWebPageFn != nil {
+		return f.lookupWebPageFn(rawURL)
+	}
+	return domain.MessageWebPage{}, false
+}
+
+func (f *fakeFiles) CreateDocumentFromURL(_ context.Context, rawURL string) (domain.Document, error) {
+	if rawURL == "" {
+		return domain.Document{}, domain.ErrDocumentInvalid
+	}
+	doc := domain.Document{ID: 9200, AccessHash: 92, DCID: 2, MimeType: "image/jpeg", Attributes: []domain.DocumentAttribute{{Kind: domain.DocAttrFilename, FileName: "ext.jpg"}}}
+	if f.docs == nil {
+		f.docs = map[int64]domain.Document{}
+	}
+	f.docs[doc.ID] = doc
+	return doc, nil
+}
+
 func (f *fakeFiles) GetPhoto(_ context.Context, id int64) (domain.Photo, bool, error) {
 	p, ok := f.photos[id]
 	return p, ok, nil
@@ -67,29 +213,76 @@ func (f *fakeFiles) GetDocument(_ context.Context, id int64) (domain.Document, b
 	d, ok := f.docs[id]
 	return d, ok, nil
 }
-func (f *fakeFiles) UploadProfilePhoto(context.Context, domain.PeerType, int64, domain.UploadedFileRef, int) (domain.Photo, error) {
-	return domain.Photo{}, nil
+func (f *fakeFiles) UploadProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID int64, file domain.UploadedFileRef, date int) (domain.Photo, error) {
+	return f.UploadProfilePhotoKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile, file, date)
 }
-func (f *fakeFiles) UploadProfilePhotoKind(context.Context, domain.PeerType, int64, domain.ProfilePhotoKind, domain.UploadedFileRef, int) (domain.Photo, error) {
-	return domain.Photo{}, nil
+func (f *fakeFiles) UploadProfilePhotoKind(_ context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, _ domain.UploadedFileRef, _ int) (domain.Photo, error) {
+	photo, _ := f.CreateAvatarFromUpload(context.Background(), domain.UploadedFileRef{})
+	if f.profile == nil {
+		f.profile = map[fakeProfilePhotoKey]int64{}
+	}
+	f.profile[fakeProfilePhotoKey{ownerType: ownerType, ownerID: ownerID, kind: kind}] = photo.ID
+	return photo, nil
 }
-func (f *fakeFiles) SetCurrentProfilePhoto(context.Context, domain.PeerType, int64, int64, int) (domain.Photo, bool, error) {
-	return domain.Photo{}, false, nil
+func (f *fakeFiles) SetCurrentProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID, photoID int64, date int) (domain.Photo, bool, error) {
+	return f.SetCurrentProfilePhotoKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile, photoID, date)
 }
-func (f *fakeFiles) SetCurrentProfilePhotoKind(context.Context, domain.PeerType, int64, domain.ProfilePhotoKind, int64, int) (domain.Photo, bool, error) {
-	return domain.Photo{}, false, nil
+func (f *fakeFiles) SetCurrentProfilePhotoKind(_ context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, _ int) (domain.Photo, bool, error) {
+	photo, ok := f.photos[photoID]
+	if !ok {
+		return domain.Photo{}, false, nil
+	}
+	if f.profile == nil {
+		f.profile = map[fakeProfilePhotoKey]int64{}
+	}
+	f.profile[fakeProfilePhotoKey{ownerType: ownerType, ownerID: ownerID, kind: kind}] = photoID
+	return photo, true, nil
 }
-func (f *fakeFiles) CurrentProfilePhoto(context.Context, domain.PeerType, int64) (domain.Photo, bool, error) {
-	return domain.Photo{}, false, nil
+func (f *fakeFiles) CurrentProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID int64) (domain.Photo, bool, error) {
+	return f.CurrentProfilePhotoKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile)
 }
-func (f *fakeFiles) CurrentProfilePhotoKind(context.Context, domain.PeerType, int64, domain.ProfilePhotoKind) (domain.Photo, bool, error) {
-	return domain.Photo{}, false, nil
+func (f *fakeFiles) CurrentProfilePhotoKind(_ context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind) (domain.Photo, bool, error) {
+	photoID := f.profile[fakeProfilePhotoKey{ownerType: ownerType, ownerID: ownerID, kind: kind}]
+	if photoID == 0 {
+		return domain.Photo{}, false, nil
+	}
+	photo, ok := f.photos[photoID]
+	return photo, ok, nil
 }
-func (f *fakeFiles) GetProfilePhotos(context.Context, domain.PeerType, int64, int, int, int64) ([]domain.Photo, int, error) {
-	return nil, 0, nil
+func (f *fakeFiles) CurrentProfilePhotos(ctx context.Context, ownerType domain.PeerType, ownerIDs []int64) (map[int64]domain.ProfilePhotoRef, error) {
+	return f.CurrentProfilePhotosKind(ctx, ownerType, ownerIDs, domain.ProfilePhotoKindProfile)
 }
-func (f *fakeFiles) GetProfilePhotosKind(context.Context, domain.PeerType, int64, domain.ProfilePhotoKind, int, int, int64) ([]domain.Photo, int, error) {
-	return nil, 0, nil
+func (f *fakeFiles) CurrentProfilePhotosKind(_ context.Context, ownerType domain.PeerType, ownerIDs []int64, kind domain.ProfilePhotoKind) (map[int64]domain.ProfilePhotoRef, error) {
+	out := make(map[int64]domain.ProfilePhotoRef, len(ownerIDs))
+	for _, ownerID := range ownerIDs {
+		photoID := f.profile[fakeProfilePhotoKey{ownerType: ownerType, ownerID: ownerID, kind: kind}]
+		if photoID == 0 {
+			continue
+		}
+		photo, ok := f.photos[photoID]
+		if !ok {
+			continue
+		}
+		out[ownerID] = domain.ProfilePhotoRef{
+			PhotoID:  photo.ID,
+			DCID:     photo.DCID,
+			Stripped: domain.StrippedFromSizes(photo.Sizes),
+			HasVideo: domain.PhotoHasVideo(photo.Sizes),
+		}
+	}
+	return out, nil
+}
+func (f *fakeFiles) GetProfilePhotos(_ context.Context, _ domain.PeerType, _ int64, offset, limit int, maxID int64) ([]domain.Photo, int, error) {
+	f.lastProfileOffset = offset
+	f.lastProfileLimit = limit
+	f.lastProfileMaxID = maxID
+	return append([]domain.Photo(nil), f.profilePhotos...), f.profilePhotosTotal, nil
+}
+func (f *fakeFiles) GetProfilePhotosKind(_ context.Context, _ domain.PeerType, _ int64, _ domain.ProfilePhotoKind, offset, limit int, maxID int64) ([]domain.Photo, int, error) {
+	f.lastProfileOffset = offset
+	f.lastProfileLimit = limit
+	f.lastProfileMaxID = maxID
+	return append([]domain.Photo(nil), f.profilePhotos...), f.profilePhotosTotal, nil
 }
 func (f *fakeFiles) DeleteProfilePhotos(context.Context, domain.PeerType, int64, []int64) (int, error) {
 	return 0, nil
@@ -106,6 +299,8 @@ func newMediaTestRouter(t *testing.T) (*Router, domain.User, domain.User) {
 	friend, _ := userStore.Create(ctx, domain.User{AccessHash: 12, Phone: "15550009002", FirstName: "Friend"})
 	dialogStore := memory.NewDialogStore()
 	messageStore := memory.NewMessageStore(dialogStore)
+	pollStore := memory.NewPollStore()
+	messageStore.AttachPollStore(pollStore)
 	files := &fakeFiles{
 		docs: map[int64]domain.Document{
 			555: {
@@ -122,6 +317,7 @@ func newMediaTestRouter(t *testing.T) (*Router, domain.User, domain.User) {
 		Users:    appusers.NewService(userStore),
 		Messages: appmessages.NewService(messageStore, dialogStore),
 		Files:    files,
+		Polls:    apppolls.NewService(pollStore),
 		Sessions: &captureSessions{},
 	}, zaptest.NewLogger(t), clock.System)
 	return r, owner, friend
@@ -141,9 +337,41 @@ func newMessageFromUpdates(t *testing.T, updates tg.UpdatesClass) *tg.Message {
 			}
 			return msg
 		}
+		if nm, ok := u.(*tg.UpdateNewChannelMessage); ok {
+			msg, ok := nm.Message.(*tg.Message)
+			if !ok {
+				t.Fatalf("expected channel *tg.Message, got %T", nm.Message)
+			}
+			return msg
+		}
 	}
-	t.Fatal("no UpdateNewMessage found")
+	t.Fatal("no new message update found")
 	return nil
+}
+
+func assertMessageMediaStory(t *testing.T, media tg.MessageMediaClass, wantUserID int64, wantStoryID int, wantEmbedded bool) {
+	t.Helper()
+	storyMedia, ok := media.(*tg.MessageMediaStory)
+	if !ok {
+		t.Fatalf("message media = %T, want *tg.MessageMediaStory", media)
+	}
+	peer, ok := storyMedia.Peer.(*tg.PeerUser)
+	if !ok || peer.UserID != wantUserID {
+		t.Fatalf("story media peer = %T %+v, want user %d", storyMedia.Peer, storyMedia.Peer, wantUserID)
+	}
+	if storyMedia.ID != wantStoryID {
+		t.Fatalf("story media id = %d, want %d", storyMedia.ID, wantStoryID)
+	}
+	story, hasStory := storyMedia.GetStory()
+	if hasStory != wantEmbedded {
+		t.Fatalf("story media embedded = %v, want %v", hasStory, wantEmbedded)
+	}
+	if wantEmbedded {
+		item, ok := story.(*tg.StoryItem)
+		if !ok || item.ID != wantStoryID {
+			t.Fatalf("embedded story = %T %+v, want story id %d", story, story, wantStoryID)
+		}
+	}
 }
 
 func TestSendMediaPrivateSticker(t *testing.T) {
@@ -211,6 +439,145 @@ func TestSendMediaPrivateUploadedPhoto(t *testing.T) {
 	}
 	if photo.ID != 777 {
 		t.Errorf("photo id = %d, want 777", photo.ID)
+	}
+}
+
+func TestSendMediaInputMediaStoryStoresMessageMediaStory(t *testing.T) {
+	ctx := context.Background()
+	r, owner, friend := newMediaTestRouter(t)
+	storyStore := memory.NewStoryStore()
+	r.deps.Stories = appstories.NewService(storyStore)
+	ownerPeer := domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID}
+	if _, err := storyStore.UpsertStory(ctx, domain.UpsertStoryRequest{Story: domain.Story{
+		Owner:      ownerPeer,
+		ID:         7,
+		Date:       1700000001,
+		ExpireDate: 1700003600,
+		Public:     true,
+		Caption:    "story source",
+		Media:      &domain.MessageMedia{Kind: domain.MessageMediaKindPhoto, Photo: &domain.Photo{ID: 771, AccessHash: 77, DCID: 2}},
+	}}); err != nil {
+		t.Fatalf("upsert story: %v", err)
+	}
+
+	updates, err := r.onMessagesSendMedia(WithUserID(ctx, owner.ID), &tg.MessagesSendMediaRequest{
+		Peer:     &tg.InputPeerUser{UserID: friend.ID, AccessHash: friend.AccessHash},
+		Media:    &tg.InputMediaStory{Peer: &tg.InputPeerSelf{}, ID: 7},
+		RandomID: 10021,
+	})
+	if err != nil {
+		t.Fatalf("sendMedia story: %v", err)
+	}
+	msg := newMessageFromUpdates(t, updates)
+	assertMessageMediaStory(t, msg.Media, owner.ID, 7, true)
+
+	got, err := r.onMessagesGetMessages(WithUserID(ctx, owner.ID), []tg.InputMessageClass{&tg.InputMessageID{ID: msg.ID}})
+	if err != nil {
+		t.Fatalf("get story message: %v", err)
+	}
+	box, ok := got.(*tg.MessagesMessages)
+	if !ok || len(box.Messages) != 1 {
+		t.Fatalf("get story message = %T %+v, want one messages.messages", got, got)
+	}
+	stored, ok := box.Messages[0].(*tg.Message)
+	if !ok {
+		t.Fatalf("stored story message = %T, want *tg.Message", box.Messages[0])
+	}
+	assertMessageMediaStory(t, stored.Media, owner.ID, 7, true)
+}
+
+func TestSendMediaInputMediaStoryRejectsNoForwardsSource(t *testing.T) {
+	ctx := context.Background()
+	r, owner, friend := newMediaTestRouter(t)
+	storyStore := memory.NewStoryStore()
+	r.deps.Stories = appstories.NewService(storyStore)
+	ownerPeer := domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID}
+	if _, err := storyStore.UpsertStory(ctx, domain.UpsertStoryRequest{Story: domain.Story{
+		Owner:      ownerPeer,
+		ID:         8,
+		Date:       1700000002,
+		ExpireDate: 1700003600,
+		Public:     true,
+		NoForwards: true,
+	}}); err != nil {
+		t.Fatalf("upsert noforwards story: %v", err)
+	}
+
+	_, err := r.onMessagesSendMedia(WithUserID(ctx, owner.ID), &tg.MessagesSendMediaRequest{
+		Peer:     &tg.InputPeerUser{UserID: friend.ID, AccessHash: friend.AccessHash},
+		Media:    &tg.InputMediaStory{Peer: &tg.InputPeerSelf{}, ID: 8},
+		RandomID: 10022,
+	})
+	if err == nil || !tgerr.Is(err, "CHAT_FORWARDS_RESTRICTED") {
+		t.Fatalf("sendMedia noforwards story err = %v, want CHAT_FORWARDS_RESTRICTED", err)
+	}
+}
+
+func TestSendMediaPrivateContact(t *testing.T) {
+	ctx := context.Background()
+	r, owner, friend := newMediaTestRouter(t)
+	r.deps.Files = nil
+
+	updates, err := r.onMessagesSendMedia(WithUserID(ctx, owner.ID), &tg.MessagesSendMediaRequest{
+		Peer: &tg.InputPeerUser{UserID: friend.ID, AccessHash: friend.AccessHash},
+		Media: &tg.InputMediaContact{
+			PhoneNumber: "+1 (555) 000-9002",
+			FirstName:   "Bob",
+			LastName:    "Shared",
+			Vcard:       "BEGIN:VCARD\nFN:Bob Shared\nEND:VCARD",
+		},
+		RandomID: 1003,
+	})
+	if err != nil {
+		t.Fatalf("sendMedia contact: %v", err)
+	}
+	upd := updates.(*tg.Updates)
+	msg := newMessageFromUpdates(t, updates)
+	media, ok := msg.Media.(*tg.MessageMediaContact)
+	if !ok {
+		t.Fatalf("expected MessageMediaContact, got %T", msg.Media)
+	}
+	if media.PhoneNumber != "+1 (555) 000-9002" || media.FirstName != "Bob" || media.LastName != "Shared" || media.Vcard == "" {
+		t.Fatalf("contact media = %+v, want preserved contact payload", media)
+	}
+	if media.UserID != friend.ID {
+		t.Fatalf("contact user_id = %d, want %d", media.UserID, friend.ID)
+	}
+	foundFriend := false
+	for _, u := range upd.Users {
+		if got, ok := u.(*tg.User); ok && got.ID == friend.ID {
+			foundFriend = true
+		}
+	}
+	if !foundFriend {
+		t.Fatalf("updates users = %#v, want shared contact user", upd.Users)
+	}
+}
+
+func TestUploadMediaContactUnregistered(t *testing.T) {
+	ctx := context.Background()
+	r, owner, _ := newMediaTestRouter(t)
+
+	media, err := r.onMessagesUploadMedia(WithUserID(ctx, owner.ID), &tg.MessagesUploadMediaRequest{
+		Peer: &tg.InputPeerEmpty{},
+		Media: &tg.InputMediaContact{
+			PhoneNumber: "+19990000000",
+			FirstName:   "External",
+			LastName:    "Contact",
+		},
+	})
+	if err != nil {
+		t.Fatalf("uploadMedia contact: %v", err)
+	}
+	contact, ok := media.(*tg.MessageMediaContact)
+	if !ok {
+		t.Fatalf("expected MessageMediaContact, got %T", media)
+	}
+	if contact.UserID != 0 {
+		t.Fatalf("unregistered contact user_id = %d, want 0", contact.UserID)
+	}
+	if contact.FirstName != "External" || contact.LastName != "Contact" {
+		t.Fatalf("contact media = %+v, want external contact", contact)
 	}
 }
 

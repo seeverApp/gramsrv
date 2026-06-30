@@ -10,6 +10,7 @@ import (
 
 	"go.uber.org/zap/zaptest"
 
+	"github.com/gotd/log/logzap"
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/exchange"
@@ -61,27 +62,34 @@ func startTestServer(t *testing.T, opts Options) (addr string, pub exchange.Publ
 // 返回连接、握手结果与 client 端 cipher。连接通过 t.Cleanup 自动关闭。
 func dialHandshake(t *testing.T, addr string, dc int, pub exchange.PublicKey) (transport.Conn, exchange.ClientExchangeResult, crypto.Cipher) {
 	t.Helper()
-	raw, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	conn, err := transport.Intermediate.Handshake(raw)
-	if err != nil {
-		t.Fatalf("transport handshake: %v", err)
-	}
-	t.Cleanup(func() { _ = conn.Close() })
+	conn := dialTransportOnly(t, addr)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	auth, err := exchange.NewExchanger(conn, dc).
 		WithRand(rand.Reader).
-		WithLogger(zaptest.NewLogger(t).Named("client")).
+		WithLogger(logzap.New(zaptest.NewLogger(t).Named("client"))).
 		Client([]exchange.PublicKey{pub}).
 		Run(ctx)
 	if err != nil {
 		t.Fatalf("client exchange: %v", err)
 	}
 	return conn, auth, crypto.NewClientCipher(rand.Reader)
+}
+
+func dialTransportOnly(t *testing.T, addr string) transport.Conn {
+	t.Helper()
+	raw, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	conn, err := transport.Intermediate.Handshake(raw)
+	if err != nil {
+		_ = raw.Close()
+		t.Fatalf("transport handshake: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
 }
 
 // sendEncrypted 用 client cipher 加密并发送一条带 msgID 的消息。

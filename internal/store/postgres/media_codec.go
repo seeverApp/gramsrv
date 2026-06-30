@@ -43,6 +43,56 @@ func decodeMessageMedia(s string) (*domain.MessageMedia, error) {
 	return &m, nil
 }
 
+// encodeReplyMarkup 把 inline keyboard 快照序列化为 JSONB；空 markup 序列化为 "{}"。
+// callback data 是 []byte，json.Marshal 自动 base64（保证经 JSONB 字节级 round-trip）。
+func encodeReplyMarkup(m *domain.MessageReplyMarkup) ([]byte, error) {
+	if m.IsZero() {
+		return []byte("{}"), nil
+	}
+	return json.Marshal(m)
+}
+
+// decodeReplyMarkup 把消息行的 reply_markup JSONB 文本还原为 *MessageReplyMarkup；
+// 空载荷返回 nil。
+func decodeReplyMarkup(s string) (*domain.MessageReplyMarkup, error) {
+	if s == "" || s == "{}" || s == "null" {
+		return nil, nil
+	}
+	var m domain.MessageReplyMarkup
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		return nil, err
+	}
+	if m.IsZero() {
+		return nil, nil
+	}
+	return &m, nil
+}
+
+// encodeRichMessage 把富文本消息快照序列化为 JSONB；空载荷序列化为 "{}"。
+// Blocks 是 []byte（不透明 TL），json.Marshal 自动 base64，保证 JSONB 字节级 round-trip。
+func encodeRichMessage(m *domain.MessageRichMessage) ([]byte, error) {
+	if m.IsZero() {
+		return []byte("{}"), nil
+	}
+	return json.Marshal(m)
+}
+
+// decodeRichMessage 把消息行的 rich_message JSONB 文本还原为 *MessageRichMessage；
+// 空载荷返回 nil。
+func decodeRichMessage(s string) (*domain.MessageRichMessage, error) {
+	if s == "" || s == "{}" || s == "null" {
+		return nil, nil
+	}
+	var m domain.MessageRichMessage
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		return nil, err
+	}
+	if m.IsZero() {
+		return nil, nil
+	}
+	return &m, nil
+}
+
 func decodePhotoSizes(s string) ([]domain.PhotoSize, error) {
 	if s == "" || s == "[]" || s == "null" {
 		return nil, nil

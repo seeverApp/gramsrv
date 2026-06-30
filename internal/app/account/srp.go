@@ -4,11 +4,8 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/sha512"
 	"encoding/hex"
 	"math/big"
-
-	"golang.org/x/crypto/pbkdf2"
 
 	"telesrv/internal/domain"
 )
@@ -158,20 +155,6 @@ func hashBytes(parts ...[]byte) []byte {
 		_, _ = h.Write(part)
 	}
 	return h.Sum(nil)
-}
-
-func passwordDigest(algo domain.PasswordKDFAlgo, password []byte) []byte {
-	hash1 := hashBytes(algo.Salt1, password, algo.Salt1)
-	hash2 := hashBytes(algo.Salt2, hash1, algo.Salt2)
-	hash3 := pbkdf2.Key(hash2, algo.Salt1, 100000, 64, sha512.New)
-	return hashBytes(algo.Salt2, hash3, algo.Salt2)
-}
-
-func verifierForPassword(algo domain.PasswordKDFAlgo, password []byte) []byte {
-	p := new(big.Int).SetBytes(algo.P)
-	g := big.NewInt(int64(algo.G))
-	x := new(big.Int).SetBytes(passwordDigest(algo, password))
-	return padToHash(new(big.Int).Exp(g, x, p).Bytes())
 }
 
 func padToHash(in []byte) []byte {

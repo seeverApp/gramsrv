@@ -4,11 +4,375 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	appchannels "telesrv/internal/app/channels"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
+
+type countingDialogStore struct {
+	store.DialogStore
+	listByUserCalls    int
+	listByPeersCalls   int
+	listByPeersBatches [][]domain.Peer
+	listDraftsCalls    int
+}
+
+func (s *countingDialogStore) ListByUser(ctx context.Context, userID int64, filter domain.DialogFilter) (domain.DialogList, error) {
+	s.listByUserCalls++
+	return s.DialogStore.ListByUser(ctx, userID, filter)
+}
+
+func (s *countingDialogStore) ListByPeers(ctx context.Context, userID int64, peers []domain.Peer) (domain.DialogList, error) {
+	s.listByPeersCalls++
+	s.listByPeersBatches = append(s.listByPeersBatches, append([]domain.Peer(nil), peers...))
+	return s.DialogStore.ListByPeers(ctx, userID, peers)
+}
+
+func (s *countingDialogStore) ListDrafts(ctx context.Context, userID int64, limit int) ([]domain.DialogDraft, error) {
+	s.listDraftsCalls++
+	return s.DialogStore.ListDrafts(ctx, userID, limit)
+}
+
+type fakeDialogReadModelVersions struct {
+	hashes map[store.ReadModelKey]int64
+}
+
+func (f *fakeDialogReadModelVersions) ReadModelHash(_ context.Context, model string, ownerUserID int64, peerType domain.PeerType, peerID int64) (int64, bool, error) {
+	hash := f.hashes[store.ReadModelKey{Model: model, OwnerUserID: ownerUserID, PeerType: peerType, PeerID: peerID}]
+	return hash, hash != 0, nil
+}
+
+func (f *fakeDialogReadModelVersions) ReadModelHashes(_ context.Context, keys []store.ReadModelKey) (map[store.ReadModelKey]int64, error) {
+	out := make(map[store.ReadModelKey]int64, len(keys))
+	for _, key := range keys {
+		if hash := f.hashes[key]; hash != 0 {
+			out[key] = hash
+		}
+	}
+	return out, nil
+}
+
+type countingDialogChannelStore struct {
+	*memory.ChannelStore
+	getChannelCalls        int
+	getChannelsCalls       int
+	getChannelDialogsCalls int
+}
+
+func (s *countingDialogChannelStore) GetChannel(ctx context.Context, viewerUserID, channelID int64) (domain.ChannelView, error) {
+	s.getChannelCalls++
+	return s.ChannelStore.GetChannel(ctx, viewerUserID, channelID)
+}
+
+func (s *countingDialogChannelStore) GetChannels(ctx context.Context, viewerUserID int64, channelIDs []int64) ([]domain.ChannelView, error) {
+	s.getChannelsCalls++
+	return s.ChannelStore.GetChannels(ctx, viewerUserID, channelIDs)
+}
+
+func (s *countingDialogChannelStore) GetChannelDialogs(ctx context.Context, viewerUserID int64, channelIDs []int64) (domain.ChannelDialogList, error) {
+	s.getChannelDialogsCalls++
+	return s.ChannelStore.GetChannelDialogs(ctx, viewerUserID, channelIDs)
+}
+
+func TestGetDialogsHashUsesWarmStableHashCacheAndInvalidatesOnWrite(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	peer := domain.Peer{Type: domain.PeerTypeUser, ID: 1002}
+	base := memory.NewDialogStore()
+	if err := base.SaveList(ctx, ownerID, domain.DialogList{
+		Dialogs: []domain.Dialog{{
+			Peer:           peer,
+			TopMessage:     7,
+			TopMessageDate: 70,
+			UnreadCount:    1,
+		}},
+		Messages: []domain.Message{{
+			ID:          7,
+			OwnerUserID: ownerID,
+			Peer:        peer,
+			From:        peer,
+			Date:        70,
+			Body:        "cached top",
+		}},
+		Users: []domain.User{{ID: peer.ID, AccessHash: 22, FirstName: "Peer"}},
+	}); err != nil {
+		t.Fatalf("SaveList: %v", err)
+	}
+	counting := &countingDialogStore{DialogStore: base}
+	dialogs := NewService(counting)
+	filter := domain.DialogFilter{ExcludePinned: true, Limit: 10}
+	list, err := dialogs.GetDialogs(ctx, ownerID, filter)
+	if err != nil {
+		t.Fatalf("GetDialogs warm: %v", err)
+	}
+	if list.Hash == 0 {
+		t.Fatal("warmed list hash = 0, want stable non-zero hash")
+	}
+
+	check, err := dialogs.GetDialogsHash(ctx, ownerID, domain.DialogFilter{ExcludePinned: true, Limit: 10, Hash: list.Hash})
+	if err != nil {
+		t.Fatalf("GetDialogsHash: %v", err)
+	}
+	if !check.Known || !check.Matched || check.Count != list.Count {
+		t.Fatalf("hash check = %+v, want known matched count %d", check, list.Count)
+	}
+	if counting.listByUserCalls != 1 {
+		t.Fatalf("ListByUser calls = %d, want only warm load", counting.listByUserCalls)
+	}
+
+	if _, err := dialogs.SaveDraft(ctx, ownerID, domain.DialogDraft{Peer: peer, Date: 71, Message: "new draft"}); err != nil {
+		t.Fatalf("SaveDraft: %v", err)
+	}
+	check, err = dialogs.GetDialogsHash(ctx, ownerID, domain.DialogFilter{ExcludePinned: true, Limit: 10, Hash: list.Hash})
+	if err != nil {
+		t.Fatalf("GetDialogsHash after invalidation: %v", err)
+	}
+	if check.Known {
+		t.Fatalf("hash check after invalidation = %+v, want unknown", check)
+	}
+}
+
+func TestSaveDraftNoopsWhenOnlyDateChanges(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	peer := domain.Peer{Type: domain.PeerTypeUser, ID: 1002}
+	base := memory.NewDialogStore()
+	dialogs := NewService(base)
+
+	changed, err := dialogs.SaveDraft(ctx, ownerID, domain.DialogDraft{Peer: peer, Date: 71, Message: "draft"})
+	if err != nil {
+		t.Fatalf("SaveDraft first: %v", err)
+	}
+	if !changed {
+		t.Fatalf("SaveDraft first changed = false, want true")
+	}
+	changed, err = dialogs.SaveDraft(ctx, ownerID, domain.DialogDraft{Peer: peer, Date: 72, Message: "draft"})
+	if err != nil {
+		t.Fatalf("SaveDraft same content: %v", err)
+	}
+	if changed {
+		t.Fatalf("SaveDraft same content changed = true, want false")
+	}
+	got, found, err := base.GetDraft(ctx, ownerID, peer, 0)
+	if err != nil || !found {
+		t.Fatalf("GetDraft = found %v err %v, want stored draft", found, err)
+	}
+	if got.Date != 71 {
+		t.Fatalf("draft date = %d, want original 71", got.Date)
+	}
+
+	changed, err = dialogs.SaveDraft(ctx, ownerID, domain.DialogDraft{Peer: peer, Date: 73, Message: "updated"})
+	if err != nil {
+		t.Fatalf("SaveDraft updated: %v", err)
+	}
+	if !changed {
+		t.Fatalf("SaveDraft updated changed = false, want true")
+	}
+}
+
+func TestGetPeerDialogsCachesPrivatePeerReadModelByHash(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	peer := domain.Peer{Type: domain.PeerTypeUser, ID: 1002}
+	base := memory.NewDialogStore()
+	if err := base.SaveList(ctx, ownerID, domain.DialogList{
+		Dialogs: []domain.Dialog{{
+			Peer:           peer,
+			TopMessage:     7,
+			TopMessageDate: 70,
+			UnreadCount:    1,
+		}},
+		Messages: []domain.Message{{
+			ID:          7,
+			OwnerUserID: ownerID,
+			Peer:        peer,
+			From:        peer,
+			Date:        70,
+			Body:        "cached top",
+		}},
+		Users: []domain.User{{ID: peer.ID, AccessHash: 22, FirstName: "Peer"}},
+	}); err != nil {
+		t.Fatalf("SaveList: %v", err)
+	}
+	if err := base.SaveDraft(ctx, ownerID, domain.DialogDraft{Peer: peer, Date: 71, Message: "draft"}); err != nil {
+		t.Fatalf("SaveDraft: %v", err)
+	}
+	counting := &countingDialogStore{DialogStore: base}
+	versions := &fakeDialogReadModelVersions{hashes: map[store.ReadModelKey]int64{
+		{Model: dialogLightReadModel, OwnerUserID: ownerID, PeerType: peer.Type, PeerID: peer.ID}: 101,
+	}}
+	dialogs := NewService(counting).Configure(WithReadModelVersions(versions))
+
+	first, err := dialogs.GetPeerDialogs(ctx, ownerID, []domain.Peer{peer})
+	if err != nil {
+		t.Fatalf("first GetPeerDialogs: %v", err)
+	}
+	if len(first.Dialogs) != 1 || first.Dialogs[0].Draft == nil || first.Dialogs[0].Draft.Message != "draft" {
+		t.Fatalf("first dialog = %+v, want cached draft attached", first.Dialogs)
+	}
+	second, err := dialogs.GetPeerDialogs(ctx, ownerID, []domain.Peer{peer})
+	if err != nil {
+		t.Fatalf("second GetPeerDialogs: %v", err)
+	}
+	if len(second.Dialogs) != 1 || second.Dialogs[0].TopMessage != 7 {
+		t.Fatalf("second dialog = %+v, want cached top message", second.Dialogs)
+	}
+	if counting.listByPeersCalls != 1 || counting.listDraftsCalls != 1 {
+		t.Fatalf("store calls ListByPeers/ListDrafts = %d/%d, want 1/1 after cache hit", counting.listByPeersCalls, counting.listDraftsCalls)
+	}
+
+	versions.hashes[store.ReadModelKey{Model: dialogLightReadModel, OwnerUserID: ownerID, PeerType: peer.Type, PeerID: peer.ID}] = 202
+	if _, err := dialogs.GetPeerDialogs(ctx, ownerID, []domain.Peer{peer}); err != nil {
+		t.Fatalf("third GetPeerDialogs after hash bump: %v", err)
+	}
+	if counting.listByPeersCalls != 2 || counting.listDraftsCalls != 2 {
+		t.Fatalf("store calls after hash bump = %d/%d, want 2/2", counting.listByPeersCalls, counting.listDraftsCalls)
+	}
+
+	if _, err := dialogs.SaveDraft(ctx, ownerID, domain.DialogDraft{Peer: peer, Date: 72, Message: "new draft"}); err != nil {
+		t.Fatalf("service SaveDraft: %v", err)
+	}
+	if _, err := dialogs.GetPeerDialogs(ctx, ownerID, []domain.Peer{peer}); err != nil {
+		t.Fatalf("GetPeerDialogs after service invalidation: %v", err)
+	}
+	if counting.listByPeersCalls != 3 || counting.listDraftsCalls != 3 {
+		t.Fatalf("store calls after explicit invalidation = %d/%d, want 3/3", counting.listByPeersCalls, counting.listDraftsCalls)
+	}
+}
+
+func TestGetPeerDialogsReloadsOnlyReadModelCacheMisses(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	firstPeer := domain.Peer{Type: domain.PeerTypeUser, ID: 1002}
+	secondPeer := domain.Peer{Type: domain.PeerTypeUser, ID: 1003}
+	base := memory.NewDialogStore()
+	if err := base.SaveList(ctx, ownerID, domain.DialogList{
+		Dialogs: []domain.Dialog{
+			{Peer: firstPeer, TopMessage: 7, TopMessageDate: 70},
+			{Peer: secondPeer, TopMessage: 8, TopMessageDate: 80},
+		},
+		Messages: []domain.Message{
+			{ID: 7, OwnerUserID: ownerID, Peer: firstPeer, From: firstPeer, Date: 70, Body: "first"},
+			{ID: 8, OwnerUserID: ownerID, Peer: secondPeer, From: secondPeer, Date: 80, Body: "second"},
+		},
+		Users: []domain.User{
+			{ID: firstPeer.ID, AccessHash: 22, FirstName: "First"},
+			{ID: secondPeer.ID, AccessHash: 33, FirstName: "Second"},
+		},
+	}); err != nil {
+		t.Fatalf("SaveList: %v", err)
+	}
+	counting := &countingDialogStore{DialogStore: base}
+	versions := &fakeDialogReadModelVersions{hashes: map[store.ReadModelKey]int64{
+		{Model: dialogLightReadModel, OwnerUserID: ownerID, PeerType: firstPeer.Type, PeerID: firstPeer.ID}:   101,
+		{Model: dialogLightReadModel, OwnerUserID: ownerID, PeerType: secondPeer.Type, PeerID: secondPeer.ID}: 202,
+	}}
+	dialogs := NewService(counting).Configure(WithReadModelVersions(versions))
+	peers := []domain.Peer{firstPeer, secondPeer}
+
+	if _, err := dialogs.GetPeerDialogs(ctx, ownerID, peers); err != nil {
+		t.Fatalf("first GetPeerDialogs: %v", err)
+	}
+	versions.hashes[store.ReadModelKey{Model: dialogLightReadModel, OwnerUserID: ownerID, PeerType: secondPeer.Type, PeerID: secondPeer.ID}] = 303
+	if _, err := dialogs.GetPeerDialogs(ctx, ownerID, peers); err != nil {
+		t.Fatalf("second GetPeerDialogs after one hash bump: %v", err)
+	}
+	if counting.listByPeersCalls != 2 {
+		t.Fatalf("ListByPeers calls = %d, want 2", counting.listByPeersCalls)
+	}
+	lastBatch := counting.listByPeersBatches[len(counting.listByPeersBatches)-1]
+	if len(lastBatch) != 1 || lastBatch[0] != secondPeer {
+		t.Fatalf("last ListByPeers batch = %+v, want only %+v", lastBatch, secondPeer)
+	}
+}
+
+func TestGetPeerDialogsCachesChannelPeerReadModelByCompositeHash(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	dialogStore := &countingDialogStore{DialogStore: memory.NewDialogStore()}
+	channelStore := &countingDialogChannelStore{ChannelStore: memory.NewChannelStore()}
+	channels := appchannels.NewService(channelStore)
+	created, err := channels.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
+		Title:     "Cached Channel Dialog",
+		Megagroup: true,
+		Date:      1700003200,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
+	sent, err := channels.SendMessage(ctx, ownerID, domain.SendChannelMessageRequest{
+		ChannelID: created.Channel.ID,
+		RandomID:  11,
+		Message:   "cached channel top",
+		Date:      1700003210,
+	})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	peer := domain.Peer{Type: domain.PeerTypeChannel, ID: created.Channel.ID}
+	versions := &fakeDialogReadModelVersions{hashes: map[store.ReadModelKey]int64{
+		{Model: channelBaseReadModel, OwnerUserID: 0, PeerType: peer.Type, PeerID: peer.ID}:         11,
+		{Model: channelMemberReadModel, OwnerUserID: ownerID, PeerType: peer.Type, PeerID: peer.ID}: 22,
+		{Model: dialogLightReadModel, OwnerUserID: ownerID, PeerType: peer.Type, PeerID: peer.ID}:   33,
+	}}
+	dialogs := NewService(dialogStore, channelStore).Configure(WithReadModelVersions(versions))
+
+	first, err := dialogs.GetPeerDialogs(ctx, ownerID, []domain.Peer{peer})
+	if err != nil {
+		t.Fatalf("first GetPeerDialogs: %v", err)
+	}
+	if len(first.Dialogs) != 1 || first.Dialogs[0].TopMessage != sent.Message.ID {
+		t.Fatalf("first dialogs = %+v, want channel top %d", first.Dialogs, sent.Message.ID)
+	}
+	if len(first.ChannelMessages) != 1 || first.ChannelMessages[0].Body != "cached channel top" {
+		t.Fatalf("first channel messages = %+v, want cached top message", first.ChannelMessages)
+	}
+	if _, err := dialogs.GetPeerDialogs(ctx, ownerID, []domain.Peer{peer}); err != nil {
+		t.Fatalf("second GetPeerDialogs: %v", err)
+	}
+	if channelStore.getChannelDialogsCalls != 1 || dialogStore.listDraftsCalls != 1 {
+		t.Fatalf("store calls GetChannelDialogs/ListDrafts = %d/%d, want 1/1 after channel cache hit",
+			channelStore.getChannelDialogsCalls, dialogStore.listDraftsCalls)
+	}
+
+	versions.hashes[store.ReadModelKey{Model: channelMemberReadModel, OwnerUserID: ownerID, PeerType: peer.Type, PeerID: peer.ID}] = 44
+	if _, err := dialogs.GetPeerDialogs(ctx, ownerID, []domain.Peer{peer}); err != nil {
+		t.Fatalf("third GetPeerDialogs after member hash bump: %v", err)
+	}
+	if channelStore.getChannelDialogsCalls != 2 || dialogStore.listDraftsCalls != 2 {
+		t.Fatalf("store calls after member hash bump = %d/%d, want 2/2",
+			channelStore.getChannelDialogsCalls, dialogStore.listDraftsCalls)
+	}
+
+	if _, err := dialogs.SaveDraft(ctx, ownerID, domain.DialogDraft{Peer: peer, Date: 1700003220, Message: "channel draft"}); err != nil {
+		t.Fatalf("SaveDraft: %v", err)
+	}
+	if _, err := dialogs.GetPeerDialogs(ctx, ownerID, []domain.Peer{peer}); err != nil {
+		t.Fatalf("GetPeerDialogs after draft invalidation: %v", err)
+	}
+	if channelStore.getChannelDialogsCalls != 3 || dialogStore.listDraftsCalls != 3 {
+		t.Fatalf("store calls after draft invalidation = %d/%d, want 3/3",
+			channelStore.getChannelDialogsCalls, dialogStore.listDraftsCalls)
+	}
+}
+
+func TestDialogPeerReadModelCacheRejectsStaleFillAfterInvalidation(t *testing.T) {
+	peer := domain.Peer{Type: domain.PeerTypeUser, ID: 1002}
+	key := dialogPeerCacheKey{userID: 1001, peer: peer}
+	cache := newDialogPeerReadModelCache(time.Hour)
+	epoch := cache.cacheEpoch()
+	cache.invalidate(key)
+	cache.putIfEpoch(key, domain.DialogList{
+		Dialogs: []domain.Dialog{{Peer: peer, TopMessage: 7}},
+		Hash:    101,
+	}, 101, epoch)
+	if _, ok := cache.lookup(key, 101); ok {
+		t.Fatalf("stale cache fill survived invalidation")
+	}
+}
 
 func TestGetDialogsIncludesChannelReadOutboxAfterOfflineRead(t *testing.T) {
 	ctx := context.Background()
@@ -143,14 +507,14 @@ func TestChannelDialogSettingsPersistThroughUnifiedDialogService(t *testing.T) {
 	firstPeer := domain.Peer{Type: domain.PeerTypeChannel, ID: first.Channel.ID}
 	secondPeer := domain.Peer{Type: domain.PeerTypeChannel, ID: second.Channel.ID}
 
-	if changed, err := dialogs.TogglePinned(ctx, 1001, firstPeer, true); err != nil || !changed {
+	if changed, _, err := dialogs.TogglePinned(ctx, 1001, firstPeer, true); err != nil || !changed {
 		t.Fatalf("TogglePinned first = changed %v err %v, want changed", changed, err)
 	}
-	if changed, err := dialogs.TogglePinned(ctx, 1001, secondPeer, true); err != nil || !changed {
+	if changed, _, err := dialogs.TogglePinned(ctx, 1001, secondPeer, true); err != nil || !changed {
 		t.Fatalf("TogglePinned second = changed %v err %v, want changed", changed, err)
 	}
-	if err := dialogs.ReorderPinned(ctx, 1001, []domain.Peer{secondPeer, firstPeer}, true); err != nil {
-		t.Fatalf("ReorderPinned: %v", err)
+	if changed, err := dialogs.ReorderPinned(ctx, 1001, domain.DialogMainFolderID, []domain.Peer{secondPeer, firstPeer}, true); err != nil || changed {
+		t.Fatalf("ReorderPinned same order = changed %v err %v, want no-op", changed, err)
 	}
 	if changed, err := dialogs.MarkUnread(ctx, 1001, firstPeer, true); err != nil || !changed {
 		t.Fatalf("MarkUnread = changed %v err %v, want changed", changed, err)
@@ -165,9 +529,15 @@ func TestChannelDialogSettingsPersistThroughUnifiedDialogService(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetDialogs: %v", err)
 	}
-	firstDialog := findChannelDialog(t, list, first.Channel.ID)
-	if !firstDialog.Pinned || firstDialog.PinnedOrder != 1 || !firstDialog.UnreadMark || firstDialog.FolderID != domain.DialogArchiveFolderID {
-		t.Fatalf("first dialog = %+v, want pinned order 1, unread mark, archived", firstDialog)
+	// 归档对话不再出现在主列表（缺省 folder 视为 folder 0），主列表以
+	// ArchiveSummary 聚合呈现归档状态。
+	for _, dialog := range list.Dialogs {
+		if dialog.Peer.Type == domain.PeerTypeChannel && dialog.Peer.ID == first.Channel.ID {
+			t.Fatalf("archived dialog leaked into main list: %+v", dialog)
+		}
+	}
+	if list.ArchiveSummary == nil {
+		t.Fatalf("main list archive summary = nil, want attached after archiving")
 	}
 	secondDialog := findChannelDialog(t, list, second.Channel.ID)
 	if !secondDialog.Pinned || secondDialog.PinnedOrder != 2 {
@@ -188,8 +558,14 @@ func TestChannelDialogSettingsPersistThroughUnifiedDialogService(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetDialogs archive: %v", err)
 	}
-	if got := findChannelDialog(t, archived, first.Channel.ID); got.FolderID != domain.DialogArchiveFolderID {
+	got := findChannelDialog(t, archived, first.Channel.ID)
+	if got.FolderID != domain.DialogArchiveFolderID {
 		t.Fatalf("archived dialog = %+v, want archive folder", got)
+	}
+	// 归档清除 pinned（对齐 TDesktop History::setFolderPointer 的本地 unpin），
+	// unread_mark 保留。
+	if got.Pinned || got.PinnedOrder != 0 || !got.UnreadMark {
+		t.Fatalf("archived dialog = %+v, want unpinned with unread mark", got)
 	}
 
 	custom, err := dialogs.GetDialogs(ctx, 1001, domain.DialogFilter{
@@ -203,6 +579,64 @@ func TestChannelDialogSettingsPersistThroughUnifiedDialogService(t *testing.T) {
 	}
 	if got := findChannelDialog(t, custom, first.Channel.ID); got.Peer.ID != first.Channel.ID {
 		t.Fatalf("custom group dialog = %+v, want first channel", got)
+	}
+}
+
+func TestTogglePinnedPromotesNewestPinnedAcrossPrivateAndChannelDialogs(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	dialogStore := memory.NewDialogStore()
+	channelStore := memory.NewChannelStore()
+	channels := appchannels.NewService(channelStore)
+	dialogs := NewService(dialogStore, channelStore)
+	privatePeer := domain.Peer{Type: domain.PeerTypeUser, ID: 1002}
+	if err := dialogStore.SaveList(ctx, ownerID, domain.DialogList{
+		Dialogs: []domain.Dialog{{
+			Peer:           privatePeer,
+			TopMessage:     30,
+			TopMessageDate: 3000,
+		}},
+		Messages: []domain.Message{{
+			ID:          30,
+			OwnerUserID: ownerID,
+			Peer:        privatePeer,
+			From:        privatePeer,
+			Date:        3000,
+			Body:        "newer private top",
+		}},
+		Users: []domain.User{{ID: privatePeer.ID, AccessHash: 22, FirstName: "Private"}},
+	}); err != nil {
+		t.Fatalf("SaveList private dialog: %v", err)
+	}
+	created, err := channels.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
+		Title:     "Older Channel",
+		Megagroup: true,
+		Date:      1000,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
+	channelPeer := domain.Peer{Type: domain.PeerTypeChannel, ID: created.Channel.ID}
+
+	if changed, _, err := dialogs.TogglePinned(ctx, ownerID, privatePeer, true); err != nil || !changed {
+		t.Fatalf("TogglePinned private = changed %v err %v, want changed", changed, err)
+	}
+	if changed, _, err := dialogs.TogglePinned(ctx, ownerID, channelPeer, true); err != nil || !changed {
+		t.Fatalf("TogglePinned channel = changed %v err %v, want changed", changed, err)
+	}
+
+	list, err := dialogs.GetDialogs(ctx, ownerID, domain.DialogFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("GetDialogs: %v", err)
+	}
+	if len(list.Dialogs) < 2 {
+		t.Fatalf("dialogs = %+v, want private and channel dialogs", list.Dialogs)
+	}
+	if list.Dialogs[0].Peer != channelPeer || list.Dialogs[0].PinnedOrder != 2 {
+		t.Fatalf("first dialog = %+v, want newly pinned channel with highest order", list.Dialogs[0])
+	}
+	if list.Dialogs[1].Peer != privatePeer || list.Dialogs[1].PinnedOrder != 1 {
+		t.Fatalf("second dialog = %+v, want older pinned private dialog", list.Dialogs[1])
 	}
 }
 
@@ -328,6 +762,99 @@ func TestGetPeerDialogsIncludesPublicChannelPreviewForNonMember(t *testing.T) {
 	}
 }
 
+func TestGetPeerDialogsBatchesMissingChannelPreviews(t *testing.T) {
+	ctx := context.Background()
+	channelStore := &countingDialogChannelStore{ChannelStore: memory.NewChannelStore()}
+	channels := appchannels.NewService(channelStore)
+	dialogs := NewService(nil, channelStore)
+
+	first, err := channels.CreateChannel(ctx, 1001, domain.CreateChannelRequest{
+		Title:     "Batch Preview One",
+		Broadcast: true,
+		Date:      1700002100,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel first: %v", err)
+	}
+	if _, err := channels.UpdateUsername(ctx, 1001, domain.UpdateChannelUsernameRequest{
+		UserID:    1001,
+		ChannelID: first.Channel.ID,
+		Username:  "batch_preview_one",
+	}); err != nil {
+		t.Fatalf("UpdateUsername first: %v", err)
+	}
+	firstMsg, err := channels.SendMessage(ctx, 1001, domain.SendChannelMessageRequest{
+		ChannelID: first.Channel.ID,
+		RandomID:  101,
+		Message:   "first public preview",
+		Date:      1700002110,
+	})
+	if err != nil {
+		t.Fatalf("SendMessage first: %v", err)
+	}
+
+	second, err := channels.CreateChannel(ctx, 1001, domain.CreateChannelRequest{
+		Title:     "Batch Preview Two",
+		Broadcast: true,
+		Date:      1700002120,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel second: %v", err)
+	}
+	if _, err := channels.UpdateUsername(ctx, 1001, domain.UpdateChannelUsernameRequest{
+		UserID:    1001,
+		ChannelID: second.Channel.ID,
+		Username:  "batch_preview_two",
+	}); err != nil {
+		t.Fatalf("UpdateUsername second: %v", err)
+	}
+	secondMsg, err := channels.SendMessage(ctx, 1001, domain.SendChannelMessageRequest{
+		ChannelID: second.Channel.ID,
+		RandomID:  102,
+		Message:   "second public preview",
+		Date:      1700002130,
+	})
+	if err != nil {
+		t.Fatalf("SendMessage second: %v", err)
+	}
+
+	private, err := channels.CreateChannel(ctx, 1001, domain.CreateChannelRequest{
+		Title:     "Batch Preview Private",
+		Broadcast: true,
+		Date:      1700002140,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel private: %v", err)
+	}
+
+	channelStore.getChannelCalls = 0
+	channelStore.getChannelsCalls = 0
+	list, err := dialogs.GetPeerDialogs(ctx, 1002, []domain.Peer{
+		{Type: domain.PeerTypeChannel, ID: first.Channel.ID},
+		{Type: domain.PeerTypeChannel, ID: private.Channel.ID},
+		{Type: domain.PeerTypeChannel, ID: second.Channel.ID},
+		{Type: domain.PeerTypeChannel, ID: first.Channel.ID},
+	})
+	if err != nil {
+		t.Fatalf("GetPeerDialogs batch previews: %v", err)
+	}
+	if channelStore.getChannelsCalls != 1 || channelStore.getChannelCalls != 0 {
+		t.Fatalf("preview channel calls: GetChannels=%d GetChannel=%d, want one batch call only", channelStore.getChannelsCalls, channelStore.getChannelCalls)
+	}
+	if len(list.Dialogs) != 2 {
+		t.Fatalf("dialogs = %+v, want two public previews", list.Dialogs)
+	}
+	if got := findChannelDialog(t, list, first.Channel.ID); got.TopMessage != firstMsg.Message.ID {
+		t.Fatalf("first preview top = %d, want %d", got.TopMessage, firstMsg.Message.ID)
+	}
+	if got := findChannelDialog(t, list, second.Channel.ID); got.TopMessage != secondMsg.Message.ID {
+		t.Fatalf("second preview top = %d, want %d", got.TopMessage, secondMsg.Message.ID)
+	}
+	if len(list.ChannelMessages) != 2 {
+		t.Fatalf("channel messages = %+v, want two top messages", list.ChannelMessages)
+	}
+}
+
 func findChannelDialog(t *testing.T, list domain.DialogList, channelID int64) domain.Dialog {
 	t.Helper()
 	for _, dialog := range list.Dialogs {
@@ -360,4 +887,150 @@ func (p dialogProfilePhotos) CurrentProfilePhotos(_ context.Context, _ domain.Pe
 		}
 	}
 	return out, nil
+}
+
+func TestGetDialogsMainListAttachesArchiveSummary(t *testing.T) {
+	ctx := context.Background()
+	dialogStore := memory.NewDialogStore()
+	dialogs := NewService(dialogStore)
+
+	archivedPeer := domain.Peer{Type: domain.PeerTypeUser, ID: 2002}
+	mainPeer := domain.Peer{Type: domain.PeerTypeUser, ID: 2003}
+	if err := dialogStore.Upsert(ctx, 1001, domain.Dialog{
+		Peer:           archivedPeer,
+		FolderID:       domain.DialogArchiveFolderID,
+		TopMessage:     7,
+		TopMessageDate: 30,
+		UnreadCount:    3,
+	}); err != nil {
+		t.Fatalf("upsert archived dialog: %v", err)
+	}
+	if err := dialogStore.Upsert(ctx, 1001, domain.Dialog{
+		Peer:           mainPeer,
+		TopMessage:     9,
+		TopMessageDate: 40,
+	}); err != nil {
+		t.Fatalf("upsert main dialog: %v", err)
+	}
+
+	list, err := dialogs.GetDialogs(ctx, 1001, domain.DialogFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("GetDialogs main: %v", err)
+	}
+	if list.ArchiveSummary == nil {
+		t.Fatalf("main list archive summary = nil, want attached")
+	}
+	if list.ArchiveSummary.TopPeer != archivedPeer || list.ArchiveSummary.TopMessage != 7 {
+		t.Fatalf("archive summary top = %+v, want peer %+v message 7", list.ArchiveSummary, archivedPeer)
+	}
+	if list.ArchiveSummary.UnreadPeersCount != 1 || list.ArchiveSummary.UnreadMessagesCount != 3 {
+		t.Fatalf("archive summary counts = %+v, want 1 peer / 3 messages", list.ArchiveSummary)
+	}
+	for _, dialog := range list.Dialogs {
+		if dialog.Peer == archivedPeer {
+			t.Fatalf("archived dialog leaked into main list: %+v", dialog)
+		}
+	}
+
+	archived, err := dialogs.GetDialogs(ctx, 1001, domain.DialogFilter{
+		HasFolderID: true,
+		FolderID:    domain.DialogArchiveFolderID,
+		Limit:       10,
+	})
+	if err != nil {
+		t.Fatalf("GetDialogs archive: %v", err)
+	}
+	if archived.ArchiveSummary != nil {
+		t.Fatalf("archive list summary = %+v, want nil", archived.ArchiveSummary)
+	}
+
+	paged, err := dialogs.GetDialogs(ctx, 1001, domain.DialogFilter{Limit: 10, OffsetID: 9})
+	if err != nil {
+		t.Fatalf("GetDialogs paged: %v", err)
+	}
+	if paged.ArchiveSummary != nil {
+		t.Fatalf("paged list summary = %+v, want nil (first page only)", paged.ArchiveSummary)
+	}
+}
+
+func TestGetDialogsMainListSkipsArchiveSummaryWhenEmpty(t *testing.T) {
+	ctx := context.Background()
+	dialogStore := memory.NewDialogStore()
+	dialogs := NewService(dialogStore)
+	if err := dialogStore.Upsert(ctx, 1001, domain.Dialog{
+		Peer:           domain.Peer{Type: domain.PeerTypeUser, ID: 2003},
+		TopMessage:     9,
+		TopMessageDate: 40,
+	}); err != nil {
+		t.Fatalf("upsert main dialog: %v", err)
+	}
+	list, err := dialogs.GetDialogs(ctx, 1001, domain.DialogFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("GetDialogs: %v", err)
+	}
+	if list.ArchiveSummary != nil {
+		t.Fatalf("archive summary = %+v, want nil when no archived dialogs", list.ArchiveSummary)
+	}
+}
+
+func TestGetDialogsPinnedOnlyAttachesArchiveSummary(t *testing.T) {
+	ctx := context.Background()
+	dialogStore := memory.NewDialogStore()
+	dialogs := NewService(dialogStore)
+	archivedPeer := domain.Peer{Type: domain.PeerTypeUser, ID: 2002}
+	if err := dialogStore.Upsert(ctx, 1001, domain.Dialog{
+		Peer:           archivedPeer,
+		FolderID:       domain.DialogArchiveFolderID,
+		TopMessage:     7,
+		TopMessageDate: 30,
+		UnreadCount:    3,
+	}); err != nil {
+		t.Fatalf("upsert archived dialog: %v", err)
+	}
+	// getPinnedDialogs(folder_id=0) 路径：DrKLO 的 archive 行发现完全依赖
+	// 该响应里的 dialogFolder 条目。
+	pinned, err := dialogs.GetDialogs(ctx, 1001, domain.DialogFilter{
+		PinnedOnly:  true,
+		HasFolderID: true,
+		FolderID:    domain.DialogMainFolderID,
+		Limit:       100,
+	})
+	if err != nil {
+		t.Fatalf("GetDialogs pinned: %v", err)
+	}
+	if pinned.ArchiveSummary == nil || !pinned.ArchiveSummary.Pinned || pinned.ArchiveSummary.TopPeer != archivedPeer {
+		t.Fatalf("pinned archive summary = %+v, want pinned archive entry", pinned.ArchiveSummary)
+	}
+	// archive 行被 unpin 后不属于 pinned 集合。
+	if _, err := dialogStore.SetArchivePinned(ctx, 1001, false); err != nil {
+		t.Fatalf("set archive pinned: %v", err)
+	}
+	unpinned, err := dialogs.GetDialogs(ctx, 1001, domain.DialogFilter{
+		PinnedOnly:  true,
+		HasFolderID: true,
+		FolderID:    domain.DialogMainFolderID,
+		Limit:       100,
+	})
+	if err != nil {
+		t.Fatalf("GetDialogs pinned after unpin: %v", err)
+	}
+	if unpinned.ArchiveSummary != nil {
+		t.Fatalf("pinned archive summary after unpin = %+v, want nil", unpinned.ArchiveSummary)
+	}
+	// 主列表第一页仍输出条目（pinned flag 用真值），与官方一致。
+	main, err := dialogs.GetDialogs(ctx, 1001, domain.DialogFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("GetDialogs main: %v", err)
+	}
+	if main.ArchiveSummary == nil || main.ArchiveSummary.Pinned {
+		t.Fatalf("main archive summary = %+v, want entry with pinned=false", main.ArchiveSummary)
+	}
+	// exclude_pinned 请求按官方语义不带条目。
+	excluded, err := dialogs.GetDialogs(ctx, 1001, domain.DialogFilter{ExcludePinned: true, Limit: 10})
+	if err != nil {
+		t.Fatalf("GetDialogs exclude pinned: %v", err)
+	}
+	if excluded.ArchiveSummary != nil {
+		t.Fatalf("exclude_pinned archive summary = %+v, want nil", excluded.ArchiveSummary)
+	}
 }

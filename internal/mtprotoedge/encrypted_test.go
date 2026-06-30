@@ -301,6 +301,34 @@ func TestPingDelayDisconnectEvenSeqAccepted(t *testing.T) {
 	}
 }
 
+func TestPingDelayDisconnectPongUsesEvenSeqNo(t *testing.T) {
+	const dc = 2
+	addr, pub, _ := startTestServer(t, Options{DC: dc})
+	conn, auth, cipher := dialHandshake(t, addr, dc, pub)
+
+	clientMsgID := proto.NewMessageIDGen(time.Now)
+	reqMsgID := clientMsgID.New(proto.MessageFromClient)
+	sendEncryptedWithSeq(t, conn, cipher, auth, reqMsgID, 0, &mt.PingDelayDisconnectRequest{
+		PingID:          11,
+		DisconnectDelay: 10,
+	})
+
+	for i := 0; i < 4; i++ {
+		data, id, _ := readServerMessage(t, conn, cipher, auth.AuthKey)
+		if id == mt.BadMsgNotificationTypeID {
+			t.Fatal("ping_delay_disconnect produced bad_msg_notification")
+		}
+		if id != mt.PongTypeID {
+			continue
+		}
+		if data.SeqNo%2 != 0 {
+			t.Fatalf("pong seq_no = %d, want even non-content-related seq_no", data.SeqNo)
+		}
+		return
+	}
+	t.Fatal("pong was not returned")
+}
+
 func TestPingDelayDisconnectOddSeqAccepted(t *testing.T) {
 	const dc = 2
 	addr, pub, _ := startTestServer(t, Options{DC: dc})

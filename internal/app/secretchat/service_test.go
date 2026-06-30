@@ -1,0 +1,346 @@
+package secretchat
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"telesrv/internal/domain"
+	"telesrv/internal/store/memory"
+)
+
+// fakeChatIDAllocator 是单调自增的测试分配器（无 Redis）。
+type fakeChatIDAllocator struct{ n int }
+
+func (a *fakeChatIDAllocator) NextSecretChatID(context.Context) (int, error) {
+	a.n++
+	return a.n, nil
+}
+
+func (a *fakeChatIDAllocator) NextSecretChatIDAtLeast(_ context.Context, floor int) (int, error) {
+	if a.n < floor {
+		a.n = floor
+	}
+	a.n++
+	return a.n, nil
+}
+
+func (a *fakeChatIDAllocator) CurrentSecretChatID(context.Context) (int, error) { return a.n, nil }
+
+// validGA 返回一个落在合法 DH 区间的 256 字节 g_a（首字节 0x55 ≈ 2^2046，
+// 既 > 2^1984 又 < p≈0xc7..）。
+func validGA() []byte {
+	b := make([]byte, 256)
+	for i := range b {
+		b[i] = 0x42
+	}
+	b[0] = 0x55
+	return b
+}
+
+func newTestService() (*Service, *memory.SecretChatStore) {
+	st := memory.NewSecretChatStore()
+	return NewService(st, memory.NewEncryptedQueueStore(), &fakeChatIDAllocator{}), st
+}
+
+const (
+	adminUser    = int64(1001)
+	partUser     = int64(2002)
+	adminAuthKey = int64(0x1111)
+	partAuthKey  = int64(0x2222)
+	keyFP        = int64(0x0123456789abcdef)
+)
+
+func requestFixture() domain.SecretChatRequest {
+	return domain.SecretChatRequest{
+		AdminUserID:       adminUser,
+		AdminAuthKeyID:    adminAuthKey,
+		ParticipantUserID: partUser,
+		RandomID:          12345,
+		GA:                validGA(),
+		Date:              1000,
+	}
+}
+
+func TestRequestEncryption(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	chat, err := svc.RequestEncryption(ctx, requestFixture())
+	if err != nil {
+		t.Fatalf("RequestEncryption: %v", err)
+	}
+	if chat.ID <= 0 || chat.ID > 0x7fffffff {
+		t.Fatalf("chat id out of int32 range: %d", chat.ID)
+	}
+	if chat.State != domain.SecretChatStateRequested {
+		t.Fatalf("state = %q, want requested", chat.State)
+	}
+	if len(chat.GA) != dhPubSize {
+		t.Fatalf("g_a length = %d, want %d (left-padded)", len(chat.GA), dhPubSize)
+	}
+	if chat.AdminAccessHash == 0 || chat.ParticipantAccessHash == 0 {
+		t.Fatal("access hashes must be non-zero")
+	}
+	if chat.AdminAccessHash == chat.ParticipantAccessHash {
+		t.Fatal("admin/participant access hashes must differ (per-viewer)")
+	}
+	if chat.ParticipantAuthKeyID != 0 {
+		t.Fatalf("participant auth key must be unbound before accept, got %d", chat.ParticipantAuthKeyID)
+	}
+}
+
+func TestRequestEncryptionIdempotent(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	first, err := svc.RequestEncryption(ctx, requestFixture())
+	if err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+	second, err := svc.RequestEncryption(ctx, requestFixture())
+	if err != nil {
+		t.Fatalf("second request: %v", err)
+	}
+	if first.ID != second.ID {
+		t.Fatalf("idempotent re-request must return same chat: %d vs %d", first.ID, second.ID)
+	}
+}
+
+func TestRequestEncryptionInvalidGA(t *testing.T) {
+	svc, _ := newTestService()
+	req := requestFixture()
+	req.GA = []byte{0x01} // value 1 → 不在 (1, p-1)
+	if _, err := svc.RequestEncryption(context.Background(), req); !errors.Is(err, ErrGAInvalid) {
+		t.Fatalf("err = %v, want ErrGAInvalid", err)
+	}
+}
+
+func TestAcceptEncryption(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	chat, err := svc.RequestEncryption(ctx, requestFixture())
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	accepted, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, validGA(), keyFP)
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if accepted.State != domain.SecretChatStateNormal {
+		t.Fatalf("state = %q, want normal", accepted.State)
+	}
+	if accepted.KeyFingerprint != keyFP {
+		t.Fatalf("key fingerprint not relayed byte-for-byte: got %x want %x", accepted.KeyFingerprint, keyFP)
+	}
+	if accepted.ParticipantAuthKeyID != partAuthKey {
+		t.Fatalf("participant auth key not bound: %d", accepted.ParticipantAuthKeyID)
+	}
+	if len(accepted.GB) != dhPubSize {
+		t.Fatalf("g_b length = %d, want %d", len(accepted.GB), dhPubSize)
+	}
+}
+
+func TestAcceptEncryptionWrongAccessHash(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	chat, _ := svc.RequestEncryption(ctx, requestFixture())
+	_, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash+1, validGA(), keyFP)
+	if !errors.Is(err, domain.ErrSecretChatNotFound) {
+		t.Fatalf("err = %v, want ErrSecretChatNotFound", err)
+	}
+}
+
+func TestAcceptEncryptionWrongUser(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	chat, _ := svc.RequestEncryption(ctx, requestFixture())
+	// admin 自己冒充接受方。
+	_, err := svc.AcceptEncryption(ctx, chat.ID, adminUser, adminAuthKey, chat.ParticipantAccessHash, validGA(), keyFP)
+	if !errors.Is(err, domain.ErrSecretChatNotFound) {
+		t.Fatalf("err = %v, want ErrSecretChatNotFound", err)
+	}
+}
+
+func TestAcceptEncryptionDoubleAccept(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	chat, _ := svc.RequestEncryption(ctx, requestFixture())
+	if _, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, validGA(), keyFP); err != nil {
+		t.Fatalf("first accept: %v", err)
+	}
+	// 第二台设备 accept：CAS 落空 → ENCRYPTION_ALREADY_ACCEPTED。
+	_, err := svc.AcceptEncryption(ctx, chat.ID, partUser, int64(0x3333), chat.ParticipantAccessHash, validGA(), keyFP)
+	if !errors.Is(err, domain.ErrSecretChatAlreadyAccepted) {
+		t.Fatalf("err = %v, want ErrSecretChatAlreadyAccepted", err)
+	}
+}
+
+func TestAcceptEncryptionInvalidGB(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	chat, _ := svc.RequestEncryption(ctx, requestFixture())
+	_, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, []byte{0x01}, keyFP)
+	if !errors.Is(err, ErrGAInvalid) {
+		t.Fatalf("err = %v, want ErrGAInvalid", err)
+	}
+}
+
+func TestDiscardEncryption(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	chat, _ := svc.RequestEncryption(ctx, requestFixture())
+	got, already, err := svc.DiscardEncryption(ctx, chat.ID, adminUser, true)
+	if err != nil {
+		t.Fatalf("discard: %v", err)
+	}
+	if already {
+		t.Fatal("first discard must not report already")
+	}
+	if got.State != domain.SecretChatStateDiscarded || !got.HistoryDeleted {
+		t.Fatalf("discarded chat = %+v", got)
+	}
+	// 幂等：再 discard 返回 already=true。
+	_, already, err = svc.DiscardEncryption(ctx, chat.ID, partUser, false)
+	if err != nil || !already {
+		t.Fatalf("idempotent discard: already=%v err=%v", already, err)
+	}
+}
+
+func TestDiscardEncryptionNonParticipant(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	chat, _ := svc.RequestEncryption(ctx, requestFixture())
+	_, _, err := svc.DiscardEncryption(ctx, chat.ID, int64(9999), false)
+	if !errors.Is(err, domain.ErrSecretChatNotFound) {
+		t.Fatalf("err = %v, want ErrSecretChatNotFound", err)
+	}
+}
+
+// acceptedChat 跑完 request→accept，返回 normal 态密聊。
+func acceptedChat(t *testing.T, svc *Service) domain.SecretChat {
+	t.Helper()
+	ctx := context.Background()
+	chat, err := svc.RequestEncryption(ctx, requestFixture())
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	accepted, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, dhParamGB(), keyFP)
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	return accepted
+}
+
+func dhParamGB() []byte {
+	b := make([]byte, 256)
+	for i := range b {
+		b[i] = 0x42
+	}
+	b[0] = 0x66
+	return b
+}
+
+func TestSendEncryptedQtsAllocation(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	chat := acceptedChat(t, svc)
+
+	// admin 发 → 投给 participant 设备（partAuthKey），qts 从 1 起。
+	_, m1, err := svc.SendEncrypted(ctx, chat.ID, adminUser, chat.AdminAccessHash, domain.SecretMessageDelivery{RandomID: 111, Bytes: []byte{1, 2, 3}, Date: 2000})
+	if err != nil {
+		t.Fatalf("send 1: %v", err)
+	}
+	if m1.Qts != 1 || m1.ReceiverAuthKeyID != partAuthKey || m1.ReceiverUserID != partUser {
+		t.Fatalf("msg1 = %+v (want qts=1, receiver=participant device)", m1)
+	}
+	_, m2, err := svc.SendEncrypted(ctx, chat.ID, adminUser, chat.AdminAccessHash, domain.SecretMessageDelivery{RandomID: 222, Bytes: []byte{4}, Date: 2001})
+	if err != nil || m2.Qts != 2 {
+		t.Fatalf("msg2 qts = %d err=%v, want 2", m2.Qts, err)
+	}
+
+	// 幂等重发同 random_id → 返回首次 qts/date，不分配新 qts。
+	_, dup, err := svc.SendEncrypted(ctx, chat.ID, adminUser, chat.AdminAccessHash, domain.SecretMessageDelivery{RandomID: 111, Bytes: []byte{1, 2, 3}, Date: 9999})
+	if err != nil {
+		t.Fatalf("dup send: %v", err)
+	}
+	if dup.Qts != 1 || dup.Date != 2000 {
+		t.Fatalf("idempotent resend = %+v, want qts=1 date=2000 (首次落库值)", dup)
+	}
+
+	// participant 发 → 投给 admin 设备（adminAuthKey），独立 qts 序列从 1 起。
+	_, pm, err := svc.SendEncrypted(ctx, chat.ID, partUser, chat.ParticipantAccessHash, domain.SecretMessageDelivery{RandomID: 333, Bytes: []byte{9}, Date: 2002})
+	if err != nil {
+		t.Fatalf("participant send: %v", err)
+	}
+	if pm.Qts != 1 || pm.ReceiverAuthKeyID != adminAuthKey || pm.ReceiverUserID != adminUser {
+		t.Fatalf("participant msg = %+v (want qts=1, receiver=admin device)", pm)
+	}
+}
+
+func TestSendEncryptedWrongAccessHash(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	chat := acceptedChat(t, svc)
+	_, _, err := svc.SendEncrypted(ctx, chat.ID, adminUser, chat.AdminAccessHash+1, domain.SecretMessageDelivery{RandomID: 1, Bytes: []byte{1}, Date: 2000})
+	if !errors.Is(err, domain.ErrSecretChatNotFound) {
+		t.Fatalf("err = %v, want ErrSecretChatNotFound", err)
+	}
+}
+
+func TestSendEncryptedNonNormal(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	chat, _ := svc.RequestEncryption(ctx, requestFixture()) // requested, 未 accept
+	_, _, err := svc.SendEncrypted(ctx, chat.ID, adminUser, chat.AdminAccessHash, domain.SecretMessageDelivery{RandomID: 1, Bytes: []byte{1}, Date: 2000})
+	if !errors.Is(err, domain.ErrSecretChatNotFound) {
+		t.Fatalf("err = %v, want ErrSecretChatNotFound (未成型不能发)", err)
+	}
+}
+
+func TestListNewMessagesAndAck(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	chat := acceptedChat(t, svc)
+	for i := 0; i < 3; i++ {
+		if _, _, err := svc.SendEncrypted(ctx, chat.ID, adminUser, chat.AdminAccessHash, domain.SecretMessageDelivery{RandomID: int64(1000 + i), Bytes: []byte{byte(i)}, Date: 2000 + i}); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+	// 接收设备（participant）补差分：qts>0 全部 3 条。
+	msgs, err := svc.ListNewMessages(ctx, partAuthKey, 0, 0)
+	if err != nil || len(msgs) != 3 {
+		t.Fatalf("list since 0 = %d msgs err=%v, want 3", len(msgs), err)
+	}
+	if msgs[0].Qts != 1 || msgs[2].Qts != 3 {
+		t.Fatalf("qts sequence broken: %d..%d", msgs[0].Qts, msgs[2].Qts)
+	}
+	// qts>1 → 剩 2 条。
+	msgs, _ = svc.ListNewMessages(ctx, partAuthKey, 1, 0)
+	if len(msgs) != 2 || msgs[0].Qts != 2 {
+		t.Fatalf("list since 1 = %+v, want qts 2,3", msgs)
+	}
+	// reserved qts = 3。
+	if q, _ := svc.DeviceReservedQts(ctx, partAuthKey); q != 3 {
+		t.Fatalf("reserved qts = %d, want 3", q)
+	}
+	// ack 到 3：不报错（confirmed 推进）。
+	if err := svc.AckQueue(ctx, partAuthKey, 3); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	// 未参与设备 qts=0。
+	if q, _ := svc.DeviceReservedQts(ctx, int64(0xDEAD)); q != 0 {
+		t.Fatalf("unrelated device reserved qts = %d, want 0", q)
+	}
+}
+
+func TestAcceptAfterDiscard(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	chat, _ := svc.RequestEncryption(ctx, requestFixture())
+	if _, _, err := svc.DiscardEncryption(ctx, chat.ID, adminUser, false); err != nil {
+		t.Fatalf("discard: %v", err)
+	}
+	_, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, validGA(), keyFP)
+	if !errors.Is(err, domain.ErrSecretChatAlreadyDeclined) {
+		t.Fatalf("err = %v, want ErrSecretChatAlreadyDeclined", err)
+	}
+}

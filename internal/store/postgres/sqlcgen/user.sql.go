@@ -7,21 +7,24 @@ package sqlcgen
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const createUser = `-- name: CreateUser :one
-INSERT INTO users (access_hash, phone, first_name, last_name, username, country_code)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at
+INSERT INTO users (access_hash, phone, first_name, last_name, username, country_code, premium_expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id
 `
 
 type CreateUserParams struct {
-	AccessHash  int64
-	Phone       string
-	FirstName   string
-	LastName    string
-	Username    string
-	CountryCode string
+	AccessHash       int64
+	Phone            string
+	FirstName        string
+	LastName         string
+	Username         string
+	CountryCode      string
+	PremiumExpiresAt pgtype.Timestamptz
 }
 
 func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, error) {
@@ -32,6 +35,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		arg.LastName,
 		arg.Username,
 		arg.CountryCode,
+		arg.PremiumExpiresAt,
 	)
 	var i User
 	err := row.Scan(
@@ -48,12 +52,28 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.Support,
 		&i.About,
 		&i.LastSeenAt,
+		&i.DefaultHistoryTtlPeriod,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
+		&i.ColorSet,
+		&i.Color,
+		&i.ColorBackgroundEmojiID,
+		&i.ProfileColorSet,
+		&i.ProfileColor,
+		&i.ProfileColorBackgroundEmojiID,
+		&i.BirthdayDay,
+		&i.BirthdayMonth,
+		&i.BirthdayYear,
+		&i.PersonalChannelID,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at FROM users WHERE id = $1
+SELECT id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id int64) (User, error) {
@@ -73,12 +93,28 @@ func (q *Queries) GetUserByID(ctx context.Context, id int64) (User, error) {
 		&i.Support,
 		&i.About,
 		&i.LastSeenAt,
+		&i.DefaultHistoryTtlPeriod,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
+		&i.ColorSet,
+		&i.Color,
+		&i.ColorBackgroundEmojiID,
+		&i.ProfileColorSet,
+		&i.ProfileColor,
+		&i.ProfileColorBackgroundEmojiID,
+		&i.BirthdayDay,
+		&i.BirthdayMonth,
+		&i.BirthdayYear,
+		&i.PersonalChannelID,
 	)
 	return i, err
 }
 
 const getUserByPhone = `-- name: GetUserByPhone :one
-SELECT id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at FROM users WHERE phone = $1
+SELECT id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id FROM users WHERE phone = $1
 `
 
 func (q *Queries) GetUserByPhone(ctx context.Context, phone string) (User, error) {
@@ -98,12 +134,28 @@ func (q *Queries) GetUserByPhone(ctx context.Context, phone string) (User, error
 		&i.Support,
 		&i.About,
 		&i.LastSeenAt,
+		&i.DefaultHistoryTtlPeriod,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
+		&i.ColorSet,
+		&i.Color,
+		&i.ColorBackgroundEmojiID,
+		&i.ProfileColorSet,
+		&i.ProfileColor,
+		&i.ProfileColorBackgroundEmojiID,
+		&i.BirthdayDay,
+		&i.BirthdayMonth,
+		&i.BirthdayYear,
+		&i.PersonalChannelID,
 	)
 	return i, err
 }
 
 const getUserByUsername = `-- name: GetUserByUsername :one
-SELECT id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at FROM users WHERE lower(username) = lower($1) AND username <> ''
+SELECT id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id FROM users WHERE lower(username) = lower($1) AND username <> ''
 `
 
 func (q *Queries) GetUserByUsername(ctx context.Context, lower string) (User, error) {
@@ -123,12 +175,28 @@ func (q *Queries) GetUserByUsername(ctx context.Context, lower string) (User, er
 		&i.Support,
 		&i.About,
 		&i.LastSeenAt,
+		&i.DefaultHistoryTtlPeriod,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
+		&i.ColorSet,
+		&i.Color,
+		&i.ColorBackgroundEmojiID,
+		&i.ProfileColorSet,
+		&i.ProfileColor,
+		&i.ProfileColorBackgroundEmojiID,
+		&i.BirthdayDay,
+		&i.BirthdayMonth,
+		&i.BirthdayYear,
+		&i.PersonalChannelID,
 	)
 	return i, err
 }
 
 const getUsersByIDs = `-- name: GetUsersByIDs :many
-SELECT id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at
+SELECT id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id
 FROM users
 WHERE id = ANY($1::bigint[])
 ORDER BY id
@@ -157,6 +225,22 @@ func (q *Queries) GetUsersByIDs(ctx context.Context, ids []int64) ([]User, error
 			&i.Support,
 			&i.About,
 			&i.LastSeenAt,
+			&i.DefaultHistoryTtlPeriod,
+			&i.IsBot,
+			&i.BotInfoVersion,
+			&i.PremiumExpiresAt,
+			&i.EmojiStatusDocumentID,
+			&i.EmojiStatusUntil,
+			&i.ColorSet,
+			&i.Color,
+			&i.ColorBackgroundEmojiID,
+			&i.ProfileColorSet,
+			&i.ProfileColor,
+			&i.ProfileColorBackgroundEmojiID,
+			&i.BirthdayDay,
+			&i.BirthdayMonth,
+			&i.BirthdayYear,
+			&i.PersonalChannelID,
 		); err != nil {
 			return nil, err
 		}
@@ -169,7 +253,7 @@ func (q *Queries) GetUsersByIDs(ctx context.Context, ids []int64) ([]User, error
 }
 
 const getUsersByPhones = `-- name: GetUsersByPhones :many
-SELECT id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at
+SELECT id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id
 FROM users
 WHERE phone = ANY($1::text[])
 ORDER BY id
@@ -198,6 +282,22 @@ func (q *Queries) GetUsersByPhones(ctx context.Context, phones []string) ([]User
 			&i.Support,
 			&i.About,
 			&i.LastSeenAt,
+			&i.DefaultHistoryTtlPeriod,
+			&i.IsBot,
+			&i.BotInfoVersion,
+			&i.PremiumExpiresAt,
+			&i.EmojiStatusDocumentID,
+			&i.EmojiStatusUntil,
+			&i.ColorSet,
+			&i.Color,
+			&i.ColorBackgroundEmojiID,
+			&i.ProfileColorSet,
+			&i.ProfileColor,
+			&i.ProfileColorBackgroundEmojiID,
+			&i.BirthdayDay,
+			&i.BirthdayMonth,
+			&i.BirthdayYear,
+			&i.PersonalChannelID,
 		); err != nil {
 			return nil, err
 		}
@@ -222,6 +322,17 @@ WITH matched AS (
     u.country_code,
     u.verified,
     u.support,
+    u.is_bot,
+    u.bot_info_version,
+    u.premium_expires_at,
+    u.emoji_status_document_id,
+    u.emoji_status_until,
+    u.color_set,
+    u.color,
+    u.color_background_emoji_id,
+    u.profile_color_set,
+    u.profile_color,
+    u.profile_color_background_emoji_id,
     u.last_seen_at,
     (c.contact_user_id IS NOT NULL)::boolean AS contact,
     COALESCE(c.mutual, false)::boolean AS mutual,
@@ -259,6 +370,17 @@ SELECT
   country_code,
   verified,
   support,
+  is_bot,
+  bot_info_version,
+  premium_expires_at,
+  emoji_status_document_id,
+  emoji_status_until,
+  color_set,
+  color,
+  color_background_emoji_id,
+  profile_color_set,
+  profile_color,
+  profile_color_background_emoji_id,
   last_seen_at,
   contact,
   mutual
@@ -276,19 +398,30 @@ type SearchUsersParams struct {
 }
 
 type SearchUsersRow struct {
-	ID          int64
-	AccessHash  int64
-	Phone       string
-	FirstName   string
-	LastName    string
-	About       string
-	Username    string
-	CountryCode string
-	Verified    bool
-	Support     bool
-	LastSeenAt  int64
-	Contact     bool
-	Mutual      bool
+	ID                            int64
+	AccessHash                    int64
+	Phone                         string
+	FirstName                     string
+	LastName                      string
+	About                         string
+	Username                      string
+	CountryCode                   string
+	Verified                      bool
+	Support                       bool
+	IsBot                         bool
+	BotInfoVersion                int32
+	PremiumExpiresAt              pgtype.Timestamptz
+	EmojiStatusDocumentID         int64
+	EmojiStatusUntil              int64
+	ColorSet                      bool
+	Color                         int32
+	ColorBackgroundEmojiID        int64
+	ProfileColorSet               bool
+	ProfileColor                  int32
+	ProfileColorBackgroundEmojiID int64
+	LastSeenAt                    int64
+	Contact                       bool
+	Mutual                        bool
 }
 
 func (q *Queries) SearchUsers(ctx context.Context, arg SearchUsersParams) ([]SearchUsersRow, error) {
@@ -317,6 +450,17 @@ func (q *Queries) SearchUsers(ctx context.Context, arg SearchUsersParams) ([]Sea
 			&i.CountryCode,
 			&i.Verified,
 			&i.Support,
+			&i.IsBot,
+			&i.BotInfoVersion,
+			&i.PremiumExpiresAt,
+			&i.EmojiStatusDocumentID,
+			&i.EmojiStatusUntil,
+			&i.ColorSet,
+			&i.Color,
+			&i.ColorBackgroundEmojiID,
+			&i.ProfileColorSet,
+			&i.ProfileColor,
+			&i.ProfileColorBackgroundEmojiID,
 			&i.LastSeenAt,
 			&i.Contact,
 			&i.Mutual,
@@ -329,6 +473,345 @@ func (q *Queries) SearchUsers(ctx context.Context, arg SearchUsersParams) ([]Sea
 		return nil, err
 	}
 	return items, nil
+}
+
+const setUserPremiumUntil = `-- name: SetUserPremiumUntil :one
+UPDATE users
+SET premium_expires_at = $1::timestamptz,
+    updated_at = now()
+WHERE id = $2::bigint
+RETURNING id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id
+`
+
+type SetUserPremiumUntilParams struct {
+	PremiumExpiresAt pgtype.Timestamptz
+	ID               int64
+}
+
+func (q *Queries) SetUserPremiumUntil(ctx context.Context, arg SetUserPremiumUntilParams) (User, error) {
+	row := q.db.QueryRow(ctx, setUserPremiumUntil, arg.PremiumExpiresAt, arg.ID)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.AccessHash,
+		&i.Phone,
+		&i.FirstName,
+		&i.LastName,
+		&i.Username,
+		&i.CountryCode,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Verified,
+		&i.Support,
+		&i.About,
+		&i.LastSeenAt,
+		&i.DefaultHistoryTtlPeriod,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
+		&i.ColorSet,
+		&i.Color,
+		&i.ColorBackgroundEmojiID,
+		&i.ProfileColorSet,
+		&i.ProfileColor,
+		&i.ProfileColorBackgroundEmojiID,
+		&i.BirthdayDay,
+		&i.BirthdayMonth,
+		&i.BirthdayYear,
+		&i.PersonalChannelID,
+	)
+	return i, err
+}
+
+const setUserVerified = `-- name: SetUserVerified :one
+UPDATE users
+SET verified = $1::boolean,
+    updated_at = now()
+WHERE id = $2::bigint
+RETURNING id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id
+`
+
+type SetUserVerifiedParams struct {
+	Verified bool
+	ID       int64
+}
+
+func (q *Queries) SetUserVerified(ctx context.Context, arg SetUserVerifiedParams) (User, error) {
+	row := q.db.QueryRow(ctx, setUserVerified, arg.Verified, arg.ID)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.AccessHash,
+		&i.Phone,
+		&i.FirstName,
+		&i.LastName,
+		&i.Username,
+		&i.CountryCode,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Verified,
+		&i.Support,
+		&i.About,
+		&i.LastSeenAt,
+		&i.DefaultHistoryTtlPeriod,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
+		&i.ColorSet,
+		&i.Color,
+		&i.ColorBackgroundEmojiID,
+		&i.ProfileColorSet,
+		&i.ProfileColor,
+		&i.ProfileColorBackgroundEmojiID,
+		&i.BirthdayDay,
+		&i.BirthdayMonth,
+		&i.BirthdayYear,
+		&i.PersonalChannelID,
+	)
+	return i, err
+}
+
+const sweepExpiredPremium = `-- name: SweepExpiredPremium :many
+UPDATE users
+SET premium_expires_at = NULL,
+    updated_at = now()
+WHERE id IN (
+  SELECT id FROM users
+  WHERE premium_expires_at IS NOT NULL
+    AND premium_expires_at <= $1::timestamptz
+  ORDER BY premium_expires_at
+  LIMIT $2::int
+)
+RETURNING id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id
+`
+
+type SweepExpiredPremiumParams struct {
+	Now        pgtype.Timestamptz
+	LimitCount int32
+}
+
+func (q *Queries) SweepExpiredPremium(ctx context.Context, arg SweepExpiredPremiumParams) ([]User, error) {
+	rows, err := q.db.Query(ctx, sweepExpiredPremium, arg.Now, arg.LimitCount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []User
+	for rows.Next() {
+		var i User
+		if err := rows.Scan(
+			&i.ID,
+			&i.AccessHash,
+			&i.Phone,
+			&i.FirstName,
+			&i.LastName,
+			&i.Username,
+			&i.CountryCode,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Verified,
+			&i.Support,
+			&i.About,
+			&i.LastSeenAt,
+			&i.DefaultHistoryTtlPeriod,
+			&i.IsBot,
+			&i.BotInfoVersion,
+			&i.PremiumExpiresAt,
+			&i.EmojiStatusDocumentID,
+			&i.EmojiStatusUntil,
+			&i.ColorSet,
+			&i.Color,
+			&i.ColorBackgroundEmojiID,
+			&i.ProfileColorSet,
+			&i.ProfileColor,
+			&i.ProfileColorBackgroundEmojiID,
+			&i.BirthdayDay,
+			&i.BirthdayMonth,
+			&i.BirthdayYear,
+			&i.PersonalChannelID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const updateUserBirthday = `-- name: UpdateUserBirthday :one
+UPDATE users
+SET birthday_day = $1::int,
+    birthday_month = $2::int,
+    birthday_year = $3::int,
+    updated_at = now()
+WHERE id = $4::bigint
+RETURNING id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id
+`
+
+type UpdateUserBirthdayParams struct {
+	BirthdayDay   int32
+	BirthdayMonth int32
+	BirthdayYear  int32
+	ID            int64
+}
+
+func (q *Queries) UpdateUserBirthday(ctx context.Context, arg UpdateUserBirthdayParams) (User, error) {
+	row := q.db.QueryRow(ctx, updateUserBirthday,
+		arg.BirthdayDay,
+		arg.BirthdayMonth,
+		arg.BirthdayYear,
+		arg.ID,
+	)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.AccessHash,
+		&i.Phone,
+		&i.FirstName,
+		&i.LastName,
+		&i.Username,
+		&i.CountryCode,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Verified,
+		&i.Support,
+		&i.About,
+		&i.LastSeenAt,
+		&i.DefaultHistoryTtlPeriod,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
+		&i.ColorSet,
+		&i.Color,
+		&i.ColorBackgroundEmojiID,
+		&i.ProfileColorSet,
+		&i.ProfileColor,
+		&i.ProfileColorBackgroundEmojiID,
+		&i.BirthdayDay,
+		&i.BirthdayMonth,
+		&i.BirthdayYear,
+		&i.PersonalChannelID,
+	)
+	return i, err
+}
+
+const updateUserColor = `-- name: UpdateUserColor :one
+UPDATE users
+SET color_set = $1::boolean,
+    color = $2::int,
+    color_background_emoji_id = $3::bigint,
+    updated_at = now()
+WHERE id = $4::bigint
+RETURNING id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id
+`
+
+type UpdateUserColorParams struct {
+	ColorSet          bool
+	Color             int32
+	BackgroundEmojiID int64
+	ID                int64
+}
+
+func (q *Queries) UpdateUserColor(ctx context.Context, arg UpdateUserColorParams) (User, error) {
+	row := q.db.QueryRow(ctx, updateUserColor,
+		arg.ColorSet,
+		arg.Color,
+		arg.BackgroundEmojiID,
+		arg.ID,
+	)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.AccessHash,
+		&i.Phone,
+		&i.FirstName,
+		&i.LastName,
+		&i.Username,
+		&i.CountryCode,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Verified,
+		&i.Support,
+		&i.About,
+		&i.LastSeenAt,
+		&i.DefaultHistoryTtlPeriod,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
+		&i.ColorSet,
+		&i.Color,
+		&i.ColorBackgroundEmojiID,
+		&i.ProfileColorSet,
+		&i.ProfileColor,
+		&i.ProfileColorBackgroundEmojiID,
+		&i.BirthdayDay,
+		&i.BirthdayMonth,
+		&i.BirthdayYear,
+		&i.PersonalChannelID,
+	)
+	return i, err
+}
+
+const updateUserEmojiStatus = `-- name: UpdateUserEmojiStatus :one
+UPDATE users
+SET emoji_status_document_id = $1::bigint,
+    emoji_status_until = $2::bigint,
+    updated_at = now()
+WHERE id = $3::bigint
+RETURNING id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id
+`
+
+type UpdateUserEmojiStatusParams struct {
+	EmojiStatusDocumentID int64
+	EmojiStatusUntil      int64
+	ID                    int64
+}
+
+func (q *Queries) UpdateUserEmojiStatus(ctx context.Context, arg UpdateUserEmojiStatusParams) (User, error) {
+	row := q.db.QueryRow(ctx, updateUserEmojiStatus, arg.EmojiStatusDocumentID, arg.EmojiStatusUntil, arg.ID)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.AccessHash,
+		&i.Phone,
+		&i.FirstName,
+		&i.LastName,
+		&i.Username,
+		&i.CountryCode,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Verified,
+		&i.Support,
+		&i.About,
+		&i.LastSeenAt,
+		&i.DefaultHistoryTtlPeriod,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
+		&i.ColorSet,
+		&i.Color,
+		&i.ColorBackgroundEmojiID,
+		&i.ProfileColorSet,
+		&i.ProfileColor,
+		&i.ProfileColorBackgroundEmojiID,
+		&i.BirthdayDay,
+		&i.BirthdayMonth,
+		&i.BirthdayYear,
+		&i.PersonalChannelID,
+	)
+	return i, err
 }
 
 const updateUserLastSeen = `-- name: UpdateUserLastSeen :exec
@@ -348,6 +831,56 @@ func (q *Queries) UpdateUserLastSeen(ctx context.Context, arg UpdateUserLastSeen
 	return err
 }
 
+const updateUserPersonalChannel = `-- name: UpdateUserPersonalChannel :one
+UPDATE users
+SET personal_channel_id = $1::bigint,
+    updated_at = now()
+WHERE id = $2::bigint
+RETURNING id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id
+`
+
+type UpdateUserPersonalChannelParams struct {
+	PersonalChannelID int64
+	ID                int64
+}
+
+func (q *Queries) UpdateUserPersonalChannel(ctx context.Context, arg UpdateUserPersonalChannelParams) (User, error) {
+	row := q.db.QueryRow(ctx, updateUserPersonalChannel, arg.PersonalChannelID, arg.ID)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.AccessHash,
+		&i.Phone,
+		&i.FirstName,
+		&i.LastName,
+		&i.Username,
+		&i.CountryCode,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Verified,
+		&i.Support,
+		&i.About,
+		&i.LastSeenAt,
+		&i.DefaultHistoryTtlPeriod,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
+		&i.ColorSet,
+		&i.Color,
+		&i.ColorBackgroundEmojiID,
+		&i.ProfileColorSet,
+		&i.ProfileColor,
+		&i.ProfileColorBackgroundEmojiID,
+		&i.BirthdayDay,
+		&i.BirthdayMonth,
+		&i.BirthdayYear,
+		&i.PersonalChannelID,
+	)
+	return i, err
+}
+
 const updateUserProfile = `-- name: UpdateUserProfile :one
 UPDATE users
 SET first_name = $2,
@@ -355,7 +888,7 @@ SET first_name = $2,
     about = $4,
     updated_at = now()
 WHERE id = $1
-RETURNING id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at
+RETURNING id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id
 `
 
 type UpdateUserProfileParams struct {
@@ -387,6 +920,81 @@ func (q *Queries) UpdateUserProfile(ctx context.Context, arg UpdateUserProfilePa
 		&i.Support,
 		&i.About,
 		&i.LastSeenAt,
+		&i.DefaultHistoryTtlPeriod,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
+		&i.ColorSet,
+		&i.Color,
+		&i.ColorBackgroundEmojiID,
+		&i.ProfileColorSet,
+		&i.ProfileColor,
+		&i.ProfileColorBackgroundEmojiID,
+		&i.BirthdayDay,
+		&i.BirthdayMonth,
+		&i.BirthdayYear,
+		&i.PersonalChannelID,
+	)
+	return i, err
+}
+
+const updateUserProfileColor = `-- name: UpdateUserProfileColor :one
+UPDATE users
+SET profile_color_set = $1::boolean,
+    profile_color = $2::int,
+    profile_color_background_emoji_id = $3::bigint,
+    updated_at = now()
+WHERE id = $4::bigint
+RETURNING id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id
+`
+
+type UpdateUserProfileColorParams struct {
+	ColorSet          bool
+	Color             int32
+	BackgroundEmojiID int64
+	ID                int64
+}
+
+func (q *Queries) UpdateUserProfileColor(ctx context.Context, arg UpdateUserProfileColorParams) (User, error) {
+	row := q.db.QueryRow(ctx, updateUserProfileColor,
+		arg.ColorSet,
+		arg.Color,
+		arg.BackgroundEmojiID,
+		arg.ID,
+	)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.AccessHash,
+		&i.Phone,
+		&i.FirstName,
+		&i.LastName,
+		&i.Username,
+		&i.CountryCode,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Verified,
+		&i.Support,
+		&i.About,
+		&i.LastSeenAt,
+		&i.DefaultHistoryTtlPeriod,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
+		&i.ColorSet,
+		&i.Color,
+		&i.ColorBackgroundEmojiID,
+		&i.ProfileColorSet,
+		&i.ProfileColor,
+		&i.ProfileColorBackgroundEmojiID,
+		&i.BirthdayDay,
+		&i.BirthdayMonth,
+		&i.BirthdayYear,
+		&i.PersonalChannelID,
 	)
 	return i, err
 }
@@ -396,7 +1004,7 @@ UPDATE users
 SET username = $2,
     updated_at = now()
 WHERE id = $1
-RETURNING id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at
+RETURNING id, access_hash, phone, first_name, last_name, username, country_code, created_at, updated_at, verified, support, about, last_seen_at, default_history_ttl_period, is_bot, bot_info_version, premium_expires_at, emoji_status_document_id, emoji_status_until, color_set, color, color_background_emoji_id, profile_color_set, profile_color, profile_color_background_emoji_id, birthday_day, birthday_month, birthday_year, personal_channel_id
 `
 
 type UpdateUserUsernameParams struct {
@@ -421,6 +1029,22 @@ func (q *Queries) UpdateUserUsername(ctx context.Context, arg UpdateUserUsername
 		&i.Support,
 		&i.About,
 		&i.LastSeenAt,
+		&i.DefaultHistoryTtlPeriod,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
+		&i.ColorSet,
+		&i.Color,
+		&i.ColorBackgroundEmojiID,
+		&i.ProfileColorSet,
+		&i.ProfileColor,
+		&i.ProfileColorBackgroundEmojiID,
+		&i.BirthdayDay,
+		&i.BirthdayMonth,
+		&i.BirthdayYear,
+		&i.PersonalChannelID,
 	)
 	return i, err
 }

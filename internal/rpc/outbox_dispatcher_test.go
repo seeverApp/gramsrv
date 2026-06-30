@@ -3,10 +3,12 @@ package rpc
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/gotd/td/bin"
+	"github.com/gotd/td/clock"
 	"github.com/gotd/td/proto"
 	"github.com/gotd/td/tg"
 	"go.uber.org/zap/zaptest"
@@ -150,6 +152,400 @@ func TestOutboxDispatcherBatchPath(t *testing.T) {
 	}
 }
 
+func TestRouterBuildOutboxUpdatesProjectsSenderPerViewerAndCaches(t *testing.T) {
+	const (
+		senderUserID = int64(1000000001)
+		viewerUserID = int64(1000000002)
+	)
+	projected := domain.User{
+		ID:        senderUserID,
+		FirstName: "Sender",
+		PhotoID:   9301,
+		PhotoDCID: 2,
+	}
+	users := &countingOutboxUsersService{users: map[int64]domain.User{senderUserID: projected}}
+	router := New(Config{}, Deps{Users: users}, zaptest.NewLogger(t), clock.System)
+	requests := make([]OutboxUpdateRequest, 0, 2)
+	for i, pts := range []int{7, 8} {
+		msg := domain.Message{
+			ID:          10 + i,
+			OwnerUserID: viewerUserID,
+			Peer:        domain.Peer{Type: domain.PeerTypeUser, ID: senderUserID},
+			From:        domain.Peer{Type: domain.PeerTypeUser, ID: senderUserID},
+			Date:        1700000300 + i,
+			Body:        "hello",
+			Pts:         pts,
+		}
+		requests = append(requests, OutboxUpdateRequest{
+			TargetUserID: viewerUserID,
+			Event: domain.UpdateEvent{
+				UserID:   viewerUserID,
+				Type:     domain.UpdateEventNewMessage,
+				Pts:      pts,
+				PtsCount: 1,
+				Date:     msg.Date,
+				Message:  msg,
+				Users:    []domain.User{{ID: senderUserID, FirstName: "Stale"}},
+			},
+		})
+	}
+
+	updates := router.BuildOutboxUpdates(context.Background(), requests)
+	if len(updates) != len(requests) {
+		t.Fatalf("updates count = %d, want %d", len(updates), len(requests))
+	}
+	for i, update := range updates {
+		if update == nil || len(update.Users) != 1 {
+			t.Fatalf("updates[%d].Users = %+v, want projected sender", i, update)
+		}
+		user, ok := update.Users[0].(*tg.User)
+		if !ok {
+			t.Fatalf("updates[%d].Users[0] = %T, want *tg.User", i, update.Users[0])
+		}
+		if user.FirstName != "Sender" {
+			t.Fatalf("updates[%d] user first_name = %q, want projected Sender", i, user.FirstName)
+		}
+		photo, ok := user.Photo.(*tg.UserProfilePhoto)
+		if !ok || photo.PhotoID != projected.PhotoID || photo.DCID != projected.PhotoDCID {
+			t.Fatalf("updates[%d] user photo = %#v, want photo_id=%d dc=%d", i, user.Photo, projected.PhotoID, projected.PhotoDCID)
+		}
+	}
+	if len(users.calls) != 1 {
+		t.Fatalf("ByIDs calls = %+v, want one batch call for repeated sender", users.calls)
+	}
+	if users.calls[0].viewerUserID != viewerUserID || !reflect.DeepEqual(users.calls[0].ids, []int64{senderUserID}) {
+		t.Fatalf("ByIDs call = %+v, want viewer=%d ids=[%d]", users.calls[0], viewerUserID, senderUserID)
+	}
+}
+
+func TestRouterBuildOutboxUpdatesSeparatesViewerCache(t *testing.T) {
+	const senderUserID = int64(1000000001)
+	users := &viewerSpecificOutboxUsersService{}
+	router := New(Config{}, Deps{Users: users}, zaptest.NewLogger(t), clock.System)
+	requests := []OutboxUpdateRequest{
+		{
+			TargetUserID: 1000000002,
+			Event: domain.UpdateEvent{
+				UserID:   1000000002,
+				Type:     domain.UpdateEventNewMessage,
+				Pts:      7,
+				PtsCount: 1,
+				Date:     1700000307,
+				Message: domain.Message{
+					ID:          10,
+					OwnerUserID: 1000000002,
+					Peer:        domain.Peer{Type: domain.PeerTypeUser, ID: senderUserID},
+					From:        domain.Peer{Type: domain.PeerTypeUser, ID: senderUserID},
+					Date:        1700000307,
+					Pts:         7,
+				},
+			},
+		},
+		{
+			TargetUserID: 1000000003,
+			Event: domain.UpdateEvent{
+				UserID:   1000000003,
+				Type:     domain.UpdateEventNewMessage,
+				Pts:      8,
+				PtsCount: 1,
+				Date:     1700000308,
+				Message: domain.Message{
+					ID:          11,
+					OwnerUserID: 1000000003,
+					Peer:        domain.Peer{Type: domain.PeerTypeUser, ID: senderUserID},
+					From:        domain.Peer{Type: domain.PeerTypeUser, ID: senderUserID},
+					Date:        1700000308,
+					Pts:         8,
+				},
+			},
+		},
+	}
+
+	updates := router.BuildOutboxUpdates(context.Background(), requests)
+	if len(updates) != 2 || updates[0] == nil || updates[1] == nil {
+		t.Fatalf("updates = %+v, want two updates", updates)
+	}
+	firstUser, ok := updates[0].Users[0].(*tg.User)
+	if !ok {
+		t.Fatalf("updates[0].Users[0] = %T, want *tg.User", updates[0].Users[0])
+	}
+	secondUser, ok := updates[1].Users[0].(*tg.User)
+	if !ok {
+		t.Fatalf("updates[1].Users[0] = %T, want *tg.User", updates[1].Users[0])
+	}
+	if firstUser.FirstName != "viewer2" || secondUser.FirstName != "viewer3" {
+		t.Fatalf("projected users = %q/%q, want viewer-specific names", firstUser.FirstName, secondUser.FirstName)
+	}
+	wantCalls := []outboxUsersCall{
+		{viewerUserID: 1000000002, ids: []int64{senderUserID}},
+		{viewerUserID: 1000000003, ids: []int64{senderUserID}},
+	}
+	if !sameOutboxUsersCalls(users.calls, wantCalls) {
+		t.Fatalf("ByIDs calls = %+v, want %+v", users.calls, wantCalls)
+	}
+}
+
+func TestChannelMessageUpdatesIncludesActionUsers(t *testing.T) {
+	const (
+		viewerUserID = int64(1000000002)
+		senderUserID = int64(1000000001)
+		actionUserID = int64(1000000003)
+		channelID    = int64(2000000001)
+		messageID    = 41
+		messageDate  = 1700000330
+		messagePts   = 17
+	)
+	msg := domain.ChannelMessage{
+		ID:           messageID,
+		ChannelID:    channelID,
+		SenderUserID: senderUserID,
+		From:         domain.Peer{Type: domain.PeerTypeUser, ID: senderUserID},
+		Date:         messageDate,
+		Action: &domain.ChannelMessageAction{
+			Type:    domain.ChannelActionChatAddUser,
+			UserIDs: []int64{actionUserID},
+		},
+		Pts: messagePts,
+	}
+	router := New(Config{}, Deps{
+		Users: mapUsersService{users: map[int64]domain.User{
+			senderUserID: {ID: senderUserID, FirstName: "Sender"},
+			actionUserID: {ID: actionUserID, FirstName: "Invitee", PhotoID: 9302, PhotoDCID: 2},
+		}},
+	}, zaptest.NewLogger(t), clock.System)
+
+	updates := router.channelMessageUpdatesWithPeerCache(context.Background(), viewerUserID, domain.SendChannelMessageResult{
+		Channel: domain.Channel{ID: channelID, AccessHash: 44, Title: "Group", Megagroup: true, Date: messageDate},
+		Message: msg,
+		Event: domain.ChannelUpdateEvent{
+			ChannelID: channelID,
+			Type:      domain.ChannelUpdateNewMessage,
+			Pts:       messagePts,
+			PtsCount:  1,
+			Date:      messageDate,
+			Message:   msg,
+		},
+	}, 0, newViewerPeerCache(router))
+	got := map[int64]*tg.User{}
+	for _, user := range updates.Users {
+		if u, ok := user.(*tg.User); ok {
+			got[u.ID] = u
+		}
+	}
+	if _, ok := got[senderUserID]; !ok {
+		t.Fatalf("sender user missing from updates.users: %+v", updates.Users)
+	}
+	actionUser, ok := got[actionUserID]
+	if !ok {
+		t.Fatalf("action user missing from updates.users: %+v", updates.Users)
+	}
+	if photo, ok := actionUser.Photo.(*tg.UserProfilePhoto); !ok || photo.PhotoID != 9302 {
+		t.Fatalf("action user photo = %#v, want projected profile photo", actionUser.Photo)
+	}
+}
+
+func TestOutboxDispatcherBatchPathUsesUpdateBuilder(t *testing.T) {
+	items := []store.DispatchOutboxItem{
+		{ID: 3, TargetUserID: 1000000003, Pts: 12, EventType: domain.UpdateEventReadHistoryInbox},
+		{ID: 1, TargetUserID: 1000000002, Pts: 10, EventType: domain.UpdateEventReadHistoryInbox},
+	}
+	events := &batchEventStore{captureUpdateEventStore: &captureUpdateEventStore{events: []domain.UpdateEvent{
+		{
+			UserID:           1000000002,
+			Type:             domain.UpdateEventReadHistoryInbox,
+			Pts:              10,
+			PtsCount:         1,
+			Date:             1700000310,
+			Peer:             domain.Peer{Type: domain.PeerTypeUser, ID: 1000000001},
+			MaxID:            10,
+			StillUnreadCount: 0,
+		},
+		{
+			UserID:           1000000003,
+			Type:             domain.UpdateEventReadHistoryInbox,
+			Pts:              12,
+			PtsCount:         1,
+			Date:             1700000312,
+			Peer:             domain.Peer{Type: domain.PeerTypeUser, ID: 1000000001},
+			MaxID:            12,
+			StillUnreadCount: 0,
+		},
+	}}}
+	outbox := &batchDispatchOutbox{captureDispatchOutbox: &captureDispatchOutbox{items: items}}
+	sessions := &orderedOutboxCaptureSessions{}
+	var gotRequests []OutboxUpdateRequest
+	builder := func(_ context.Context, requests []OutboxUpdateRequest) []*tg.Updates {
+		gotRequests = append([]OutboxUpdateRequest(nil), requests...)
+		out := make([]*tg.Updates, len(requests))
+		for i, req := range requests {
+			out[i] = &tg.Updates{
+				Updates: []tg.UpdateClass{&tg.UpdateReadHistoryInbox{
+					Peer:             &tg.PeerUser{UserID: req.Event.Peer.ID},
+					MaxID:            req.Event.MaxID,
+					StillUnreadCount: req.Event.StillUnreadCount,
+					Pts:              req.Event.Pts,
+					PtsCount:         req.Event.PtsCount,
+				}},
+				Date: req.Event.Date,
+			}
+		}
+		return out
+	}
+	dispatcher := NewOutboxDispatcher(events, outbox, sessions, zaptest.NewLogger(t), WithOutboxUpdateBuilder(builder))
+
+	dispatcher.DispatchOnce(context.Background())
+
+	if len(gotRequests) != 2 {
+		t.Fatalf("builder requests = %+v, want two requests", gotRequests)
+	}
+	if gotRequests[0].TargetUserID != 1000000002 || gotRequests[0].Event.Pts != 10 || gotRequests[1].TargetUserID != 1000000003 || gotRequests[1].Event.Pts != 12 {
+		t.Fatalf("builder requests = %+v, want sorted by target user then pts", gotRequests)
+	}
+	if got := sessions.pushedPts(); !reflect.DeepEqual(got, []int{10, 12}) {
+		t.Fatalf("pushed pts = %v, want builder updates in sorted order", got)
+	}
+	if len(outbox.deliveredBatch) != 2 {
+		t.Fatalf("delivered batch = %+v, want two delivered items", outbox.deliveredBatch)
+	}
+}
+
+func TestOutboxDispatcherOrdersClaimedItemsByUserPts(t *testing.T) {
+	const targetUserID int64 = 1000000002
+	items := []store.DispatchOutboxItem{
+		{ID: 3, TargetUserID: targetUserID, Pts: 12, EventType: domain.UpdateEventNewMessage},
+		{ID: 1, TargetUserID: targetUserID, Pts: 10, EventType: domain.UpdateEventNewMessage},
+		{ID: 2, TargetUserID: targetUserID, Pts: 11, EventType: domain.UpdateEventNewMessage},
+	}
+	events := make([]domain.UpdateEvent, 0, len(items))
+	for _, pts := range []int{10, 11, 12} {
+		msg := domain.Message{
+			ID:          pts,
+			OwnerUserID: targetUserID,
+			Peer:        domain.Peer{Type: domain.PeerTypeUser, ID: 1000000001},
+			From:        domain.Peer{Type: domain.PeerTypeUser, ID: 1000000001},
+			Date:        1700000300 + pts,
+			Body:        "ordered",
+			Pts:         pts,
+		}
+		events = append(events, domain.UpdateEvent{
+			UserID:   targetUserID,
+			Type:     domain.UpdateEventNewMessage,
+			Pts:      pts,
+			PtsCount: 1,
+			Date:     msg.Date,
+			Message:  msg,
+			Users:    []domain.User{{ID: msg.From.ID, FirstName: "Sender"}},
+		})
+	}
+	eventStore := &batchEventStore{captureUpdateEventStore: &captureUpdateEventStore{events: events}}
+	outbox := &batchDispatchOutbox{captureDispatchOutbox: &captureDispatchOutbox{items: items}}
+	sessions := &orderedOutboxCaptureSessions{}
+	dispatcher := NewOutboxDispatcher(eventStore, outbox, sessions, zaptest.NewLogger(t))
+
+	dispatcher.DispatchOnce(context.Background())
+
+	want := []int{10, 11, 12}
+	if got := sessions.pushedPts(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("pushed pts = %v, want %v", got, want)
+	}
+	if got := eventStore.batchCursors; len(got) != len(want) {
+		t.Fatalf("batch cursors = %+v, want %d cursors", got, len(want))
+	} else {
+		for i, cursor := range got {
+			if cursor.UserID != targetUserID || cursor.Pts != want[i] {
+				t.Fatalf("batch cursor[%d] = %+v, want user=%d pts=%d", i, cursor, targetUserID, want[i])
+			}
+		}
+	}
+}
+
+type outboxUsersCall struct {
+	viewerUserID int64
+	ids          []int64
+}
+
+func sameOutboxUsersCalls(got, want []outboxUsersCall) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	used := make([]bool, len(want))
+	for _, call := range got {
+		found := false
+		for i, expected := range want {
+			if used[i] || call.viewerUserID != expected.viewerUserID || !reflect.DeepEqual(call.ids, expected.ids) {
+				continue
+			}
+			used[i] = true
+			found = true
+			break
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+type countingOutboxUsersService struct {
+	users map[int64]domain.User
+	calls []outboxUsersCall
+}
+
+type viewerSpecificOutboxUsersService struct {
+	calls []outboxUsersCall
+}
+
+func (s *viewerSpecificOutboxUsersService) Self(_ context.Context, userID int64) (domain.User, error) {
+	return domain.User{ID: userID, FirstName: "self"}, nil
+}
+
+func (s *viewerSpecificOutboxUsersService) ByID(_ context.Context, currentUserID, userID int64) (domain.User, bool, error) {
+	return domain.User{ID: userID, FirstName: viewerSpecificName(currentUserID)}, true, nil
+}
+
+func (s *viewerSpecificOutboxUsersService) ByIDs(_ context.Context, viewerUserID int64, userIDs []int64) ([]domain.User, error) {
+	s.calls = append(s.calls, outboxUsersCall{viewerUserID: viewerUserID, ids: append([]int64(nil), userIDs...)})
+	out := make([]domain.User, 0, len(userIDs))
+	for _, userID := range userIDs {
+		out = append(out, domain.User{ID: userID, FirstName: viewerSpecificName(viewerUserID)})
+	}
+	return out, nil
+}
+
+func viewerSpecificName(viewerUserID int64) string {
+	switch viewerUserID {
+	case 1000000002:
+		return "viewer2"
+	case 1000000003:
+		return "viewer3"
+	default:
+		return "viewer"
+	}
+}
+
+func (s *countingOutboxUsersService) Self(_ context.Context, userID int64) (domain.User, error) {
+	if u, ok := s.users[userID]; ok {
+		return u, nil
+	}
+	return domain.User{}, nil
+}
+
+func (s *countingOutboxUsersService) ByID(_ context.Context, _ int64, userID int64) (domain.User, bool, error) {
+	u, ok := s.users[userID]
+	return u, ok, nil
+}
+
+func (s *countingOutboxUsersService) ByIDs(_ context.Context, viewerUserID int64, userIDs []int64) ([]domain.User, error) {
+	s.calls = append(s.calls, outboxUsersCall{viewerUserID: viewerUserID, ids: append([]int64(nil), userIDs...)})
+	out := make([]domain.User, 0, len(userIDs))
+	for _, id := range userIDs {
+		if u, ok := s.users[id]; ok {
+			out = append(out, u)
+		}
+	}
+	return out, nil
+}
+
 func TestOutboxDispatcherUsesBestEffortPush(t *testing.T) {
 	msg := domain.Message{
 		ID:          10,
@@ -200,6 +596,38 @@ func (s *captureBestEffortSessions) PushToUserExceptSessionBestEffort(ctx contex
 	return s.PushToUserExceptSession(ctx, userID, excludeSessionID, t, msg)
 }
 
+type orderedOutboxCaptureSessions struct {
+	captureSessions
+	pushed []int
+}
+
+func (s *orderedOutboxCaptureSessions) PushToUserExceptSession(_ context.Context, userID, excludeSessionID int64, t proto.MessageType, msg bin.Encoder) (int, error) {
+	if updates, ok := msg.(*tg.Updates); ok {
+		s.pushed = append(s.pushed, firstOutboxUpdatePts(updates))
+	}
+	return s.captureSessions.PushToUserExceptSession(context.Background(), userID, excludeSessionID, t, msg)
+}
+
+func (s *orderedOutboxCaptureSessions) pushedPts() []int {
+	return append([]int(nil), s.pushed...)
+}
+
+func firstOutboxUpdatePts(updates *tg.Updates) int {
+	if updates == nil || len(updates.Updates) == 0 {
+		return 0
+	}
+	switch update := updates.Updates[0].(type) {
+	case *tg.UpdateNewMessage:
+		return update.Pts
+	case *tg.UpdateReadHistoryInbox:
+		return update.Pts
+	case *tg.UpdateReadHistoryOutbox:
+		return update.Pts
+	default:
+		return 0
+	}
+}
+
 // batchEventStore 给 captureUpdateEventStore 加上 BatchByCursor 批量能力。
 type batchEventStore struct {
 	*captureUpdateEventStore
@@ -236,6 +664,22 @@ type captureUpdateEventStore struct {
 
 func (s *captureUpdateEventStore) Append(context.Context, int64, domain.UpdateEvent) error {
 	return nil
+}
+
+func (s *captureUpdateEventStore) AppendAllocated(_ context.Context, userID int64, event domain.UpdateEvent) (domain.UpdateEvent, error) {
+	if event.PtsCount <= 0 {
+		event.PtsCount = 1
+	}
+	event.UserID = userID
+	maxPts := 0
+	for _, existing := range s.events {
+		if existing.UserID == userID && existing.Pts > maxPts {
+			maxPts = existing.Pts
+		}
+	}
+	event.Pts = maxPts + event.PtsCount
+	s.events = append(s.events, event)
+	return event, nil
 }
 
 func (s *captureUpdateEventStore) ListAfter(_ context.Context, _ int64, pts, limit int) ([]domain.UpdateEvent, error) {
@@ -276,10 +720,6 @@ func (s *captureUpdateEventStore) MaxContiguousPts(context.Context, int64) (int,
 	return contiguous, nil
 }
 
-func (s *captureUpdateEventStore) AdvanceContiguousPts(ctx context.Context, userID int64) (int, error) {
-	return s.MaxContiguousPts(ctx, userID)
-}
-
 type captureDispatchOutbox struct {
 	items           []store.DispatchOutboxItem
 	delivered       bool
@@ -292,6 +732,7 @@ type captureDispatchOutbox struct {
 type captureScopedSessions struct {
 	*captureSessions
 	scopedAuthKeyID [8]byte
+	immediatePush   bool
 }
 
 func (s *captureScopedSessions) BindAuthKeyForSession(rawAuthKeyID [8]byte, sessionID int64, authKeyID [8]byte) {
@@ -319,6 +760,12 @@ func (s *captureScopedSessions) UserIDResolvedForAuthKey([8]byte, int64) (int64,
 func (s *captureScopedSessions) SetReceivesUpdatesForAuthKey([8]byte, int64, bool) {}
 
 func (s *captureScopedSessions) PushToSessionForAuthKey(_ context.Context, rawAuthKeyID [8]byte, sessionID int64, t proto.MessageType, msg bin.Encoder) error {
+	s.scopedAuthKeyID = rawAuthKeyID
+	return s.PushToSession(context.Background(), sessionID, t, msg)
+}
+
+func (s *captureScopedSessions) PushToSessionForAuthKeyImmediate(_ context.Context, rawAuthKeyID [8]byte, sessionID int64, t proto.MessageType, msg bin.Encoder) error {
+	s.immediatePush = true
 	s.scopedAuthKeyID = rawAuthKeyID
 	return s.PushToSession(context.Background(), sessionID, t, msg)
 }

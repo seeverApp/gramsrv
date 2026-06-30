@@ -1,0 +1,246 @@
+package rpc
+
+import (
+	"context"
+	"sync"
+	"telesrv/internal/domain"
+)
+
+type captureAuthService struct {
+	resolvedAuthKeyID     [8]byte
+	hasResolved           bool
+	resolveCount          int
+	userID                int64
+	userIDCount           int
+	signInUser            domain.User
+	signUpPhone           string
+	signUpHash            string
+	signUpFirstName       string
+	signUpLastName        string
+	signUpAuth            domain.Authorization
+	signUpUser            domain.User
+	acceptedAuth          domain.Authorization
+	acceptedUserID        int64
+	authorizations        []domain.Authorization
+	authorizationLookups  int
+	authorizationLists    int
+	loggedOutAuthKeyID    [8]byte
+	pendingPasswordUserID int64
+	pendingPassword       bool
+	completedPasswordKey  [8]byte
+	completePasswordCount int
+}
+
+type blockingUserAuthService struct {
+	userID  int64
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	count   int
+}
+
+func (s *blockingUserAuthService) UserIDCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.count
+}
+
+func (s *blockingUserAuthService) BindTempAuthKey(context.Context, int64, domain.TempAuthKeyBinding) error {
+	return nil
+}
+
+func (s *blockingUserAuthService) ResolveAuthKey(context.Context, [8]byte) ([8]byte, bool, error) {
+	return [8]byte{}, false, nil
+}
+
+func (s *blockingUserAuthService) UserID(ctx context.Context, _ [8]byte) (int64, bool, error) {
+	s.mu.Lock()
+	s.count++
+	s.mu.Unlock()
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-s.release:
+		return s.userID, s.userID != 0, nil
+	case <-ctx.Done():
+		return 0, false, ctx.Err()
+	}
+}
+
+func (s *blockingUserAuthService) SendCode(context.Context, string) (string, error) {
+	return "", nil
+}
+
+func (s *blockingUserAuthService) ResendCode(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
+func (s *blockingUserAuthService) CancelCode(context.Context, string, string) error {
+	return nil
+}
+
+func (s *blockingUserAuthService) SignIn(context.Context, domain.Authorization, string, string, string) (domain.User, domain.Message, bool, error) {
+	return domain.User{}, domain.Message{}, false, nil
+}
+
+func (s *blockingUserAuthService) SignInWithEmail(context.Context, domain.Authorization, string, string, string) (domain.User, domain.Message, bool, error) {
+	return domain.User{}, domain.Message{}, false, nil
+}
+
+func (s *blockingUserAuthService) BindVerifiedLogin(_ context.Context, _ domain.Authorization, userID int64) (domain.User, error) {
+	return domain.User{ID: userID}, nil
+}
+
+func (s *blockingUserAuthService) SignUp(context.Context, domain.Authorization, string, string, string, string) (domain.User, domain.Message, error) {
+	return domain.User{}, domain.Message{}, nil
+}
+
+func (s *blockingUserAuthService) AcceptLoginToken(context.Context, domain.Authorization, int64) (domain.Authorization, error) {
+	return domain.Authorization{}, nil
+}
+
+func (s *blockingUserAuthService) SignInBot(context.Context, domain.Authorization, string) (domain.User, error) {
+	return domain.User{}, domain.ErrBotTokenInvalid
+}
+
+func (s *blockingUserAuthService) LogOut(context.Context, [8]byte) error {
+	return nil
+}
+
+func (s *blockingUserAuthService) Authorization(context.Context, [8]byte) (domain.Authorization, bool, error) {
+	return domain.Authorization{}, false, nil
+}
+
+func (s *blockingUserAuthService) ListAuthorizations(context.Context, int64) ([]domain.Authorization, error) {
+	return nil, nil
+}
+
+func (s *blockingUserAuthService) ResetAuthorization(context.Context, int64, int64) (domain.Authorization, bool, error) {
+	return domain.Authorization{}, false, nil
+}
+
+func (s *blockingUserAuthService) ResetAuthorizations(context.Context, int64, [8]byte) ([]domain.Authorization, error) {
+	return nil, nil
+}
+
+func (s *blockingUserAuthService) PendingPasswordUserID(context.Context, [8]byte) (int64, bool, error) {
+	return 0, false, nil
+}
+
+func (s *blockingUserAuthService) CompletePasswordSignIn(context.Context, [8]byte) error {
+	return nil
+}
+
+func (s *captureAuthService) BindTempAuthKey(context.Context, int64, domain.TempAuthKeyBinding) error {
+	return nil
+}
+
+func (s *captureAuthService) ResolveAuthKey(context.Context, [8]byte) ([8]byte, bool, error) {
+	s.resolveCount++
+	return s.resolvedAuthKeyID, s.hasResolved, nil
+}
+
+func (s *captureAuthService) UserID(context.Context, [8]byte) (int64, bool, error) {
+	s.userIDCount++
+	return s.userID, s.userID != 0, nil
+}
+
+func (s *captureAuthService) SendCode(context.Context, string) (string, error) {
+	return "", nil
+}
+
+func (s *captureAuthService) ResendCode(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
+func (s *captureAuthService) CancelCode(context.Context, string, string) error {
+	return nil
+}
+
+func (s *captureAuthService) SignIn(context.Context, domain.Authorization, string, string, string) (domain.User, domain.Message, bool, error) {
+	if s.signInUser.ID != 0 {
+		return s.signInUser, domain.Message{}, false, nil
+	}
+	return domain.User{}, domain.Message{}, false, nil
+}
+
+func (s *captureAuthService) SignInWithEmail(context.Context, domain.Authorization, string, string, string) (domain.User, domain.Message, bool, error) {
+	if s.signInUser.ID != 0 {
+		return s.signInUser, domain.Message{}, false, nil
+	}
+	return domain.User{}, domain.Message{}, false, nil
+}
+
+func (s *captureAuthService) BindVerifiedLogin(_ context.Context, _ domain.Authorization, userID int64) (domain.User, error) {
+	if s.signInUser.ID != 0 {
+		return s.signInUser, nil
+	}
+	return domain.User{ID: userID}, nil
+}
+
+func (s *captureAuthService) SignUp(_ context.Context, a domain.Authorization, phone, hash, first, last string) (domain.User, domain.Message, error) {
+	s.signUpAuth = a
+	s.signUpPhone = phone
+	s.signUpHash = hash
+	s.signUpFirstName = first
+	s.signUpLastName = last
+	if s.signUpUser.ID != 0 {
+		return s.signUpUser, domain.Message{}, nil
+	}
+	return domain.User{}, domain.Message{}, nil
+}
+
+func (s *captureAuthService) AcceptLoginToken(_ context.Context, a domain.Authorization, userID int64) (domain.Authorization, error) {
+	a.UserID = userID
+	if a.Hash == 0 {
+		a.Hash = 77
+	}
+	s.acceptedAuth = a
+	s.acceptedUserID = userID
+	return a, nil
+}
+
+func (s *captureAuthService) SignInBot(context.Context, domain.Authorization, string) (domain.User, error) {
+	if s.signInUser.ID != 0 {
+		return s.signInUser, nil
+	}
+	return domain.User{}, domain.ErrBotTokenInvalid
+}
+
+func (s *captureAuthService) LogOut(_ context.Context, authKeyID [8]byte) error {
+	s.loggedOutAuthKeyID = authKeyID
+	return nil
+}
+
+func (s *captureAuthService) Authorization(_ context.Context, authKeyID [8]byte) (domain.Authorization, bool, error) {
+	s.authorizationLookups++
+	for _, item := range s.authorizations {
+		if item.AuthKeyID == authKeyID {
+			return item, true, nil
+		}
+	}
+	return domain.Authorization{}, false, nil
+}
+
+func (s *captureAuthService) ListAuthorizations(context.Context, int64) ([]domain.Authorization, error) {
+	s.authorizationLists++
+	return append([]domain.Authorization(nil), s.authorizations...), nil
+}
+
+func (s *captureAuthService) ResetAuthorization(context.Context, int64, int64) (domain.Authorization, bool, error) {
+	return domain.Authorization{}, false, nil
+}
+
+func (s *captureAuthService) ResetAuthorizations(context.Context, int64, [8]byte) ([]domain.Authorization, error) {
+	return nil, nil
+}
+
+func (s *captureAuthService) PendingPasswordUserID(context.Context, [8]byte) (int64, bool, error) {
+	return s.pendingPasswordUserID, s.pendingPassword, nil
+}
+
+func (s *captureAuthService) CompletePasswordSignIn(_ context.Context, authKeyID [8]byte) error {
+	s.completedPasswordKey = authKeyID
+	s.completePasswordCount++
+	return nil
+}

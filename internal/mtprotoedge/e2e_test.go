@@ -10,6 +10,7 @@ import (
 
 	"go.uber.org/zap/zaptest"
 
+	"github.com/gotd/log/logzap"
 	"github.com/gotd/td/clock"
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/session"
@@ -61,7 +62,7 @@ func TestTelegramClientEndToEnd(t *testing.T) {
 		PublicKeys:     []exchange.PublicKey{{RSA: &rsaKey.PublicKey}},
 		Resolver:       dcs.Plain(dcs.PlainOptions{Protocol: transport.Intermediate}),
 		DCList:         dcs.List{Options: []tg.DCOption{{ID: dc, IPAddress: tcpAddr.IP.String(), Port: tcpAddr.Port, Static: true}}},
-		Logger:         zaptest.NewLogger(t).Named("client"),
+		Logger:         logzap.New(zaptest.NewLogger(t).Named("client")),
 		SessionStorage: &session.StorageMemory{},
 		UpdateHandler:  telegram.UpdateHandlerFunc(func(context.Context, tg.UpdatesClass) error { return nil }),
 	}
@@ -75,8 +76,9 @@ func TestTelegramClientEndToEnd(t *testing.T) {
 		if cfg.ThisDC != dc {
 			t.Errorf("config.ThisDC = %d, want %d", cfg.ThisDC, dc)
 		}
-		if len(cfg.DCOptions) == 0 {
-			t.Error("config.DCOptions is empty")
+		// 不下发 DCOptions：客户端使用自己的 DCList / 写死 static 地址。
+		if len(cfg.DCOptions) != 0 {
+			t.Errorf("config.DCOptions = %+v, want empty", cfg.DCOptions)
 		}
 		return nil
 	}); err != nil {

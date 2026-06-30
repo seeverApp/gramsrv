@@ -14,8 +14,9 @@ import (
 
 // DefaultSessionTTL 是 session 记录的默认过期时间。
 // session 是连接态：过期或丢失后，客户端重连会触发 new_session_created / bad_server_salt 重建，
-// 因此 TTL 不必很长。
-const DefaultSessionTTL = 30 * 24 * time.Hour
+// 因此 TTL 不必很长。每个随机 session_id 都落一条记录且断连不删，过长的 TTL
+// 只会堆积死 session（移动端每次重连一条）。7 天足够覆盖常规离线窗口。
+const DefaultSessionTTL = 7 * 24 * time.Hour
 
 // SessionStore 用 Redis 实现 store.SessionStore。
 type SessionStore struct {

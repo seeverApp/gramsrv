@@ -2,6 +2,7 @@ package channels
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"unicode/utf8"
 
@@ -12,11 +13,57 @@ import (
 // Service exposes channel/supergroup business operations.
 type Service struct {
 	channels store.ChannelStore
+	bots     BotProfileResolver
+	versions store.ReadModelVersionStore
+	sendGate SendPermissionChecker
+
+	viewCache        *channelViewReadModelCache
+	resolveCache     *channelResolveReadModelCache
+	mediaCountCache  *mediaCountReadModelCache
+	participantCache *participantsReadModelCache
+	activeIDsCache   *activeChannelIDsReadModelCache
+}
+
+type Option func(*Service)
+
+type SendPermissionChecker interface {
+	CanSendMessages(ctx context.Context, userID int64) error
 }
 
 // NewService creates a channel service.
-func NewService(channels store.ChannelStore) *Service {
-	return &Service{channels: channels}
+func NewService(channels store.ChannelStore, opts ...Option) *Service {
+	s := &Service{
+		channels:         channels,
+		viewCache:        newChannelViewReadModelCache(defaultChannelViewReadModelTTL),
+		resolveCache:     newChannelResolveReadModelCache(defaultChannelResolveReadModelTTL),
+		mediaCountCache:  newMediaCountReadModelCache(defaultMediaCountReadModelTTL),
+		participantCache: newParticipantsReadModelCache(defaultParticipantsReadModelTTL),
+		activeIDsCache:   newActiveChannelIDsReadModelCache(defaultActiveChannelIDsReadModelTTL),
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// WithBotProfileResolver enables group bot membership and privacy policy checks.
+func WithBotProfileResolver(bots BotProfileResolver) Option {
+	return func(s *Service) {
+		s.bots = bots
+	}
+}
+
+// WithReadModelVersions enables version-token guarded channel full-view caching.
+func WithReadModelVersions(v store.ReadModelVersionStore) Option {
+	return func(s *Service) {
+		s.versions = v
+	}
+}
+
+func WithSendPermissionChecker(c SendPermissionChecker) Option {
+	return func(s *Service) {
+		s.sendGate = c
+	}
 }
 
 // CreateMegagroupFromCreateChat handles messages.createChat by directly creating a megagroup.
@@ -44,10 +91,24 @@ func (s *Service) CreateChannel(ctx context.Context, userID int64, req domain.Cr
 	if len(req.MemberUserIDs) > domain.MaxChannelInviteUsers {
 		return domain.CreateChannelResult{}, domain.ErrChannelInvalid
 	}
+	if err := s.rejectBlockedBotInvites(ctx, req.MemberUserIDs); err != nil {
+		return domain.CreateChannelResult{}, err
+	}
 	if !req.Broadcast && !req.Megagroup {
 		req.Broadcast = true
 	}
-	return s.channels.CreateChannel(ctx, req)
+	res, err := s.channels.CreateChannel(ctx, req)
+	if err != nil {
+		return res, err
+	}
+	s.invalidateActiveChannelIDs(activeMembershipUserIDsFromMembers(userID, res.Members)...)
+	// 官方语义：创建即生成创建者的永久主链接（DrKLO 建频道后立刻
+	// getExportedChatInvites 取 invites[0]）。失败不阻断创建——
+	// ListExportedInvites 首页自愈会兜底补上。
+	if res.Channel.ID != 0 {
+		_, _ = s.channels.EnsurePermanentInvite(ctx, res.Channel.ID, userID, req.Date)
+	}
+	return res, nil
 }
 
 // GetChannel returns channel data personalized for userID.
@@ -58,9 +119,78 @@ func (s *Service) GetChannel(ctx context.Context, userID, channelID int64) (doma
 	return s.channels.GetChannel(ctx, userID, channelID)
 }
 
+// GetChannelReadModel returns the full channel view through a version-token guarded
+// read model cache. It is intended for read-only RPC projection paths, not write
+// permission checks.
+func (s *Service) GetChannelReadModel(ctx context.Context, userID, channelID int64) (domain.ChannelView, error) {
+	if s == nil || s.channels == nil || userID == 0 || channelID == 0 {
+		return domain.ChannelView{}, domain.ErrChannelInvalid
+	}
+	return s.cachedChannelView(ctx, userID, channelID)
+}
+
+// ResolveChannel 是 GetChannel 的轻量版（仅访问校验 + Channel/Self，跳过 dialog/boost 查询），
+// 供只需 access_hash / 频道标志的 peer 解析路径用。访问语义与 GetChannel 一致。
+func (s *Service) ResolveChannel(ctx context.Context, userID, channelID int64) (domain.ChannelView, error) {
+	if s == nil || s.channels == nil || userID == 0 || channelID == 0 {
+		return domain.ChannelView{}, domain.ErrChannelInvalid
+	}
+	return s.cachedResolveChannel(ctx, userID, channelID)
+}
+
+// SearchChannelMedia 返回某频道中属于给定媒体类别的消息(共享媒体标签页)。
+func (s *Service) SearchChannelMedia(ctx context.Context, userID, channelID int64, req domain.MediaSearchRequest) (domain.ChannelHistory, error) {
+	if s == nil || s.channels == nil || userID == 0 || channelID == 0 {
+		return domain.ChannelHistory{}, domain.ErrChannelInvalid
+	}
+	return s.channels.SearchChannelMedia(ctx, userID, channelID, req)
+}
+
+// CountChannelMediaCategories 返回某频道对当前 viewer 可见消息按基础媒体类别聚合的精确计数。
+func (s *Service) CountChannelMediaCategories(ctx context.Context, userID, channelID int64) (domain.MediaCategoryCounts, error) {
+	if s == nil || s.channels == nil || userID == 0 || channelID == 0 {
+		return domain.MediaCategoryCounts{}, domain.ErrChannelInvalid
+	}
+	return s.cachedChannelMediaCounts(ctx, userID, channelID)
+}
+
+// GetChannels returns channel data personalized for userID, ordered by the first occurrence in channelIDs.
+func (s *Service) GetChannels(ctx context.Context, userID int64, channelIDs []int64) ([]domain.ChannelView, error) {
+	if s == nil || s.channels == nil || userID == 0 {
+		return nil, domain.ErrChannelInvalid
+	}
+	ids := uniqueNonZero(channelIDs)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if s.versions != nil {
+		out := make([]domain.ChannelView, 0, len(ids))
+		for _, id := range ids {
+			view, err := s.GetChannelReadModel(ctx, userID, id)
+			if err != nil {
+				if errors.Is(err, domain.ErrChannelPrivate) || errors.Is(err, domain.ErrChannelInvalid) {
+					continue
+				}
+				return s.channels.GetChannels(ctx, userID, ids)
+			}
+			out = append(out, view)
+		}
+		return out, nil
+	}
+	return s.channels.GetChannels(ctx, userID, ids)
+}
+
 // GetJoinableChannel returns a channel shell so RPC can verify access hash before join.
 func (s *Service) GetJoinableChannel(ctx context.Context, userID, channelID int64) (domain.Channel, error) {
 	if s == nil || s.channels == nil || userID == 0 || channelID == 0 {
+		return domain.Channel{}, domain.ErrChannelInvalid
+	}
+	return s.channels.GetChannelByID(ctx, channelID)
+}
+
+// GetChannelByID returns the non-personalized channel base row for internal admin use.
+func (s *Service) GetChannelByID(ctx context.Context, channelID int64) (domain.Channel, error) {
+	if s == nil || s.channels == nil || channelID == 0 {
 		return domain.Channel{}, domain.ErrChannelInvalid
 	}
 	return s.channels.GetChannelByID(ctx, channelID)
@@ -74,7 +204,7 @@ func (s *Service) GetParticipants(ctx context.Context, userID, channelID int64, 
 	if utf8.RuneCountInString(filter.Query) > domain.MaxChannelParticipantsQueryLength {
 		return domain.ChannelParticipantList{}, domain.ErrChannelInvalid
 	}
-	return s.channels.GetParticipants(ctx, userID, channelID, filter, offset, capLimit(limit, domain.MaxChannelParticipantsLimit))
+	return s.cachedParticipants(ctx, userID, channelID, filter, offset, limit)
 }
 
 // GetParticipant returns one participant.
@@ -85,6 +215,14 @@ func (s *Service) GetParticipant(ctx context.Context, userID, channelID, partici
 	return s.channels.GetParticipant(ctx, userID, channelID, participantUserID)
 }
 
+// FutureCreatorAfterLeave returns the member that will become creator if userID leaves.
+func (s *Service) FutureCreatorAfterLeave(ctx context.Context, userID, channelID int64) (domain.ChannelMember, error) {
+	if s == nil || s.channels == nil || userID == 0 || channelID == 0 {
+		return domain.ChannelMember{}, domain.ErrChannelInvalid
+	}
+	return s.channels.FutureCreatorAfterLeave(ctx, channelID, userID)
+}
+
 // InviteToChannel invites users to a channel/supergroup.
 func (s *Service) InviteToChannel(ctx context.Context, userID, channelID int64, userIDs []int64, date int) (domain.CreateChannelResult, error) {
 	if s == nil || s.channels == nil || userID == 0 || channelID == 0 || len(userIDs) == 0 {
@@ -93,7 +231,14 @@ func (s *Service) InviteToChannel(ctx context.Context, userID, channelID int64, 
 	if len(userIDs) > domain.MaxChannelInviteUsers {
 		return domain.CreateChannelResult{}, domain.ErrChannelInvalid
 	}
-	return s.channels.InviteToChannel(ctx, channelID, userID, userIDs, date)
+	if err := s.rejectBlockedBotInvites(ctx, userIDs); err != nil {
+		return domain.CreateChannelResult{}, err
+	}
+	res, err := s.channels.InviteToChannel(ctx, channelID, userID, userIDs, date)
+	if err == nil {
+		s.invalidateActiveChannelIDs(activeMembershipUserIDsFromMembers(0, res.Members)...)
+	}
+	return res, err
 }
 
 // JoinChannel joins current user to a channel/supergroup.
@@ -101,7 +246,11 @@ func (s *Service) JoinChannel(ctx context.Context, userID, channelID int64, date
 	if s == nil || s.channels == nil || userID == 0 || channelID == 0 {
 		return domain.CreateChannelResult{}, domain.ErrChannelInvalid
 	}
-	return s.channels.JoinChannel(ctx, channelID, userID, date)
+	res, err := s.channels.JoinChannel(ctx, channelID, userID, date)
+	if err == nil {
+		s.invalidateActiveChannelIDs(userID)
+	}
+	return res, err
 }
 
 // LeaveChannel leaves current user from a channel/supergroup.
@@ -109,7 +258,11 @@ func (s *Service) LeaveChannel(ctx context.Context, userID, channelID int64, dat
 	if s == nil || s.channels == nil || userID == 0 || channelID == 0 {
 		return domain.CreateChannelResult{}, domain.ErrChannelInvalid
 	}
-	return s.channels.LeaveChannel(ctx, channelID, userID, date)
+	res, err := s.channels.LeaveChannel(ctx, channelID, userID, date)
+	if err == nil {
+		s.invalidateActiveChannelIDs(userID)
+	}
+	return res, err
 }
 
 // EditTitle edits a channel/supergroup title.
@@ -124,6 +277,20 @@ func (s *Service) EditTitle(ctx context.Context, userID int64, req domain.EditCh
 		return domain.EditChannelTitleResult{}, domain.ErrChannelTitleInvalid
 	}
 	return s.channels.EditChannelTitle(ctx, req)
+}
+
+// SetWallpaper sets or clears the channel/supergroup wallpaper.
+func (s *Service) SetWallpaper(ctx context.Context, userID int64, req domain.SetChannelWallpaperRequest) (domain.SetChannelWallpaperResult, error) {
+	if s == nil || s.channels == nil || userID == 0 {
+		return domain.SetChannelWallpaperResult{}, domain.ErrChannelInvalid
+	}
+	if req.UserID == 0 {
+		req.UserID = userID
+	}
+	if req.UserID != userID || req.ChannelID == 0 {
+		return domain.SetChannelWallpaperResult{}, domain.ErrChannelInvalid
+	}
+	return s.channels.SetChannelWallpaper(ctx, req)
 }
 
 // EditAbout edits a channel/supergroup description.
@@ -154,6 +321,21 @@ func (s *Service) EditAdmin(ctx context.Context, userID int64, req domain.EditCh
 	return s.channels.EditChannelAdmin(ctx, req)
 }
 
+// EditMemberRank sets or clears a participant's member tag without touching
+// their role or admin rights.
+func (s *Service) EditMemberRank(ctx context.Context, userID int64, req domain.EditChannelMemberRankRequest) (domain.EditChannelAdminResult, error) {
+	if s == nil || s.channels == nil || userID == 0 {
+		return domain.EditChannelAdminResult{}, domain.ErrChannelInvalid
+	}
+	if req.UserID == 0 {
+		req.UserID = userID
+	}
+	if req.UserID != userID || req.ChannelID == 0 || req.MemberID == 0 || len(req.Rank) > domain.MaxChannelAdminRankLength {
+		return domain.EditChannelAdminResult{}, domain.ErrChannelInvalid
+	}
+	return s.channels.EditChannelMemberRank(ctx, req)
+}
+
 // EditBanned edits a participant's banned rights.
 func (s *Service) EditBanned(ctx context.Context, userID int64, req domain.EditChannelBannedRequest) (domain.EditChannelBannedResult, error) {
 	if s == nil || s.channels == nil || userID == 0 {
@@ -165,7 +347,11 @@ func (s *Service) EditBanned(ctx context.Context, userID int64, req domain.EditC
 	if req.UserID != userID || req.ChannelID == 0 || req.Participant.Type != domain.PeerTypeUser || req.Participant.ID == 0 {
 		return domain.EditChannelBannedResult{}, domain.ErrChannelInvalid
 	}
-	return s.channels.EditChannelBanned(ctx, req)
+	res, err := s.channels.EditChannelBanned(ctx, req)
+	if err == nil {
+		s.invalidateActiveChannelIDs(req.Participant.ID)
+	}
+	return res, err
 }
 
 // EditDefaultBannedRights edits the channel/supergroup default restrictions.
@@ -193,7 +379,11 @@ func (s *Service) DeleteChannel(ctx context.Context, userID int64, req domain.De
 	if req.UserID != userID || req.ChannelID == 0 {
 		return domain.DeleteChannelResult{}, domain.ErrChannelInvalid
 	}
-	return s.channels.DeleteChannel(ctx, req)
+	res, err := s.channels.DeleteChannel(ctx, req)
+	if err == nil {
+		s.invalidateActiveChannelIDs(uniqueUserIDs(append([]int64{userID}, res.Recipients...)...)...)
+	}
+	return res, err
 }
 
 // CheckUsername checks whether a channel username is syntactically valid and free.
@@ -226,12 +416,36 @@ func (s *Service) UpdateUsername(ctx context.Context, userID int64, req domain.U
 	return s.channels.UpdateUsername(ctx, req)
 }
 
+// SetVerified sets or clears the channel/supergroup verified badge through the internal admin path.
+func (s *Service) SetVerified(ctx context.Context, channelID int64, verified bool) (domain.Channel, error) {
+	if s == nil || s.channels == nil || channelID == 0 {
+		return domain.Channel{}, domain.ErrChannelInvalid
+	}
+	return s.channels.SetChannelVerified(ctx, channelID, verified)
+}
+
 // ListAdminedPublicChannels returns public channels/supergroups administered by user.
 func (s *Service) ListAdminedPublicChannels(ctx context.Context, userID int64) ([]domain.Channel, error) {
 	if s == nil || s.channels == nil || userID == 0 {
 		return nil, nil
 	}
 	return s.channels.ListAdminedPublicChannels(ctx, userID)
+}
+
+// ListStoryPostableChannels returns channels where user can publish stories.
+func (s *Service) ListStoryPostableChannels(ctx context.Context, userID int64) ([]domain.Channel, error) {
+	if s == nil || s.channels == nil || userID == 0 {
+		return nil, nil
+	}
+	return s.channels.ListStoryPostableChannels(ctx, userID)
+}
+
+// ListSendAsChannels returns the broadcast channels the user may post messages as in groups.
+func (s *Service) ListSendAsChannels(ctx context.Context, userID int64) ([]domain.Channel, error) {
+	if s == nil || s.channels == nil || userID == 0 {
+		return nil, nil
+	}
+	return s.channels.ListSendAsChannels(ctx, userID)
 }
 
 // ResolvePublicUsername resolves a public channel/supergroup username visible to userID.
@@ -318,9 +532,9 @@ func (s *Service) SetRestrictedSponsored(ctx context.Context, userID, channelID 
 }
 
 // SetPaidMessagesPrice stores the currently advertised paid-message price state.
-func (s *Service) SetPaidMessagesPrice(ctx context.Context, userID, channelID int64, stars int64, broadcastMessagesAllowed bool) (domain.Channel, error) {
+func (s *Service) SetPaidMessagesPrice(ctx context.Context, userID, channelID int64, stars int64, broadcastMessagesAllowed bool) (domain.ChannelPaidMessagesPriceResult, error) {
 	if s == nil || s.channels == nil || userID == 0 || channelID == 0 || stars < 0 {
-		return domain.Channel{}, domain.ErrChannelInvalid
+		return domain.ChannelPaidMessagesPriceResult{}, domain.ErrChannelInvalid
 	}
 	return s.channels.SetPaidMessagesPrice(ctx, userID, channelID, stars, broadcastMessagesAllowed)
 }
@@ -341,12 +555,45 @@ func (s *Service) SetSlowMode(ctx context.Context, userID, channelID int64, seco
 	return s.channels.SetSlowMode(ctx, userID, channelID, seconds)
 }
 
+// SetBoostsToUnblockRestrictions stores the boost threshold that lets boosted
+// members bypass default send-message restrictions.
+func (s *Service) SetBoostsToUnblockRestrictions(ctx context.Context, userID, channelID int64, boosts int) (domain.Channel, error) {
+	if s == nil || s.channels == nil || userID == 0 || channelID == 0 || boosts < 0 || boosts > domain.MaxChannelBoostsToUnblockRestrictions {
+		return domain.Channel{}, domain.ErrChannelInvalid
+	}
+	return s.channels.SetBoostsToUnblockRestrictions(ctx, userID, channelID, boosts)
+}
+
 // SetNoForwards toggles channel/supergroup content protection.
 func (s *Service) SetNoForwards(ctx context.Context, userID, channelID int64, enabled bool) (domain.Channel, error) {
 	if s == nil || s.channels == nil || userID == 0 || channelID == 0 {
 		return domain.Channel{}, domain.ErrChannelInvalid
 	}
 	return s.channels.SetNoForwards(ctx, userID, channelID, enabled)
+}
+
+// SetHistoryTTL updates channel/supergroup message auto-delete period.
+func (s *Service) SetHistoryTTL(ctx context.Context, userID, channelID int64, period int, date int) (domain.Channel, []int64, error) {
+	if s == nil || s.channels == nil || userID == 0 || channelID == 0 || period < 0 {
+		return domain.Channel{}, nil, domain.ErrChannelInvalid
+	}
+	ttl, ok := s.channels.(store.ChannelHistoryTTLStore)
+	if !ok {
+		return domain.Channel{}, nil, domain.ErrChannelInvalid
+	}
+	return ttl.SetChannelHistoryTTL(ctx, userID, channelID, period, date)
+}
+
+// ClaimExpiredMessages returns expired channel delete batches for the TTL worker.
+func (s *Service) ClaimExpiredMessages(ctx context.Context, now, limit int) ([]domain.DeleteChannelMessagesRequest, error) {
+	if s == nil || s.channels == nil {
+		return nil, nil
+	}
+	ttl, ok := s.channels.(store.ChannelHistoryTTLStore)
+	if !ok {
+		return nil, nil
+	}
+	return ttl.ClaimExpiredChannelMessages(ctx, now, limit)
 }
 
 // SetJoinToSend toggles whether non-members must join before sending in a megagroup.
@@ -370,13 +617,18 @@ func (s *Service) SetAvailableReactions(ctx context.Context, userID, channelID i
 	if s == nil || s.channels == nil || userID == 0 || channelID == 0 {
 		return domain.Channel{}, domain.ErrChannelInvalid
 	}
-	if len(policy.Emoticons)+len(policy.CustomEmojiIDs) > domain.MaxChannelReactionItems ||
+	if len(policy.Emoticons)+len(policy.CustomEmojiIDs) > domain.MaxChannelReactionTypes ||
 		policy.Limit < 0 ||
-		policy.Limit > domain.MaxChannelReactionItems {
+		policy.Limit > domain.MaxChannelReactionsLimit {
 		return domain.Channel{}, domain.ErrChannelInvalid
 	}
 	for _, emoticon := range policy.Emoticons {
 		if strings.TrimSpace(emoticon) == "" || utf8.RuneCountInString(emoticon) > domain.MaxChannelReactionEmoticonLength {
+			return domain.Channel{}, domain.ErrChannelInvalid
+		}
+	}
+	for _, documentID := range policy.CustomEmojiIDs {
+		if documentID <= 0 {
 			return domain.Channel{}, domain.ErrChannelInvalid
 		}
 	}
@@ -400,6 +652,55 @@ func (s *Service) SetEmojiStatus(ctx context.Context, userID, channelID int64, s
 		return domain.Channel{}, domain.ErrChannelInvalid
 	}
 	return s.channels.SetEmojiStatus(ctx, userID, channelID, status)
+}
+
+func (s *Service) GetPremiumBoostStatus(ctx context.Context, userID, channelID int64, now int) (domain.PremiumBoostStatus, error) {
+	if s == nil || s.channels == nil || userID == 0 || channelID == 0 || now < 0 {
+		return domain.PremiumBoostStatus{}, domain.ErrChannelInvalid
+	}
+	return s.channels.GetPremiumBoostStatus(ctx, userID, channelID, now)
+}
+
+func (s *Service) ListPremiumBoosts(ctx context.Context, userID, channelID int64, gifts bool, offset string, limit, now int) (domain.PremiumBoostList, error) {
+	if s == nil || s.channels == nil || userID == 0 || channelID == 0 || now < 0 || len(offset) > domain.MaxPremiumBoostsOffsetBytes {
+		return domain.PremiumBoostList{}, domain.ErrChannelInvalid
+	}
+	if limit <= 0 {
+		limit = domain.MaxPremiumBoostsListLimit
+	}
+	if limit > domain.MaxPremiumBoostsListLimit {
+		limit = domain.MaxPremiumBoostsListLimit
+	}
+	return s.channels.ListPremiumBoosts(ctx, userID, channelID, gifts, offset, limit, now)
+}
+
+func (s *Service) GetPremiumMyBoosts(ctx context.Context, userID int64, now, premiumUntil int) (domain.PremiumMyBoosts, error) {
+	if s == nil || s.channels == nil || userID == 0 || now < 0 || premiumUntil < 0 {
+		return domain.PremiumMyBoosts{}, domain.ErrChannelInvalid
+	}
+	return s.channels.GetPremiumMyBoosts(ctx, userID, now, premiumUntil)
+}
+
+func (s *Service) ApplyPremiumBoost(ctx context.Context, userID, channelID int64, slots []int, now, premiumUntil int) (domain.PremiumMyBoosts, error) {
+	if s == nil || s.channels == nil || userID == 0 || channelID == 0 || len(slots) == 0 || len(slots) > domain.MaxPremiumBoostSlotsPerApply || now < 0 || premiumUntil < 0 {
+		return domain.PremiumMyBoosts{}, domain.ErrChannelInvalid
+	}
+	for _, slot := range slots {
+		if slot <= 0 {
+			return domain.PremiumMyBoosts{}, domain.ErrChannelInvalid
+		}
+	}
+	if premiumUntil <= now {
+		return domain.PremiumMyBoosts{}, domain.ErrPremiumRequired
+	}
+	return s.channels.ApplyPremiumBoost(ctx, userID, channelID, slots, now, premiumUntil)
+}
+
+func (s *Service) GetPremiumUserBoosts(ctx context.Context, userID, channelID, targetUserID int64, now int) (domain.PremiumBoostList, error) {
+	if s == nil || s.channels == nil || userID == 0 || channelID == 0 || targetUserID == 0 || now < 0 {
+		return domain.PremiumBoostList{}, domain.ErrChannelInvalid
+	}
+	return s.channels.GetPremiumUserBoosts(ctx, userID, channelID, targetUserID, now)
 }
 
 // ListAdminLog returns one bounded, channel-scoped admin log page.
@@ -430,6 +731,46 @@ func (s *Service) GetChannelForChangeInfo(ctx context.Context, userID, channelID
 		return view, nil
 	}
 	return domain.ChannelView{}, domain.ErrChannelAdminRequired
+}
+
+// CanPostStory validates whether the current user can publish a channel story.
+func (s *Service) CanPostStory(ctx context.Context, userID, channelID int64) error {
+	return s.canManageStory(ctx, userID, channelID, func(rights domain.ChannelAdminRights) bool {
+		return rights.PostStories
+	})
+}
+
+// CanEditStory validates whether the current user can edit a channel story.
+func (s *Service) CanEditStory(ctx context.Context, userID, channelID int64) error {
+	return s.canManageStory(ctx, userID, channelID, func(rights domain.ChannelAdminRights) bool {
+		return rights.EditStories
+	})
+}
+
+// CanDeleteStory validates whether the current user can delete a channel story.
+func (s *Service) CanDeleteStory(ctx context.Context, userID, channelID int64) error {
+	return s.canManageStory(ctx, userID, channelID, func(rights domain.ChannelAdminRights) bool {
+		return rights.DeleteStories
+	})
+}
+
+// CanPinStory validates whether the current user can change channel story pin state.
+func (s *Service) CanPinStory(ctx context.Context, userID, channelID int64) error {
+	return s.CanEditStory(ctx, userID, channelID)
+}
+
+func (s *Service) canManageStory(ctx context.Context, userID, channelID int64, allowed func(domain.ChannelAdminRights) bool) error {
+	view, err := s.GetChannel(ctx, userID, channelID)
+	if err != nil {
+		return err
+	}
+	if view.Self.Role == domain.ChannelRoleCreator {
+		return nil
+	}
+	if view.Self.Role == domain.ChannelRoleAdmin && allowed(view.Self.AdminRights) {
+		return nil
+	}
+	return domain.ErrChannelAdminRequired
 }
 
 // SaveDefaultSendAs persists the current user's default send-as peer for one channel/supergroup dialog.
@@ -480,6 +821,49 @@ func (s *Service) SetMessageReactions(ctx context.Context, userID int64, req dom
 		return domain.ChannelMessageReactionsResult{}, domain.ErrChannelInvalid
 	}
 	return s.channels.SetChannelMessageReactions(ctx, req)
+}
+
+// SendPaidReaction 为一条广播频道消息增投付费 reaction 星数；扣费在 rpc 层经 Stars 账本
+// Debit 完成，本方法只负责累计与聚合。
+func (s *Service) SendPaidReaction(ctx context.Context, userID int64, req domain.SendChannelPaidReactionRequest) (domain.ChannelMessagePaidReactionResult, error) {
+	if s == nil || s.channels == nil || userID == 0 || req.ChannelID == 0 || req.MessageID <= 0 {
+		return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
+	}
+	if req.UserID == 0 {
+		req.UserID = userID
+	}
+	if req.UserID != userID || req.MessageID > domain.MaxMessageBoxID || req.Stars <= 0 || req.Stars > domain.MaxPaidReactionStarsPerRequest {
+		return domain.ChannelMessagePaidReactionResult{}, domain.ErrChannelInvalid
+	}
+	return s.channels.AddChannelMessagePaidReaction(ctx, req)
+}
+
+// VoteMessagePoll 给频道/超级群消息上的 poll 投票（options 为空 = 撤票）。
+func (s *Service) VoteMessagePoll(ctx context.Context, userID int64, req domain.VoteChannelMessagePollRequest) (domain.ChannelMessagePollResult, error) {
+	if s == nil || s.channels == nil || userID == 0 || req.ChannelID == 0 || req.MessageID <= 0 {
+		return domain.ChannelMessagePollResult{}, domain.ErrChannelInvalid
+	}
+	if req.UserID == 0 {
+		req.UserID = userID
+	}
+	if req.UserID != userID || req.MessageID > domain.MaxMessageBoxID {
+		return domain.ChannelMessagePollResult{}, domain.ErrChannelInvalid
+	}
+	return s.channels.VoteChannelMessagePoll(ctx, req)
+}
+
+// CloseMessagePoll 关闭频道/超级群消息上的 poll（仅 poll 创建者）。
+func (s *Service) CloseMessagePoll(ctx context.Context, userID int64, req domain.CloseChannelMessagePollRequest) (domain.ChannelMessagePollResult, error) {
+	if s == nil || s.channels == nil || userID == 0 || req.ChannelID == 0 || req.MessageID <= 0 {
+		return domain.ChannelMessagePollResult{}, domain.ErrChannelInvalid
+	}
+	if req.UserID == 0 {
+		req.UserID = userID
+	}
+	if req.UserID != userID || req.MessageID > domain.MaxMessageBoxID {
+		return domain.ChannelMessagePollResult{}, domain.ErrChannelInvalid
+	}
+	return s.channels.CloseChannelMessagePoll(ctx, req)
 }
 
 // GetMessageReactions returns reaction summaries for exact channel/supergroup message ids.
@@ -813,7 +1197,22 @@ func (s *Service) SendMessage(ctx context.Context, userID int64, req domain.Send
 	if req.UserID != userID {
 		return domain.SendChannelMessageResult{}, domain.ErrChannelInvalid
 	}
+	if err := s.ensureCanSend(ctx, req.UserID); err != nil {
+		return domain.SendChannelMessageResult{}, err
+	}
+	skipped, err := s.skippedBotDeliveryUserIDs(ctx, req)
+	if err != nil {
+		return domain.SendChannelMessageResult{}, err
+	}
+	req.SkipDeliveryUserIDs = mergeSkippedUserIDs(req.SkipDeliveryUserIDs, skipped)
 	return s.channels.SendChannelMessage(ctx, req)
+}
+
+func (s *Service) ensureCanSend(ctx context.Context, userID int64) error {
+	if s == nil || s.sendGate == nil || userID == 0 {
+		return nil
+	}
+	return s.sendGate.CanSendMessages(ctx, userID)
 }
 
 // EditMessage edits a channel/supergroup text message.
@@ -827,6 +1226,23 @@ func (s *Service) EditMessage(ctx context.Context, userID int64, req domain.Edit
 	if req.UserID != userID || req.ChannelID == 0 || req.ID <= 0 {
 		return domain.EditChannelMessageResult{}, domain.ErrChannelInvalid
 	}
+	return s.channels.EditChannelMessage(ctx, req)
+}
+
+// GetInlineBotMessage returns one live channel message addressed by a signed inline id.
+func (s *Service) GetInlineBotMessage(ctx context.Context, botID, channelID int64, id int) (domain.Channel, domain.ChannelMessage, bool, error) {
+	if s == nil || s.channels == nil || botID == 0 || channelID == 0 || id <= 0 || id > domain.MaxMessageBoxID {
+		return domain.Channel{}, domain.ChannelMessage{}, false, domain.ErrChannelInvalid
+	}
+	return s.channels.GetChannelMessageForInlineBot(ctx, botID, channelID, id)
+}
+
+// EditInlineBotMessage edits a channel message through its via-bot inline id.
+func (s *Service) EditInlineBotMessage(ctx context.Context, botID int64, req domain.EditChannelMessageRequest) (domain.EditChannelMessageResult, error) {
+	if s == nil || s.channels == nil || botID == 0 || req.ChannelID == 0 || req.ID <= 0 || req.UserID == 0 {
+		return domain.EditChannelMessageResult{}, domain.ErrChannelInvalid
+	}
+	req.ViaBotEditBotID = botID
 	return s.channels.EditChannelMessage(ctx, req)
 }
 
@@ -889,6 +1305,20 @@ func (s *Service) UpdatePinnedMessage(ctx context.Context, userID int64, req dom
 	return s.channels.UpdatePinnedMessage(ctx, req)
 }
 
+// UnpinAllMessages clears every pinned message in a channel/supergroup.
+func (s *Service) UnpinAllMessages(ctx context.Context, userID int64, req domain.UnpinAllChannelMessagesRequest) (domain.UpdateChannelPinnedMessageResult, error) {
+	if s == nil || s.channels == nil || userID == 0 {
+		return domain.UpdateChannelPinnedMessageResult{}, domain.ErrChannelInvalid
+	}
+	if req.UserID == 0 {
+		req.UserID = userID
+	}
+	if req.UserID != userID || req.ChannelID == 0 {
+		return domain.UpdateChannelPinnedMessageResult{}, domain.ErrChannelInvalid
+	}
+	return s.channels.UnpinAllChannelMessages(ctx, req)
+}
+
 // ExportInvite exports a channel/supergroup invite link.
 func (s *Service) ExportInvite(ctx context.Context, userID int64, req domain.ExportChannelInviteRequest) (domain.ExportChannelInviteResult, error) {
 	if s == nil || s.channels == nil || userID == 0 {
@@ -926,7 +1356,11 @@ func (s *Service) ImportInvite(ctx context.Context, userID int64, req domain.Imp
 		return domain.CreateChannelResult{}, domain.ErrInviteHashEmpty
 	}
 	req.Hash = strings.TrimSpace(req.Hash)
-	return s.channels.ImportInvite(ctx, req)
+	res, err := s.channels.ImportInvite(ctx, req)
+	if err == nil {
+		s.invalidateActiveChannelIDs(userID)
+	}
+	return res, err
 }
 
 // ListExportedInvites returns a bounded invite management page.
@@ -942,6 +1376,13 @@ func (s *Service) ListExportedInvites(ctx context.Context, userID int64, req dom
 	}
 	req.OffsetHash = strings.TrimSpace(req.OffsetHash)
 	req.Limit = capLimit(req.Limit, domain.MaxChannelInviteListLimit)
+	// 官方语义自愈：管理员查看自己的有效链接首页时，永久主链接必须存在
+	//（存量频道/创建路径漏建借此补上；权限校验由 store 内部完成）。
+	if req.AdminUserID == userID && !req.Revoked && req.OffsetDate == 0 && req.OffsetHash == "" {
+		if _, err := s.channels.EnsurePermanentInvite(ctx, req.ChannelID, userID, 0); err != nil {
+			return domain.ChannelInviteList{}, err
+		}
+	}
 	return s.channels.ListExportedInvites(ctx, req)
 }
 
@@ -1056,7 +1497,11 @@ func (s *Service) HideChatJoinRequest(ctx context.Context, userID int64, req dom
 	if req.UserID != userID || req.ChannelID == 0 || req.TargetUserID == 0 {
 		return domain.CreateChannelResult{}, domain.ErrChannelInvalid
 	}
-	return s.channels.HideChatJoinRequest(ctx, req)
+	res, err := s.channels.HideChatJoinRequest(ctx, req)
+	if err == nil {
+		s.invalidateActiveChannelIDs(activeMembershipUserIDsFromMembers(req.TargetUserID, res.Members)...)
+	}
+	return res, err
 }
 
 // HideAllChatJoinRequests approves or dismisses pending join requests in a bounded batch.
@@ -1072,7 +1517,11 @@ func (s *Service) HideAllChatJoinRequests(ctx context.Context, userID int64, req
 		return domain.CreateChannelResult{}, domain.ErrChannelInvalid
 	}
 	req.Limit = capLimit(req.Limit, domain.MaxChannelHideJoinRequests)
-	return s.channels.HideAllChatJoinRequests(ctx, req)
+	res, err := s.channels.HideAllChatJoinRequests(ctx, req)
+	if err == nil {
+		s.invalidateActiveChannelIDs(activeMembershipUserIDsFromMembers(0, res.Members)...)
+	}
+	return res, err
 }
 
 // ListDialogs returns current user's channel/supergroup dialog page.
@@ -1180,7 +1629,11 @@ func (s *Service) GetHistory(ctx context.Context, userID int64, filter domain.Ch
 		return domain.ChannelHistory{}, domain.ErrChannelInvalid
 	}
 	filter.Limit = capLimit(filter.Limit, 100)
-	return s.channels.ListChannelHistory(ctx, userID, filter)
+	history, err := s.channels.ListChannelHistory(ctx, userID, filter)
+	if err != nil {
+		return domain.ChannelHistory{}, err
+	}
+	return s.filterBotChannelHistory(ctx, userID, history), nil
 }
 
 // SearchPosts returns a bounded page of public channel/supergroup posts.
@@ -1223,7 +1676,7 @@ func (s *Service) SearchJoinedMessages(ctx context.Context, userID int64, req do
 		return domain.ChannelHistory{}, nil
 	}
 	req.Query = strings.TrimSpace(req.Query)
-	if req.Query == "" {
+	if req.Query == "" && !req.MusicOnly {
 		return domain.ChannelHistory{}, domain.ErrChannelInvalid
 	}
 	if utf8.RuneCountInString(req.Query) > domain.MaxChannelHistoryQueryLength {
@@ -1243,7 +1696,56 @@ func (s *Service) GetReplies(ctx context.Context, userID int64, filter domain.Ch
 	}
 	filter.AddOffset = domain.ClampMessageHistoryAddOffset(filter.AddOffset)
 	filter.Limit = capLimit(filter.Limit, domain.MaxChannelRepliesLimit)
-	return s.channels.ListChannelReplies(ctx, userID, filter)
+	history, err := s.channels.ListChannelReplies(ctx, userID, filter)
+	if err != nil {
+		return domain.ChannelHistory{}, err
+	}
+	return s.filterBotChannelHistory(ctx, userID, history), nil
+}
+
+// SendMonoforumMessage 发送频道私信(monoforum)。发件权限(订阅者身份 / monoforum 管理员)
+// 由 RPC 层校验,此处仅参数校验并委托 store(store 不要求发件人是 monoforum 成员)。
+func (s *Service) SendMonoforumMessage(ctx context.Context, req domain.SendMonoforumMessageRequest) (domain.SendChannelMessageResult, error) {
+	if s == nil || s.channels == nil || req.MonoforumID == 0 || req.SenderUserID == 0 || req.SavedPeer.ID == 0 {
+		return domain.SendChannelMessageResult{}, domain.ErrChannelInvalid
+	}
+	if err := s.ensureCanSend(ctx, req.SenderUserID); err != nil {
+		return domain.SendChannelMessageResult{}, err
+	}
+	return s.channels.SendMonoforumMessage(ctx, req)
+}
+
+// ListMonoforumHistory 拉取某订阅者在频道私信(monoforum)内的历史。
+func (s *Service) ListMonoforumHistory(ctx context.Context, filter domain.MonoforumHistoryFilter) (domain.ChannelHistory, error) {
+	if s == nil || s.channels == nil || filter.MonoforumID == 0 || filter.SavedPeer.ID == 0 {
+		return domain.ChannelHistory{}, domain.ErrChannelInvalid
+	}
+	if filter.OffsetID < 0 || filter.OffsetID > domain.MaxMessageBoxID {
+		return domain.ChannelHistory{}, domain.ErrMessageIDInvalid
+	}
+	filter.Limit = capLimit(filter.Limit, domain.MaxChannelRepliesLimit)
+	return s.channels.ListMonoforumHistory(ctx, filter)
+}
+
+// ListMonoforumDialogs 列出 monoforum 的订阅者子会话(管理员视角私信列表)。访问权限(仅管理员)
+// 由 RPC 层校验。
+func (s *Service) ListMonoforumDialogs(ctx context.Context, filter domain.MonoforumDialogsFilter) (domain.MonoforumDialogList, error) {
+	if s == nil || s.channels == nil || filter.MonoforumID == 0 {
+		return domain.MonoforumDialogList{}, domain.ErrChannelInvalid
+	}
+	if filter.OffsetID < 0 || filter.OffsetID > domain.MaxMessageBoxID {
+		return domain.MonoforumDialogList{}, domain.ErrMessageIDInvalid
+	}
+	filter.Limit = capLimit(filter.Limit, domain.MaxChannelRepliesLimit)
+	return s.channels.ListMonoforumDialogs(ctx, filter)
+}
+
+// ResolveMonoforumSend 按 id 取 monoforum 频道(不要求成员身份)并返回调用者是否为其母频道管理员。
+func (s *Service) ResolveMonoforumSend(ctx context.Context, viewerUserID, monoforumID int64) (domain.Channel, bool, error) {
+	if s == nil || s.channels == nil || viewerUserID == 0 || monoforumID == 0 {
+		return domain.Channel{}, false, domain.ErrChannelInvalid
+	}
+	return s.channels.ResolveMonoforumSend(ctx, viewerUserID, monoforumID)
 }
 
 // GetUnreadMentions returns a bounded unread mention page for a channel/supergroup.
@@ -1321,7 +1823,73 @@ func (s *Service) GetMessages(ctx context.Context, userID, channelID int64, ids 
 			return domain.ChannelHistory{}, domain.ErrMessageIDInvalid
 		}
 	}
-	return s.channels.GetChannelMessages(ctx, userID, channelID, ids)
+	history, err := s.channels.GetChannelMessages(ctx, userID, channelID, ids)
+	if err != nil {
+		return domain.ChannelHistory{}, err
+	}
+	return s.filterBotChannelHistory(ctx, userID, history), nil
+}
+
+// ChannelPollFanoutViews 批量为一组 viewer 返回频道 poll 消息的 per-viewer enrich（fan-out 模板化，
+// 消除逐 viewer GetMessages 的 N+1）。store 负责成员/AvailableMinID 可见性 + 模板聚合；此处叠加
+// bot 历史可见性过滤（复刻 filterBotChannelHistory：无 ChatHistory 的 bot 看不到该消息→置 nil）。
+// 返回 map[viewer]：key 存在=已评估（nil=不可见，调用方据此跳过且无需回退）；非 nil=该 viewer enrich poll。
+func (s *Service) ChannelPollFanoutViews(ctx context.Context, channelID int64, msgID int, viewers []int64, now int) (map[int64]*domain.MessagePoll, error) {
+	if s == nil || s.channels == nil || channelID == 0 || msgID <= 0 || len(viewers) == 0 {
+		return map[int64]*domain.MessagePoll{}, nil
+	}
+	views, err := s.channels.ChannelPollFanoutViews(ctx, channelID, msgID, viewers, now)
+	if err != nil {
+		return nil, err
+	}
+	if !views.Found {
+		return map[int64]*domain.MessagePoll{}, nil
+	}
+	if s.bots != nil {
+		for viewer, poll := range views.Polls {
+			if poll == nil {
+				continue
+			}
+			if !s.botViewerCanSeeChannelMessage(ctx, viewer, views.Message) {
+				views.Polls[viewer] = nil
+			}
+		}
+	}
+	return views.Polls, nil
+}
+
+// botViewerCanSeeChannelMessage 复刻 filterBotChannelHistory 的单消息判定：非 bot 或带 ChatHistory
+// 的 bot 一律可见；无 ChatHistory 的 bot 按 botCanSeeChannelMessage 判定该条消息是否可见。
+func (s *Service) botViewerCanSeeChannelMessage(ctx context.Context, viewer int64, msg domain.ChannelMessage) bool {
+	if s.bots == nil || viewer == 0 {
+		return true
+	}
+	profile, found, err := s.bots.BotInfo(ctx, viewer)
+	if err != nil || !found || profile.ChatHistory {
+		return true
+	}
+	visible, err := s.botCanSeeChannelMessage(ctx, viewer, msg, nil)
+	return err == nil && visible
+}
+
+// ListStoryMessageForwards returns public channel/supergroup messages that
+// shared a source story as messageMediaStory.
+func (s *Service) ListStoryMessageForwards(ctx context.Context, userID int64, req domain.StoryMessageForwardListRequest) (domain.StoryMessageForwardList, error) {
+	if s == nil || s.channels == nil || userID == 0 {
+		return domain.StoryMessageForwardList{}, domain.ErrChannelInvalid
+	}
+	if req.StoryID <= 0 || req.StoryID > domain.MaxStoryID || req.Owner.ID == 0 {
+		return domain.StoryMessageForwardList{}, domain.ErrStoryIDInvalid
+	}
+	if req.Owner.Type != domain.PeerTypeUser && req.Owner.Type != domain.PeerTypeChannel {
+		return domain.StoryMessageForwardList{}, domain.ErrStoryPeerInvalid
+	}
+	if err := domain.ValidateStoryInteractionOffset(req.Offset, false); err != nil {
+		return domain.StoryMessageForwardList{}, err
+	}
+	req.ViewerUserID = userID
+	req.Limit = capLimit(req.Limit, domain.MaxStoryInteractionListLimit)
+	return s.channels.ListStoryMessageForwards(ctx, req)
 }
 
 // GetDiscussionMessage returns the root message used to open a discussion thread.
@@ -1349,6 +1917,28 @@ func (s *Service) ReadHistory(ctx context.Context, userID int64, req domain.Read
 	return s.channels.ReadChannelHistory(ctx, req)
 }
 
+// ReadTopicHistory advances current user's per-topic read watermark inside a forum.
+func (s *Service) ReadTopicHistory(ctx context.Context, userID int64, req domain.ReadChannelTopicHistoryRequest) (domain.ReadChannelTopicHistoryResult, error) {
+	if s == nil || s.channels == nil || userID == 0 || req.ChannelID == 0 || req.TopicID <= 0 {
+		return domain.ReadChannelTopicHistoryResult{}, domain.ErrChannelInvalid
+	}
+	if req.UserID == 0 {
+		req.UserID = userID
+	}
+	if req.UserID != userID {
+		return domain.ReadChannelTopicHistoryResult{}, domain.ErrChannelInvalid
+	}
+	return s.channels.ReadChannelTopicHistory(ctx, req)
+}
+
+// GeneralForumTopic 现算 forum General 话题（id=1）对 viewer 的状态。
+func (s *Service) GeneralForumTopic(ctx context.Context, userID, channelID int64) (domain.ChannelForumTopic, error) {
+	if s == nil || s.channels == nil || userID == 0 || channelID == 0 {
+		return domain.ChannelForumTopic{}, domain.ErrChannelInvalid
+	}
+	return s.channels.GeneralForumTopic(ctx, userID, channelID)
+}
+
 // GetMessageReadParticipants returns a bounded read receipt list for a small megagroup message.
 func (s *Service) GetMessageReadParticipants(ctx context.Context, userID int64, req domain.ChannelReadParticipantsRequest) (domain.ChannelReadParticipantsResult, error) {
 	if s == nil || s.channels == nil || userID == 0 || req.ChannelID == 0 || req.MessageID <= 0 {
@@ -1372,7 +1962,7 @@ func (s *Service) ActiveChannelIDsForUser(ctx context.Context, userID, afterChan
 	if limit <= 0 || limit > domain.MaxSynchronousChannelDialogFanout {
 		limit = domain.MaxSynchronousChannelDialogFanout
 	}
-	return s.channels.ListActiveChannelIDsForUser(ctx, userID, afterChannelID, limit)
+	return s.cachedActiveChannelIDsForUser(ctx, userID, afterChannelID, limit)
 }
 
 // DirtyActiveChannelsForUser pages active joined channels with channel events after sinceDate.
@@ -1433,7 +2023,19 @@ func (s *Service) GetDifference(ctx context.Context, userID int64, req domain.Ch
 		return domain.ChannelDifference{}, domain.ErrChannelInvalid
 	}
 	req.Limit = capLimit(req.Limit, domain.MaxChannelDifferenceLimit)
-	return s.channels.ListChannelDifference(ctx, req)
+	diff, err := s.channels.ListChannelDifference(ctx, req)
+	if err != nil {
+		return domain.ChannelDifference{}, err
+	}
+	return s.filterBotChannelDifference(ctx, userID, diff), nil
+}
+
+// ClearDanglingPinnedMessage 清除指向已删除消息的悬挂置顶值（unpinAll 自愈）。
+func (s *Service) ClearDanglingPinnedMessage(ctx context.Context, channelID int64, messageID int) error {
+	if s == nil || s.channels == nil || channelID == 0 || messageID <= 0 {
+		return domain.ErrChannelInvalid
+	}
+	return s.channels.ClearDanglingPinnedMessage(ctx, channelID, messageID)
 }
 
 func capLimit(limit, max int) int {
@@ -1447,28 +2049,6 @@ func capLimit(limit, max int) int {
 		return max
 	}
 	return limit
-}
-
-func uniqueNonZeroLimit(ids []int64, limit int) []int64 {
-	if limit <= 0 {
-		return nil
-	}
-	out := make([]int64, 0, minInt(len(ids), limit))
-	seen := make(map[int64]struct{}, minInt(len(ids), limit))
-	for _, id := range ids {
-		if id == 0 {
-			continue
-		}
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
-		out = append(out, id)
-		if len(out) >= limit {
-			break
-		}
-	}
-	return out
 }
 
 func uniqueNonZero(ids []int64) []int64 {
@@ -1487,11 +2067,26 @@ func uniqueNonZero(ids []int64) []int64 {
 	return out
 }
 
-func minInt(a, b int) int {
-	if a < b {
-		return a
+func uniqueUserIDs(ids ...int64) []int64 {
+	return uniqueNonZero(ids)
+}
+
+func activeMembershipUserIDsFromMembers(primary int64, members []domain.ChannelMember) []int64 {
+	ids := make([]int64, 0, len(members)+1)
+	if primary != 0 {
+		ids = append(ids, primary)
 	}
-	return b
+	for _, member := range members {
+		ids = append(ids, member.UserID)
+	}
+	return uniqueNonZero(ids)
+}
+
+func (s *Service) invalidateActiveChannelIDs(userIDs ...int64) {
+	if s == nil || s.activeIDsCache == nil {
+		return
+	}
+	s.activeIDsCache.invalidateUsers(userIDs...)
 }
 
 func normalizeChannelUsername(username string) string {

@@ -3,10 +3,13 @@ package account
 import (
 	"bytes"
 	"context"
+	"crypto/sha512"
 	"errors"
 	"math/big"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/pbkdf2"
 
 	"telesrv/internal/domain"
 	"telesrv/internal/store/memory"
@@ -182,4 +185,20 @@ func clientPasswordCheck(t *testing.T, settings domain.PasswordSettings, passwor
 		kBytes,
 	)
 	return domain.PasswordCheck{SRPID: settings.SRPID, A: aForHash, M1: m1}
+}
+
+// passwordDigest 与 verifierForPassword 是客户端侧（明文口令 → verifier）的模拟助手，
+// 服务端从不执行明文口令路径，仅供这里的客户端 SRP helper 构造测试输入。
+func passwordDigest(algo domain.PasswordKDFAlgo, password []byte) []byte {
+	hash1 := hashBytes(algo.Salt1, password, algo.Salt1)
+	hash2 := hashBytes(algo.Salt2, hash1, algo.Salt2)
+	hash3 := pbkdf2.Key(hash2, algo.Salt1, 100000, 64, sha512.New)
+	return hashBytes(algo.Salt2, hash3, algo.Salt2)
+}
+
+func verifierForPassword(algo domain.PasswordKDFAlgo, password []byte) []byte {
+	p := new(big.Int).SetBytes(algo.P)
+	g := big.NewInt(int64(algo.G))
+	x := new(big.Int).SetBytes(passwordDigest(algo, password))
+	return padToHash(new(big.Int).Exp(g, x, p).Bytes())
 }

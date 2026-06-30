@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	contactsapp "telesrv/internal/app/contacts"
@@ -83,6 +84,52 @@ func TestContactProfilesOwnerScopedRoundTrip(t *testing.T) {
 	}
 	if altList.Contacts[0].Note != "alt note" {
 		t.Fatalf("alt contact note = %q, want isolated alt note", altList.Contacts[0].Note)
+	}
+
+	beforeCloseHash := ownerList.Hash
+	result, err := contacts.EditCloseFriends(ctx, owner.ID, []int64{friend.ID, friend.ID, owner.ID, 0, 999999})
+	if err != nil {
+		t.Fatalf("edit close friends: %v", err)
+	}
+	if got, want := result.AddedUserIDs, []int64{friend.ID}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("close friends added = %v, want %v", got, want)
+	}
+	if len(result.RemovedUserIDs) != 0 {
+		t.Fatalf("close friends removed = %v, want empty", result.RemovedUserIDs)
+	}
+	ownerList, _, err = contacts.GetContacts(ctx, owner.ID, 0)
+	if err != nil {
+		t.Fatalf("owner contacts after close friends: %v", err)
+	}
+	if !ownerList.Contacts[0].CloseFriend || !ownerList.Contacts[0].User.CloseFriend {
+		t.Fatalf("owner contact close friend = %+v, want true", ownerList.Contacts[0])
+	}
+	if ownerList.Hash == beforeCloseHash {
+		t.Fatalf("owner contact hash did not change after close friend update: %d", ownerList.Hash)
+	}
+	altList, _, err = contacts.GetContacts(ctx, altOwner.ID, 0)
+	if err != nil {
+		t.Fatalf("alt contacts after close friends: %v", err)
+	}
+	if altList.Contacts[0].CloseFriend || altList.Contacts[0].User.CloseFriend {
+		t.Fatalf("alt contact close friend = %+v, want false", altList.Contacts[0])
+	}
+	result, err = contacts.EditCloseFriends(ctx, owner.ID, nil)
+	if err != nil {
+		t.Fatalf("clear close friends: %v", err)
+	}
+	if len(result.AddedUserIDs) != 0 {
+		t.Fatalf("clear close friends added = %v, want empty", result.AddedUserIDs)
+	}
+	if got, want := result.RemovedUserIDs, []int64{friend.ID}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("clear close friends removed = %v, want %v", got, want)
+	}
+	ownerList, _, err = contacts.GetContacts(ctx, owner.ID, 0)
+	if err != nil {
+		t.Fatalf("owner contacts after close friends clear: %v", err)
+	}
+	if ownerList.Contacts[0].CloseFriend || ownerList.Contacts[0].User.CloseFriend {
+		t.Fatalf("owner contact after clear = %+v, want false", ownerList.Contacts[0])
 	}
 
 	if _, err := contacts.AddContact(ctx, friend.ID, domain.ContactInput{
@@ -196,21 +243,24 @@ func TestDialogUserViewUsesContactProfileAndDialogFlags(t *testing.T) {
 
 	friendPeer := domain.Peer{Type: domain.PeerTypeUser, ID: friend.ID}
 	otherPeer := domain.Peer{Type: domain.PeerTypeUser, ID: other.ID}
-	if changed, err := dialogs.SetPinned(ctx, ownerA.ID, friendPeer, true); err != nil || !changed {
+	if changed, _, err := dialogs.SetPinned(ctx, ownerA.ID, friendPeer, true); err != nil || !changed {
 		t.Fatalf("pin friend changed=%v err=%v, want changed", changed, err)
 	}
-	if changed, err := dialogs.SetPinned(ctx, ownerA.ID, otherPeer, true); err != nil || !changed {
+	if changed, _, err := dialogs.SetPinned(ctx, ownerA.ID, otherPeer, true); err != nil || !changed {
 		t.Fatalf("pin other changed=%v err=%v, want changed", changed, err)
 	}
-	if err := dialogs.ReorderPinned(ctx, ownerA.ID, []domain.Peer{otherPeer, friendPeer}, true); err != nil {
-		t.Fatalf("reorder pinned: %v", err)
+	if changed, err := dialogs.ReorderPinned(ctx, ownerA.ID, domain.DialogMainFolderID, []domain.Peer{otherPeer, friendPeer}, true); err != nil || changed {
+		t.Fatalf("reorder pinned = changed %v err %v, want no-op", changed, err)
 	}
 	pinned, err := dialogs.ListByUser(ctx, ownerA.ID, domain.DialogFilter{PinnedOnly: true, Limit: 10})
 	if err != nil {
 		t.Fatalf("list pinned dialogs: %v", err)
 	}
-	if len(pinned.Dialogs) != 2 || pinned.Dialogs[0].Peer != otherPeer || pinned.Dialogs[0].PinnedOrder != 1 || pinned.Dialogs[1].Peer != friendPeer || pinned.Dialogs[1].PinnedOrder != 2 {
-		t.Fatalf("pinned dialogs = %+v, want other then friend with stable order", pinned.Dialogs)
+	// 协议契约只看返回顺序（TL dialog 不暴露 pinned_order）；内部约定为
+	// 首位持最大 pinned_order（reorder 写 cardinality-pos+1，读取 DESC，
+	// 与 SetPinned 的 MAX+1"新 pin 置顶最前"一致）。
+	if len(pinned.Dialogs) != 2 || pinned.Dialogs[0].Peer != otherPeer || pinned.Dialogs[0].PinnedOrder != 2 || pinned.Dialogs[1].Peer != friendPeer || pinned.Dialogs[1].PinnedOrder != 1 {
+		t.Fatalf("pinned dialogs = %+v, want other then friend with descending internal order", pinned.Dialogs)
 	}
 
 	if changed, err := dialogs.SetUnreadMark(ctx, ownerA.ID, friendPeer, true); err != nil || !changed {
@@ -223,15 +273,16 @@ func TestDialogUserViewUsesContactProfileAndDialogFlags(t *testing.T) {
 	if !containsPeer(marks, friendPeer) {
 		t.Fatalf("unread marks = %+v, want friend peer", marks)
 	}
-	if _, err := dialogs.MarkRead(ctx, ownerA.ID, friendPeer, 0); err != nil {
+	read, err := dialogs.MarkRead(ctx, ownerA.ID, friendPeer, domain.MaxMessageBoxID)
+	if err != nil {
 		t.Fatalf("mark read: %v", err)
 	}
 	peerDialogs, err := dialogs.ListByPeers(ctx, ownerA.ID, []domain.Peer{friendPeer})
 	if err != nil {
 		t.Fatalf("list peer dialogs after read: %v", err)
 	}
-	if len(peerDialogs.Dialogs) != 1 || peerDialogs.Dialogs[0].UnreadMark {
-		t.Fatalf("peer dialog after read = %+v, want unread mark cleared", peerDialogs.Dialogs)
+	if len(peerDialogs.Dialogs) != 1 || peerDialogs.Dialogs[0].UnreadMark || peerDialogs.Dialogs[0].ReadInboxMaxID != peerDialogs.Dialogs[0].TopMessage || read.MaxID != peerDialogs.Dialogs[0].TopMessage {
+		t.Fatalf("peer dialog after read = %+v read=%+v, want unread mark cleared and read clamped to top", peerDialogs.Dialogs, read)
 	}
 
 	if changed, err := dialogs.SetPeerSettingsBarHidden(ctx, ownerA.ID, friendPeer); err != nil || !changed {
@@ -243,6 +294,67 @@ func TestDialogUserViewUsesContactProfileAndDialogFlags(t *testing.T) {
 	}
 	if !hidden {
 		t.Fatal("peer settings bar hidden = false, want true")
+	}
+}
+
+func TestDialogStoreMarkReadClampsAndRecomputesUnread(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	suffix := randomSuffix(t)
+
+	users := NewUserStore(pool)
+	sender := createTestUser(t, ctx, users, "+1911"+suffix+"01", "DialogReadSender", "")
+	recipient := createTestUser(t, ctx, users, "+1911"+suffix+"02", "DialogReadRecipient", "")
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", []int64{sender.ID, recipient.ID})
+	})
+
+	messages := NewMessageStore(pool)
+	sent := make([]domain.SendPrivateTextResult, 0, 3)
+	for i, body := range []string{"one", "two", "three"} {
+		got, err := messages.SendPrivateText(ctx, domain.SendPrivateTextRequest{
+			SenderUserID:    sender.ID,
+			RecipientUserID: recipient.ID,
+			RandomID:        739100 + int64(i),
+			Message:         body,
+			Date:            1700000390 + i,
+		})
+		if err != nil {
+			t.Fatalf("SendPrivateText %q: %v", body, err)
+		}
+		sent = append(sent, got)
+	}
+
+	dialogs := NewDialogStore(pool)
+	peer := domain.Peer{Type: domain.PeerTypeUser, ID: sender.ID}
+	partial, err := dialogs.MarkRead(ctx, recipient.ID, peer, sent[1].RecipientMessage.ID)
+	if err != nil {
+		t.Fatalf("partial MarkRead: %v", err)
+	}
+	if partial.MaxID != sent[1].RecipientMessage.ID || partial.StillUnreadCount != 1 {
+		t.Fatalf("partial read = %+v, want max second and one unread", partial)
+	}
+	list, err := dialogs.ListByPeers(ctx, recipient.ID, []domain.Peer{peer})
+	if err != nil {
+		t.Fatalf("ListByPeers partial: %v", err)
+	}
+	if len(list.Dialogs) != 1 || list.Dialogs[0].ReadInboxMaxID != sent[1].RecipientMessage.ID || list.Dialogs[0].UnreadCount != 1 {
+		t.Fatalf("dialog after partial read = %+v, want read second and one unread", list.Dialogs)
+	}
+
+	full, err := dialogs.MarkRead(ctx, recipient.ID, peer, domain.MaxMessageBoxID)
+	if err != nil {
+		t.Fatalf("future MarkRead: %v", err)
+	}
+	if full.MaxID != sent[2].RecipientMessage.ID || full.StillUnreadCount != 0 {
+		t.Fatalf("full read = %+v, want clamped to top and unread zero", full)
+	}
+	list, err = dialogs.ListByPeers(ctx, recipient.ID, []domain.Peer{peer})
+	if err != nil {
+		t.Fatalf("ListByPeers full: %v", err)
+	}
+	if len(list.Dialogs) != 1 || list.Dialogs[0].ReadInboxMaxID != sent[2].RecipientMessage.ID || list.Dialogs[0].UnreadCount != 0 {
+		t.Fatalf("dialog after full read = %+v, want read top and unread zero", list.Dialogs)
 	}
 }
 

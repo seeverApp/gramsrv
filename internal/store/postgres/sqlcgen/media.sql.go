@@ -7,6 +7,8 @@ package sqlcgen
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const addProfilePhoto = `-- name: AddProfilePhoto :exec
@@ -197,10 +199,52 @@ func (q *Queries) DeactivateProfilePhotos(ctx context.Context, arg DeactivatePro
 	return items, nil
 }
 
-const deleteUploadParts = `-- name: DeleteUploadParts :exec
+const deleteExpiredUploadParts = `-- name: DeleteExpiredUploadParts :many
+WITH doomed AS (
+  SELECT owner_user_id, file_id, part
+  FROM upload_parts
+  WHERE created_at < $1::timestamptz
+  ORDER BY created_at ASC
+  LIMIT $2::int
+)
+DELETE FROM upload_parts p
+USING doomed d
+WHERE p.owner_user_id = d.owner_user_id
+  AND p.file_id = d.file_id
+  AND p.part = d.part
+RETURNING p.object_key
+`
+
+type DeleteExpiredUploadPartsParams struct {
+	Before     pgtype.Timestamptz
+	BatchLimit int32
+}
+
+func (q *Queries) DeleteExpiredUploadParts(ctx context.Context, arg DeleteExpiredUploadPartsParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, deleteExpiredUploadParts, arg.Before, arg.BatchLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var object_key string
+		if err := rows.Scan(&object_key); err != nil {
+			return nil, err
+		}
+		items = append(items, object_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const deleteUploadParts = `-- name: DeleteUploadParts :many
 DELETE FROM upload_parts
 WHERE owner_user_id = $1::bigint
   AND file_id = $2::bigint
+RETURNING object_key
 `
 
 type DeleteUploadPartsParams struct {
@@ -208,9 +252,24 @@ type DeleteUploadPartsParams struct {
 	FileID      int64
 }
 
-func (q *Queries) DeleteUploadParts(ctx context.Context, arg DeleteUploadPartsParams) error {
-	_, err := q.db.Exec(ctx, deleteUploadParts, arg.OwnerUserID, arg.FileID)
-	return err
+func (q *Queries) DeleteUploadParts(ctx context.Context, arg DeleteUploadPartsParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, deleteUploadParts, arg.OwnerUserID, arg.FileID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var object_key string
+		if err := rows.Scan(&object_key); err != nil {
+			return nil, err
+		}
+		items = append(items, object_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getDocument = `-- name: GetDocument :one
@@ -562,6 +621,71 @@ func (q *Queries) GetStickerSetBySystemKey(ctx context.Context, systemKey string
 	return i, err
 }
 
+const getUploadPartSlot = `-- name: GetUploadPartSlot :one
+SELECT
+  COALESCE((
+    SELECT size
+    FROM upload_parts
+    WHERE owner_user_id = $1::bigint
+      AND file_id = $2::bigint
+      AND part = $3::int
+  ), -1)::bigint AS existing_bytes,
+  COALESCE((
+    SELECT object_key
+    FROM upload_parts
+    WHERE owner_user_id = $1::bigint
+      AND file_id = $2::bigint
+      AND part = $3::int
+  ), '')::text AS object_key,
+  (
+    SELECT COUNT(*)::int
+    FROM upload_parts
+    WHERE owner_user_id = $1::bigint
+      AND file_id = $2::bigint
+  )::int AS file_parts
+`
+
+type GetUploadPartSlotParams struct {
+	OwnerUserID int64
+	FileID      int64
+	Part        int32
+}
+
+type GetUploadPartSlotRow struct {
+	ExistingBytes int64
+	ObjectKey     string
+	FileParts     int32
+}
+
+func (q *Queries) GetUploadPartSlot(ctx context.Context, arg GetUploadPartSlotParams) (GetUploadPartSlotRow, error) {
+	row := q.db.QueryRow(ctx, getUploadPartSlot, arg.OwnerUserID, arg.FileID, arg.Part)
+	var i GetUploadPartSlotRow
+	err := row.Scan(&i.ExistingBytes, &i.ObjectKey, &i.FileParts)
+	return i, err
+}
+
+const getUploadPartUsage = `-- name: GetUploadPartUsage :one
+SELECT
+  COALESCE(SUM(size), 0)::bigint AS bytes,
+  COUNT(*)::int AS parts,
+  COUNT(DISTINCT file_id)::int AS files
+FROM upload_parts
+WHERE owner_user_id = $1::bigint
+`
+
+type GetUploadPartUsageRow struct {
+	Bytes int64
+	Parts int32
+	Files int32
+}
+
+func (q *Queries) GetUploadPartUsage(ctx context.Context, ownerUserID int64) (GetUploadPartUsageRow, error) {
+	row := q.db.QueryRow(ctx, getUploadPartUsage, ownerUserID)
+	var i GetUploadPartUsageRow
+	err := row.Scan(&i.Bytes, &i.Parts, &i.Files)
+	return i, err
+}
+
 const listAvailableReactions = `-- name: ListAvailableReactions :many
 SELECT
   reaction, title, inactive, premium,
@@ -732,7 +856,7 @@ func (q *Queries) ListStickerSetsByKind(ctx context.Context, setKind string) ([]
 }
 
 const listUploadParts = `-- name: ListUploadParts :many
-SELECT part, total_parts, is_big, bytes
+SELECT part, total_parts, is_big, backend, object_key, size, sha256
 FROM upload_parts
 WHERE owner_user_id = $1::bigint
   AND file_id = $2::bigint
@@ -748,7 +872,10 @@ type ListUploadPartsRow struct {
 	Part       int32
 	TotalParts int32
 	IsBig      bool
-	Bytes      []byte
+	Backend    string
+	ObjectKey  string
+	Size       int64
+	Sha256     []byte
 }
 
 func (q *Queries) ListUploadParts(ctx context.Context, arg ListUploadPartsParams) ([]ListUploadPartsRow, error) {
@@ -764,7 +891,10 @@ func (q *Queries) ListUploadParts(ctx context.Context, arg ListUploadPartsParams
 			&i.Part,
 			&i.TotalParts,
 			&i.IsBig,
-			&i.Bytes,
+			&i.Backend,
+			&i.ObjectKey,
+			&i.Size,
+			&i.Sha256,
 		); err != nil {
 			return nil, err
 		}
@@ -1116,19 +1246,26 @@ func (q *Queries) PutStickerSet(ctx context.Context, arg PutStickerSetParams) er
 
 const saveUploadPart = `-- name: SaveUploadPart :exec
 
-INSERT INTO upload_parts (owner_user_id, file_id, part, total_parts, is_big, bytes)
+INSERT INTO upload_parts (owner_user_id, file_id, part, total_parts, is_big, backend, object_key, size, sha256)
 VALUES (
   $1::bigint,
   $2::bigint,
   $3::int,
   $4::int,
   $5::boolean,
-  $6::bytea
+  $6::text,
+  $7::text,
+  $8::bigint,
+  $9::bytea
 )
 ON CONFLICT (owner_user_id, file_id, part) DO UPDATE SET
   total_parts = EXCLUDED.total_parts,
   is_big = EXCLUDED.is_big,
-  bytes = EXCLUDED.bytes
+  backend = EXCLUDED.backend,
+  object_key = EXCLUDED.object_key,
+  size = EXCLUDED.size,
+  sha256 = EXCLUDED.sha256,
+  created_at = now()
 `
 
 type SaveUploadPartParams struct {
@@ -1137,7 +1274,10 @@ type SaveUploadPartParams struct {
 	Part        int32
 	TotalParts  int32
 	IsBig       bool
-	Bytes       []byte
+	Backend     string
+	ObjectKey   string
+	Size        int64
+	Sha256      []byte
 }
 
 // upload_parts ----------------------------------------------------------------
@@ -1148,7 +1288,10 @@ func (q *Queries) SaveUploadPart(ctx context.Context, arg SaveUploadPartParams) 
 		arg.Part,
 		arg.TotalParts,
 		arg.IsBig,
-		arg.Bytes,
+		arg.Backend,
+		arg.ObjectKey,
+		arg.Size,
+		arg.Sha256,
 	)
 	return err
 }

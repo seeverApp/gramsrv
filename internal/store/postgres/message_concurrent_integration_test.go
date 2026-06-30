@@ -9,11 +9,10 @@ import (
 	"telesrv/internal/domain"
 )
 
-// TestSendPrivateTextConcurrentNoPtsGap 是「Redis 分配移出事务」的正确性核心证明：
+// TestSendPrivateTextConcurrentNoPtsGap 是「PG 事务内分配 pts」的正确性核心证明：
 // N 条消息并发 sender→recipient 发送，全部成功提交后，接收方账号事件 pts 必须严格连续 1..N
 // （无空洞、无重复、无丢失），且 MaxContiguousPts == N。
-// 用 perUserCounterAllocator（mutex 单调自增，忠实复刻 Redis INCR 原子性）驱动分配器，
-// 验证事务外分配 + 连续 pts 兜底在高并发下不丢消息，不引入 Redis 依赖。
+// box id 仍可由外部计数器提供，pts 则由 user_update_watermarks 在同一 PG tx 内推进。
 func TestSendPrivateTextConcurrentNoPtsGap(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -47,7 +46,7 @@ func TestSendPrivateTextConcurrentNoPtsGap(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DELETE FROM users WHERE id = ANY($1::bigint[])", ids)
 	})
 
-	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}, &perUserCounterAllocator{}))
+	messages := NewMessageStore(pool, WithMessageAllocators(&perUserCounterAllocator{}))
 
 	const n = 200
 	base := time.Now().UnixNano()

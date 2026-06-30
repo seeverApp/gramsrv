@@ -27,7 +27,7 @@ func seedEvent(t *testing.T, events *memory.UpdateEventStore, userID int64, pts 
 }
 
 // TestGetDifferenceStopsAtHole：getDifference 只返回从 from 起连续的事件，遇在途空洞即截断，
-// State.Pts 取最后连续值；补洞后下次拉取可继续，绝不跳过空洞。
+// State.Pts 取最后连续值；后续事件到齐后下次拉取可继续，绝不跳过空洞。
 func TestGetDifferenceStopsAtHole(t *testing.T) {
 	ctx := context.Background()
 	var authKeyID [8]byte
@@ -57,7 +57,7 @@ func TestGetDifferenceStopsAtHole(t *testing.T) {
 		t.Fatalf("GetDifference after fill: %v", err)
 	}
 	if len(diff.Events) != 3 || diff.State.Pts != 6 {
-		t.Fatalf("补洞后 diff = %d events, state.pts %d; want 4,5,6 到 pts=6", len(diff.Events), diff.State.Pts)
+		t.Fatalf("events after gap filled = %d, state.pts %d; want 4,5,6 到 pts=6", len(diff.Events), diff.State.Pts)
 	}
 }
 

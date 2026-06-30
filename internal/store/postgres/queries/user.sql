@@ -32,6 +32,17 @@ WITH matched AS (
     u.country_code,
     u.verified,
     u.support,
+    u.is_bot,
+    u.bot_info_version,
+    u.premium_expires_at,
+    u.emoji_status_document_id,
+    u.emoji_status_until,
+    u.color_set,
+    u.color,
+    u.color_background_emoji_id,
+    u.profile_color_set,
+    u.profile_color,
+    u.profile_color_background_emoji_id,
     u.last_seen_at,
     (c.contact_user_id IS NOT NULL)::boolean AS contact,
     COALESCE(c.mutual, false)::boolean AS mutual,
@@ -69,6 +80,17 @@ SELECT
   country_code,
   verified,
   support,
+  is_bot,
+  bot_info_version,
+  premium_expires_at,
+  emoji_status_document_id,
+  emoji_status_until,
+  color_set,
+  color,
+  color_background_emoji_id,
+  profile_color_set,
+  profile_color,
+  profile_color_background_emoji_id,
   last_seen_at,
   contact,
   mutual
@@ -77,8 +99,8 @@ ORDER BY contact DESC, rank, id
 LIMIT sqlc.arg(limit_count);
 
 -- name: CreateUser :one
-INSERT INTO users (access_hash, phone, first_name, last_name, username, country_code)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO users (access_hash, phone, first_name, last_name, username, country_code, premium_expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING *;
 
 -- name: UpdateUserUsername :one
@@ -101,4 +123,73 @@ SET first_name = $2,
     about = $4,
     updated_at = now()
 WHERE id = $1
+RETURNING *;
+
+-- name: SetUserPremiumUntil :one
+UPDATE users
+SET premium_expires_at = sqlc.narg(premium_expires_at)::timestamptz,
+    updated_at = now()
+WHERE id = sqlc.arg(id)::bigint
+RETURNING *;
+
+-- name: SetUserVerified :one
+UPDATE users
+SET verified = sqlc.arg(verified)::boolean,
+    updated_at = now()
+WHERE id = sqlc.arg(id)::bigint
+RETURNING *;
+
+-- name: SweepExpiredPremium :many
+UPDATE users
+SET premium_expires_at = NULL,
+    updated_at = now()
+WHERE id IN (
+  SELECT id FROM users
+  WHERE premium_expires_at IS NOT NULL
+    AND premium_expires_at <= sqlc.arg(now)::timestamptz
+  ORDER BY premium_expires_at
+  LIMIT sqlc.arg(limit_count)::int
+)
+RETURNING *;
+
+-- name: UpdateUserEmojiStatus :one
+UPDATE users
+SET emoji_status_document_id = sqlc.arg(emoji_status_document_id)::bigint,
+    emoji_status_until = sqlc.arg(emoji_status_until)::bigint,
+    updated_at = now()
+WHERE id = sqlc.arg(id)::bigint
+RETURNING *;
+
+-- name: UpdateUserBirthday :one
+UPDATE users
+SET birthday_day = sqlc.arg(birthday_day)::int,
+    birthday_month = sqlc.arg(birthday_month)::int,
+    birthday_year = sqlc.arg(birthday_year)::int,
+    updated_at = now()
+WHERE id = sqlc.arg(id)::bigint
+RETURNING *;
+
+-- name: UpdateUserPersonalChannel :one
+UPDATE users
+SET personal_channel_id = sqlc.arg(personal_channel_id)::bigint,
+    updated_at = now()
+WHERE id = sqlc.arg(id)::bigint
+RETURNING *;
+
+-- name: UpdateUserColor :one
+UPDATE users
+SET color_set = sqlc.arg(color_set)::boolean,
+    color = sqlc.arg(color)::int,
+    color_background_emoji_id = sqlc.arg(background_emoji_id)::bigint,
+    updated_at = now()
+WHERE id = sqlc.arg(id)::bigint
+RETURNING *;
+
+-- name: UpdateUserProfileColor :one
+UPDATE users
+SET profile_color_set = sqlc.arg(color_set)::boolean,
+    profile_color = sqlc.arg(color)::int,
+    profile_color_background_emoji_id = sqlc.arg(background_emoji_id)::bigint,
+    updated_at = now()
+WHERE id = sqlc.arg(id)::bigint
 RETURNING *;

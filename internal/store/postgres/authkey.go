@@ -14,12 +14,13 @@ import (
 
 // AuthKeyStore 用 PostgreSQL 实现 store.AuthKeyStore。
 type AuthKeyStore struct {
-	q *sqlcgen.Queries
+	q  *sqlcgen.Queries
+	db sqlcgen.DBTX
 }
 
 // NewAuthKeyStore 基于 pgx 连接池（或事务）创建 AuthKeyStore。
 func NewAuthKeyStore(db sqlcgen.DBTX) *AuthKeyStore {
-	return &AuthKeyStore{q: sqlcgen.New(db)}
+	return &AuthKeyStore{q: sqlcgen.New(db), db: db}
 }
 
 // Save 实现 store.AuthKeyStore。auth_key_id 以小端解释为 int64 存入 BIGINT；
@@ -53,6 +54,32 @@ func (s *AuthKeyStore) Get(ctx context.Context, id [8]byte) (store.AuthKeyData, 
 		data.CreatedAt = row.CreatedAt.Time.Unix()
 	}
 	return data, true, nil
+}
+
+// Delete 实现 store.AuthKeyStore。不存在时静默成功。
+// 手写 SQL 而非 sqlc 生成：避免触碰 sqlcgen 再生成链路。
+//
+// 同时清理把本 key 当作 perm key 的 temp auth key 行：temp_auth_key_bindings.temp_auth_key_id
+// 侧有外键 ON DELETE CASCADE，删除 temp key 会自动清绑定；perm_auth_key_id 列无外键，
+// 因此被踢/登出删除 perm key 时必须先把关联 temp key 一并删掉。否则 Web/上传连接用
+// raw temp key 重连时仍能进入 RPC 层，只得到 AUTH_KEY_UNREGISTERED，而不是连接层 404。
+func (s *AuthKeyStore) Delete(ctx context.Context, id [8]byte) error {
+	keyID := authKeyIDToInt64(id)
+	if _, err := s.db.Exec(ctx, `
+WITH doomed_temp AS (
+	SELECT temp_auth_key_id
+	FROM temp_auth_key_bindings
+	WHERE perm_auth_key_id = $1
+), deleted_temp AS (
+	DELETE FROM auth_keys
+	WHERE auth_key_id IN (SELECT temp_auth_key_id FROM doomed_temp)
+)
+DELETE FROM auth_keys
+WHERE auth_key_id = $1
+`, keyID); err != nil {
+		return fmt.Errorf("delete auth key and temp bindings: %w", err)
+	}
+	return nil
 }
 
 // authKeyIDToInt64 把 [8]byte 的 auth_key_id 按小端解释为 int64（MTProto 定义即 SHA1 低 64 位）。

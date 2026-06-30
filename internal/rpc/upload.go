@@ -11,12 +11,17 @@ import (
 	"telesrv/internal/domain"
 )
 
-// registerUpload 注册 upload.* RPC handler（分片上传 + 文件下载）。
+// Telegram 客户端按 chunk 调 upload.getFile；单次响应限制为 1MiB，
+// 防止异常客户端用超大/空 limit 触发整 blob 读回。
+const maxUploadGetFileChunkLimit = 1 << 20
+
+// registerUpload 注册 upload.* RPC handler（分片上传 + 文件下载 + 地图 webfile）。
 func (r *Router) registerUpload(d *tg.ServerDispatcher) {
 	d.OnUploadSaveFilePart(r.onUploadSaveFilePart)
 	d.OnUploadSaveBigFilePart(r.onUploadSaveBigFilePart)
 	d.OnUploadGetFile(r.onUploadGetFile)
 	d.OnUploadGetFileHashes(r.onUploadGetFileHashes)
+	r.registerUploadWebFile(d)
 }
 
 func (r *Router) onUploadSaveFilePart(ctx context.Context, req *tg.UploadSaveFilePartRequest) (bool, error) {
@@ -65,6 +70,9 @@ func (r *Router) onUploadGetFile(ctx context.Context, req *tg.UploadGetFileReque
 	if r.deps.Files == nil {
 		return nil, notImplementedErr()
 	}
+	if req.Offset < 0 || req.Limit <= 0 || req.Limit > maxUploadGetFileChunkLimit {
+		return nil, limitInvalidErr()
+	}
 	key, ok := fileLocationKey(req.Location)
 	if !ok {
 		return nil, locationInvalidErr()
@@ -100,6 +108,8 @@ func (r *Router) onUploadGetFileHashes(ctx context.Context, req *tg.UploadGetFil
 //	photo:<id>:<type>   照片某尺寸（头像 big→c / small→a）
 func fileLocationKey(location tg.InputFileLocationClass) (string, bool) {
 	switch loc := location.(type) {
+	case *tg.InputFileLocation:
+		return legacyVolumeLocationKey(loc.VolumeID, loc.LocalID)
 	case *tg.InputDocumentFileLocation:
 		if loc.ID == 0 {
 			return "", false
@@ -122,10 +132,80 @@ func fileLocationKey(location tg.InputFileLocationClass) (string, bool) {
 			size = "c"
 		}
 		return fmt.Sprintf("photo:%d:%s", loc.PhotoID, size), true
+	case *tg.InputPhotoLegacyFileLocation:
+		photoID := loc.ID
+		if photoID == 0 && loc.VolumeID < 0 {
+			photoID = -loc.VolumeID
+		}
+		if photoID == 0 {
+			return "", false
+		}
+		size, ok := legacyPhotoSizeType(loc.LocalID)
+		if !ok {
+			return "", false
+		}
+		return fmt.Sprintf("photo:%d:%s", photoID, size), true
+	case *tg.InputPeerPhotoFileLocationLegacy:
+		photoID := int64(0)
+		if loc.VolumeID < 0 {
+			photoID = -loc.VolumeID
+		}
+		if photoID == 0 {
+			return "", false
+		}
+		size := "a"
+		if loc.Big {
+			size = "c"
+		}
+		return fmt.Sprintf("photo:%d:%s", photoID, size), true
+	case *tg.InputEncryptedFileLocation:
+		// 密聊文件（P2）：盲 blob，location_key "enc:<id>"。access_hash 不强校验
+		// （沿用现有媒体 dev 姿态，依赖不可枚举 id）。
+		if loc.ID == 0 {
+			return "", false
+		}
+		return fmt.Sprintf("enc:%d", loc.ID), true
 	default:
-		// InputFileLocation(legacy volume/local/secret) / InputStickerSetThumb 等本阶段不生成对应资源。
+		// InputStickerSetThumb / secure / takeout 等本阶段不生成对应资源。
 		return "", false
 	}
+}
+
+func legacyVolumeLocationKey(volumeID int64, localID int) (string, bool) {
+	if volumeID >= 0 || localID <= 0 {
+		return "", false
+	}
+	id := -volumeID
+	if size, ok := legacyPhotoSizeType(localID); ok {
+		return fmt.Sprintf("photo:%d:%s", id, size), true
+	}
+	if size, ok := legacyDocumentThumbSizeType(localID); ok {
+		return fmt.Sprintf("doc:%d:%s", id, size), true
+	}
+	return "", false
+}
+
+func legacyPhotoSizeType(localID int) (string, bool) {
+	if localID < 1 || localID > 127 {
+		return "", false
+	}
+	ch := byte(localID)
+	if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') {
+		return string(ch), true
+	}
+	return "", false
+}
+
+func legacyDocumentThumbSizeType(localID int) (string, bool) {
+	localID -= 1000
+	if localID < 1 || localID > 127 {
+		return "", false
+	}
+	ch := byte(localID)
+	if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') {
+		return string(ch), true
+	}
+	return "", false
 }
 
 // storageFileType 映射 storage.FileType，优先信任字节魔数以兼容历史上写错 mime 的 seed blob。
@@ -182,6 +262,8 @@ func fileSaveErr(err error) error {
 		return filePartsInvalidErr()
 	case errors.Is(err, domain.ErrFilePartTooBig):
 		return filePartTooBigErr()
+	case errors.Is(err, domain.ErrUploadQuotaExceeded):
+		return floodWaitErr(60)
 	default:
 		return internalErr()
 	}

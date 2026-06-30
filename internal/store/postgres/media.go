@@ -1,10 +1,15 @@
 package postgres
 
 import (
+	"container/list"
 	"context"
 	"errors"
+	"fmt"
+	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
@@ -13,13 +18,18 @@ import (
 
 // MediaStore 用 PostgreSQL 实现 store.MediaStore（媒体元数据 + blob 索引）。
 type MediaStore struct {
-	db sqlcgen.DBTX
-	q  *sqlcgen.Queries
+	db        sqlcgen.DBTX
+	q         *sqlcgen.Queries
+	documents *documentMetaCache
 }
 
 // NewMediaStore 基于 pgx 连接池（或事务）创建 MediaStore。
 func NewMediaStore(db sqlcgen.DBTX) *MediaStore {
-	return &MediaStore{db: db, q: sqlcgen.New(db)}
+	return &MediaStore{
+		db:        db,
+		q:         sqlcgen.New(db),
+		documents: newDocumentMetaCache(documentMetaCacheCapacity),
+	}
 }
 
 // bytesOrEmpty 把 nil []byte 归一为空切片，避免落入 NOT NULL bytea 列时被当作 NULL。
@@ -35,14 +45,59 @@ var _ store.MediaStore = (*MediaStore)(nil)
 // ---- 上传分片 ----
 
 func (s *MediaStore) SaveFilePart(ctx context.Context, part domain.UploadPart) error {
+	backend := string(part.Backend)
+	if backend == "" {
+		backend = string(domain.MediaBackendLocalFS)
+	}
+	sha := part.SHA256
+	if sha == nil {
+		sha = []byte{}
+	}
 	return s.q.SaveUploadPart(ctx, sqlcgen.SaveUploadPartParams{
 		OwnerUserID: part.OwnerUserID,
 		FileID:      part.FileID,
 		Part:        int32(part.Part),
 		TotalParts:  int32(part.TotalParts),
 		IsBig:       part.Big,
-		Bytes:       part.Bytes,
+		Backend:     backend,
+		ObjectKey:   part.ObjectKey,
+		Size:        part.Size,
+		Sha256:      sha,
 	})
+}
+
+func (s *MediaStore) UploadPartUsage(ctx context.Context, ownerUserID int64) (domain.UploadPartUsage, error) {
+	row, err := s.q.GetUploadPartUsage(ctx, ownerUserID)
+	if err != nil {
+		return domain.UploadPartUsage{}, err
+	}
+	return domain.UploadPartUsage{
+		Bytes: row.Bytes,
+		Parts: int(row.Parts),
+		Files: int(row.Files),
+	}, nil
+}
+
+func (s *MediaStore) UploadPartSlot(ctx context.Context, ownerUserID, fileID int64, part int) (domain.UploadPartSlot, error) {
+	row, err := s.q.GetUploadPartSlot(ctx, sqlcgen.GetUploadPartSlotParams{
+		OwnerUserID: ownerUserID,
+		FileID:      fileID,
+		Part:        int32(part),
+	})
+	if err != nil {
+		return domain.UploadPartSlot{}, err
+	}
+	found := row.ExistingBytes >= 0
+	existingBytes := row.ExistingBytes
+	if !found {
+		existingBytes = 0
+	}
+	return domain.UploadPartSlot{
+		ExistingBytes: existingBytes,
+		ObjectKey:     row.ObjectKey,
+		FileParts:     int(row.FileParts),
+		Found:         found,
+	}, nil
 }
 
 func (s *MediaStore) LoadFileParts(ctx context.Context, ownerUserID, fileID int64) ([]domain.UploadPart, error) {
@@ -58,14 +113,27 @@ func (s *MediaStore) LoadFileParts(ctx context.Context, ownerUserID, fileID int6
 			Part:        int(r.Part),
 			TotalParts:  int(r.TotalParts),
 			Big:         r.IsBig,
-			Bytes:       r.Bytes,
+			Backend:     domain.MediaBackend(r.Backend),
+			ObjectKey:   r.ObjectKey,
+			Size:        r.Size,
+			SHA256:      r.Sha256,
 		})
 	}
 	return out, nil
 }
 
-func (s *MediaStore) DeleteFileParts(ctx context.Context, ownerUserID, fileID int64) error {
+func (s *MediaStore) DeleteFileParts(ctx context.Context, ownerUserID, fileID int64) ([]string, error) {
 	return s.q.DeleteUploadParts(ctx, sqlcgen.DeleteUploadPartsParams{OwnerUserID: ownerUserID, FileID: fileID})
+}
+
+func (s *MediaStore) DeleteExpiredUploadParts(ctx context.Context, before time.Time, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	return s.q.DeleteExpiredUploadParts(ctx, sqlcgen.DeleteExpiredUploadPartsParams{
+		Before:     pgtype.Timestamptz{Time: before, Valid: true},
+		BatchLimit: int32(limit),
+	})
 }
 
 // ---- blob 索引 ----
@@ -107,6 +175,65 @@ func (s *MediaStore) GetFileBlob(ctx context.Context, locationKey string) (domai
 	}, true, nil
 }
 
+// GetFileBlobs 一发 ANY 查询批量取多个 location_key 的 blob 元数据，替代逐个 GetFileBlob 往返
+// （启动预热曾对 ~2400 个 blob 各打一次 PG，是启动期 N+1）。缺失的 key 不在返回 map 中。
+func (s *MediaStore) GetFileBlobs(ctx context.Context, locationKeys []string) (map[string]domain.FileBlob, error) {
+	if len(locationKeys) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(ctx, `
+SELECT location_key, backend, object_key, size, sha256, mime_type
+FROM file_blobs
+WHERE location_key = ANY($1::text[])`, locationKeys)
+	if err != nil {
+		return nil, fmt.Errorf("get file blobs: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]domain.FileBlob, len(locationKeys))
+	for rows.Next() {
+		var (
+			blob    domain.FileBlob
+			backend string
+		)
+		if err := rows.Scan(&blob.LocationKey, &backend, &blob.ObjectKey, &blob.Size, &blob.SHA256, &blob.MimeType); err != nil {
+			return nil, fmt.Errorf("scan file blob: %w", err)
+		}
+		blob.Backend = domain.MediaBackend(backend)
+		out[blob.LocationKey] = blob
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *MediaStore) GetSeedState(ctx context.Context, key string) (string, bool, error) {
+	var hash string
+	if err := s.db.QueryRow(ctx, `
+SELECT content_hash
+FROM seed_states
+WHERE key = $1`, key).Scan(&hash); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("get seed state: %w", err)
+	}
+	return hash, true, nil
+}
+
+func (s *MediaStore) PutSeedState(ctx context.Context, key, hash string) error {
+	_, err := s.db.Exec(ctx, `
+INSERT INTO seed_states (key, content_hash)
+VALUES ($1, $2)
+ON CONFLICT (key) DO UPDATE SET
+  content_hash = EXCLUDED.content_hash,
+  updated_at = now()`, key, hash)
+	if err != nil {
+		return fmt.Errorf("put seed state: %w", err)
+	}
+	return nil
+}
+
 // ---- 文档 ----
 
 func (s *MediaStore) PutDocument(ctx context.Context, doc domain.Document) error {
@@ -118,7 +245,7 @@ func (s *MediaStore) PutDocument(ctx context.Context, doc domain.Document) error
 	if err != nil {
 		return err
 	}
-	return s.q.PutDocument(ctx, sqlcgen.PutDocumentParams{
+	if err := s.q.PutDocument(ctx, sqlcgen.PutDocumentParams{
 		ID:             doc.ID,
 		AccessHash:     doc.AccessHash,
 		FileReference:  bytesOrEmpty(doc.FileReference),
@@ -128,10 +255,17 @@ func (s *MediaStore) PutDocument(ctx context.Context, doc domain.Document) error
 		DcID:           int32(doc.DCID),
 		AttributesJson: attrs,
 		ThumbsJson:     thumbs,
-	})
+	}); err != nil {
+		return err
+	}
+	s.documents.put(doc.ID, doc)
+	return nil
 }
 
 func (s *MediaStore) GetDocument(ctx context.Context, id int64) (domain.Document, bool, error) {
+	if doc, ok := s.documents.get(id); ok {
+		return doc, true, nil
+	}
 	row, err := s.q.GetDocument(ctx, id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -143,6 +277,7 @@ func (s *MediaStore) GetDocument(ctx context.Context, id int64) (domain.Document
 	if err != nil {
 		return domain.Document{}, false, err
 	}
+	s.documents.put(doc.ID, doc)
 	return doc, true, nil
 }
 
@@ -150,19 +285,141 @@ func (s *MediaStore) GetDocuments(ctx context.Context, ids []int64) ([]domain.Do
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	rows, err := s.q.GetDocuments(ctx, ids)
-	if err != nil {
-		return nil, err
+
+	unique := make([]int64, 0, len(ids))
+	seen := make(map[int64]struct{}, len(ids))
+	found := make(map[int64]domain.Document, len(ids))
+	var missing []int64
+	for _, id := range ids {
+		if id == 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+		if doc, ok := s.documents.get(id); ok {
+			found[id] = doc
+			continue
+		}
+		missing = append(missing, id)
 	}
-	out := make([]domain.Document, 0, len(rows))
-	for _, r := range rows {
-		doc, err := documentFromRow(sqlcgen.GetDocumentRow(r))
+	if len(unique) == 0 {
+		return nil, nil
+	}
+
+	if len(missing) > 0 {
+		rows, err := s.q.GetDocuments(ctx, missing)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, doc)
+		for _, r := range rows {
+			doc, err := documentFromRow(sqlcgen.GetDocumentRow(r))
+			if err != nil {
+				return nil, err
+			}
+			s.documents.put(doc.ID, doc)
+			found[doc.ID] = cloneDocument(doc)
+		}
+	}
+
+	out := make([]domain.Document, 0, len(found))
+	for _, id := range unique {
+		doc, ok := found[id]
+		if !ok {
+			continue
+		}
+		out = append(out, cloneDocument(doc))
 	}
 	return out, nil
+}
+
+const documentMetaCacheCapacity = 1 << 16
+
+// documentMetaCache keeps immutable document metadata hot for message/media
+// hydration. PutDocument refreshes entries synchronously, so same-process reads
+// observe newly generated access_hash/file_reference without waiting for TTL.
+type documentMetaCache struct {
+	mu  sync.Mutex
+	cap int
+	ll  *list.List
+	m   map[int64]*list.Element
+}
+
+type documentMetaEntry struct {
+	id  int64
+	doc domain.Document
+}
+
+func newDocumentMetaCache(capacity int) *documentMetaCache {
+	if capacity <= 0 {
+		capacity = 1
+	}
+	return &documentMetaCache{
+		cap: capacity,
+		ll:  list.New(),
+		m:   make(map[int64]*list.Element, capacity),
+	}
+}
+
+func (c *documentMetaCache) get(id int64) (domain.Document, bool) {
+	if c == nil || id == 0 {
+		return domain.Document{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.m[id]
+	if !ok {
+		return domain.Document{}, false
+	}
+	c.ll.MoveToFront(el)
+	return cloneDocument(el.Value.(*documentMetaEntry).doc), true
+}
+
+func (c *documentMetaCache) put(id int64, doc domain.Document) {
+	if c == nil || id == 0 {
+		return
+	}
+	copied := cloneDocument(doc)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.m[id]; ok {
+		el.Value.(*documentMetaEntry).doc = copied
+		c.ll.MoveToFront(el)
+		return
+	}
+	c.m[id] = c.ll.PushFront(&documentMetaEntry{id: id, doc: copied})
+	if c.ll.Len() > c.cap {
+		oldest := c.ll.Back()
+		if oldest != nil {
+			c.ll.Remove(oldest)
+			delete(c.m, oldest.Value.(*documentMetaEntry).id)
+		}
+	}
+}
+
+func cloneDocument(doc domain.Document) domain.Document {
+	doc.FileReference = append([]byte(nil), doc.FileReference...)
+	if len(doc.Attributes) > 0 {
+		attrs := make([]domain.DocumentAttribute, len(doc.Attributes))
+		copy(attrs, doc.Attributes)
+		for i := range attrs {
+			attrs[i].Waveform = append([]byte(nil), attrs[i].Waveform...)
+		}
+		doc.Attributes = attrs
+	}
+	if len(doc.Thumbs) > 0 {
+		thumbs := make([]domain.PhotoSize, len(doc.Thumbs))
+		copy(thumbs, doc.Thumbs)
+		for i := range thumbs {
+			thumbs[i].Bytes = append([]byte(nil), thumbs[i].Bytes...)
+			thumbs[i].Sizes = append([]int(nil), thumbs[i].Sizes...)
+			thumbs[i].BackgroundColors = append([]int(nil), thumbs[i].BackgroundColors...)
+		}
+		doc.Thumbs = thumbs
+	}
+	return doc
 }
 
 func documentFromRow(row sqlcgen.GetDocumentRow) (domain.Document, error) {
@@ -213,19 +470,47 @@ func (s *MediaStore) GetPhoto(ctx context.Context, id int64) (domain.Photo, bool
 		}
 		return domain.Photo{}, false, err
 	}
-	sizes, err := decodePhotoSizes(row.SizesJson)
+	photo, err := photoFromFields(row.ID, row.AccessHash, row.FileReference, int(row.Date), int(row.DcID), row.HasStickers, row.SizesJson)
 	if err != nil {
 		return domain.Photo{}, false, err
 	}
+	return photo, true, nil
+}
+
+type photoScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanPhotoRow(row photoScanner) (domain.Photo, error) {
+	var (
+		id            int64
+		accessHash    int64
+		fileReference []byte
+		date          int32
+		dcID          int32
+		hasStickers   bool
+		sizesJSON     string
+	)
+	if err := row.Scan(&id, &accessHash, &fileReference, &date, &dcID, &hasStickers, &sizesJSON); err != nil {
+		return domain.Photo{}, err
+	}
+	return photoFromFields(id, accessHash, fileReference, int(date), int(dcID), hasStickers, sizesJSON)
+}
+
+func photoFromFields(id, accessHash int64, fileReference []byte, date, dcID int, hasStickers bool, sizesJSON string) (domain.Photo, error) {
+	sizes, err := decodePhotoSizes(sizesJSON)
+	if err != nil {
+		return domain.Photo{}, err
+	}
 	return domain.Photo{
-		ID:            row.ID,
-		AccessHash:    row.AccessHash,
-		FileReference: row.FileReference,
-		Date:          int(row.Date),
-		DCID:          int(row.DcID),
-		HasStickers:   row.HasStickers,
+		ID:            id,
+		AccessHash:    accessHash,
+		FileReference: fileReference,
+		Date:          date,
+		DCID:          dcID,
+		HasStickers:   hasStickers,
 		Sizes:         sizes,
-	}, true, nil
+	}, nil
 }
 
 // ---- 贴纸集 ----
@@ -419,10 +704,6 @@ func (s *MediaStore) CountAvailableReactions(ctx context.Context) (int, error) {
 
 // ---- 头像历史 ----
 
-func (s *MediaStore) AddProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID, photoID int64, date int) error {
-	return s.AddProfilePhotoKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile, photoID, date)
-}
-
 func (s *MediaStore) AddProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, photoID int64, date int) error {
 	kind = normalizeProfilePhotoKind(kind)
 	next, err := s.nextProfilePhotoOrder(ctx, ownerType, ownerID, kind)
@@ -438,10 +719,6 @@ ON CONFLICT (owner_peer_type, owner_peer_id, kind, photo_id) DO UPDATE SET
   sort_order = EXCLUDED.sort_order
 `, string(ownerType), ownerID, string(kind), photoID, date, next+1)
 	return err
-}
-
-func (s *MediaStore) CurrentProfilePhoto(ctx context.Context, ownerType domain.PeerType, ownerID int64) (int64, bool, error) {
-	return s.CurrentProfilePhotoKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile)
 }
 
 func (s *MediaStore) CurrentProfilePhotoKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind) (int64, bool, error) {
@@ -510,16 +787,13 @@ ORDER BY pp.owner_peer_id, pp.sort_order DESC
 			PhotoID:  photoID,
 			DCID:     int(dcID),
 			Stripped: domain.StrippedFromSizes(sizes),
+			HasVideo: domain.PhotoHasVideo(sizes),
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	return out, nil
-}
-
-func (s *MediaStore) ListProfilePhotos(ctx context.Context, ownerType domain.PeerType, ownerID int64, offset, limit int, maxID int64) ([]int64, int, error) {
-	return s.ListProfilePhotosKind(ctx, ownerType, ownerID, domain.ProfilePhotoKindProfile, offset, limit, maxID)
 }
 
 func (s *MediaStore) ListProfilePhotosKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, offset, limit int, maxID int64) ([]int64, int, error) {
@@ -564,6 +838,74 @@ WHERE owner_peer_type = $1
 		return nil, 0, err
 	}
 	return ids, total, nil
+}
+
+func (s *MediaStore) ListProfilePhotoDetailsKind(ctx context.Context, ownerType domain.PeerType, ownerID int64, kind domain.ProfilePhotoKind, offset, limit int, maxID int64) ([]domain.Photo, int, error) {
+	kind = normalizeProfilePhotoKind(kind)
+	if limit <= 0 {
+		return nil, 0, nil
+	}
+	var rows pgx.Rows
+	var err error
+	if offset < 0 && maxID > 0 {
+		rows, err = s.db.Query(ctx, `
+SELECT ph.id, ph.access_hash, ph.file_reference, ph.date, ph.dc_id, ph.has_stickers, ph.sizes::text AS sizes_json
+FROM profile_photos pp
+JOIN photos ph ON ph.id = pp.photo_id
+WHERE pp.owner_peer_type = $1
+  AND pp.owner_peer_id = $2
+  AND pp.kind = $3
+  AND pp.active
+  AND pp.photo_id = $4
+ORDER BY pp.sort_order DESC
+LIMIT $5
+`, string(ownerType), ownerID, string(kind), maxID, limit)
+	} else {
+		if offset < 0 {
+			offset = 0
+		}
+		rows, err = s.db.Query(ctx, `
+SELECT ph.id, ph.access_hash, ph.file_reference, ph.date, ph.dc_id, ph.has_stickers, ph.sizes::text AS sizes_json
+FROM profile_photos pp
+JOIN photos ph ON ph.id = pp.photo_id
+WHERE pp.owner_peer_type = $1
+  AND pp.owner_peer_id = $2
+  AND pp.kind = $3
+  AND pp.active
+  AND ($4::bigint <= 0 OR pp.photo_id < $4::bigint)
+ORDER BY pp.sort_order DESC
+OFFSET $5
+LIMIT $6
+`, string(ownerType), ownerID, string(kind), maxID, offset, limit)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	photos := make([]domain.Photo, 0, limit)
+	for rows.Next() {
+		photo, err := scanPhotoRow(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		photos = append(photos, photo)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	var total int
+	err = s.db.QueryRow(ctx, `
+SELECT count(*)::int
+FROM profile_photos
+WHERE owner_peer_type = $1
+  AND owner_peer_id = $2
+  AND kind = $3
+  AND active
+`, string(ownerType), ownerID, string(kind)).Scan(&total)
+	if err != nil {
+		return nil, 0, err
+	}
+	return photos, total, nil
 }
 
 func (s *MediaStore) DeleteProfilePhotos(ctx context.Context, ownerType domain.PeerType, ownerID int64, photoIDs []int64) ([]int64, error) {

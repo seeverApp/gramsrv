@@ -3,12 +3,570 @@ package channels
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"telesrv/internal/app/readmodel"
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
+
+type testBotProfiles map[int64]domain.BotProfile
+
+func TestServiceSendMessageHonorsSendPermissionGate(t *testing.T) {
+	ctx := context.Background()
+	svc := NewService(memory.NewChannelStore(), WithSendPermissionChecker(channelDenySendChecker{}))
+	if _, err := svc.SendMessage(ctx, 1001, domain.SendChannelMessageRequest{
+		UserID:    1001,
+		ChannelID: 2001,
+		RandomID:  1,
+		Message:   "blocked",
+	}); !errors.Is(err, domain.ErrUserSendRestricted) {
+		t.Fatalf("SendMessage err=%v, want ErrUserSendRestricted", err)
+	}
+}
+
+func TestServiceSendMonoforumMessageHonorsSendPermissionGate(t *testing.T) {
+	ctx := context.Background()
+	svc := NewService(memory.NewChannelStore(), WithSendPermissionChecker(channelDenySendChecker{}))
+	if _, err := svc.SendMonoforumMessage(ctx, domain.SendMonoforumMessageRequest{
+		MonoforumID:  2001,
+		SenderUserID: 1001,
+		SavedPeer:    domain.Peer{Type: domain.PeerTypeUser, ID: 1002},
+		RandomID:     1,
+		Message:      "blocked",
+	}); !errors.Is(err, domain.ErrUserSendRestricted) {
+		t.Fatalf("SendMonoforumMessage err=%v, want ErrUserSendRestricted", err)
+	}
+}
+
+type channelDenySendChecker struct{}
+
+func (channelDenySendChecker) CanSendMessages(context.Context, int64) error {
+	return domain.ErrUserSendRestricted
+}
+
+func (p testBotProfiles) BotInfo(_ context.Context, botUserID int64) (domain.BotProfile, bool, error) {
+	profile, ok := p[botUserID]
+	return profile, ok, nil
+}
+
+type countingChannelStore struct {
+	*memory.ChannelStore
+	mu                  sync.Mutex
+	getChannelCalls     int
+	resolveChannelCalls int
+	countMediaCalls     int
+	getParticipantCalls int
+	listActiveIDsCalls  int
+	resolveStarted      chan struct{}
+	resolveRelease      <-chan struct{}
+	resolveStartOnce    sync.Once
+}
+
+func (s *countingChannelStore) GetChannel(ctx context.Context, viewerUserID, channelID int64) (domain.ChannelView, error) {
+	s.getChannelCalls++
+	return s.ChannelStore.GetChannel(ctx, viewerUserID, channelID)
+}
+
+func (s *countingChannelStore) ResolveChannel(ctx context.Context, viewerUserID, channelID int64) (domain.ChannelView, error) {
+	s.mu.Lock()
+	s.resolveChannelCalls++
+	if s.resolveStarted != nil {
+		s.resolveStartOnce.Do(func() { close(s.resolveStarted) })
+	}
+	release := s.resolveRelease
+	s.mu.Unlock()
+	if release != nil {
+		<-release
+	}
+	return s.ChannelStore.ResolveChannel(ctx, viewerUserID, channelID)
+}
+
+func (s *countingChannelStore) CountChannelMediaCategories(ctx context.Context, viewerUserID, channelID int64) (domain.MediaCategoryCounts, error) {
+	s.countMediaCalls++
+	return s.ChannelStore.CountChannelMediaCategories(ctx, viewerUserID, channelID)
+}
+
+func (s *countingChannelStore) GetParticipants(ctx context.Context, viewerUserID, channelID int64, filter domain.ChannelParticipantsFilter, offset, limit int) (domain.ChannelParticipantList, error) {
+	s.getParticipantCalls++
+	return s.ChannelStore.GetParticipants(ctx, viewerUserID, channelID, filter, offset, limit)
+}
+
+func (s *countingChannelStore) ListActiveChannelIDsForUser(ctx context.Context, userID, afterChannelID int64, limit int) ([]int64, error) {
+	s.listActiveIDsCalls++
+	return s.ChannelStore.ListActiveChannelIDsForUser(ctx, userID, afterChannelID, limit)
+}
+
+type fakeReadModelVersions struct {
+	hashes map[store.ReadModelKey]int64
+}
+
+func (f *fakeReadModelVersions) ReadModelHash(_ context.Context, model string, ownerUserID int64, peerType domain.PeerType, peerID int64) (int64, bool, error) {
+	hash := f.hashes[store.ReadModelKey{Model: model, OwnerUserID: ownerUserID, PeerType: peerType, PeerID: peerID}]
+	return hash, hash != 0, nil
+}
+
+func (f *fakeReadModelVersions) ReadModelHashes(_ context.Context, keys []store.ReadModelKey) (map[store.ReadModelKey]int64, error) {
+	out := make(map[store.ReadModelKey]int64, len(keys))
+	for _, key := range keys {
+		if hash := f.hashes[key]; hash != 0 {
+			out[key] = hash
+		}
+	}
+	return out, nil
+}
+
+func TestChannelFullViewReadModelCacheDefaultTTLIsLongLived(t *testing.T) {
+	if defaultChannelViewReadModelTTL != 24*time.Hour {
+		t.Fatalf("default full channel read model TTL = %v, want 24h", defaultChannelViewReadModelTTL)
+	}
+	if cache := newChannelViewReadModelCache(0); cache == nil {
+		t.Fatal("newChannelViewReadModelCache(0) 应返回非 nil 缓存")
+	}
+}
+
+func TestGetChannelCachesFullViewByCompositeReadModelHash(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	service := NewService(base)
+	created, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
+		Title:     "Cached Full",
+		Megagroup: true,
+		Date:      1700004100,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
+	peer := domain.Peer{Type: domain.PeerTypeChannel, ID: created.Channel.ID}
+	versions := &fakeReadModelVersions{hashes: map[store.ReadModelKey]int64{
+		{Model: readmodel.ModelChannelBase, OwnerUserID: 0, PeerType: peer.Type, PeerID: peer.ID}:         11,
+		{Model: readmodel.ModelChannelMember, OwnerUserID: ownerID, PeerType: peer.Type, PeerID: peer.ID}: 22,
+		{Model: readmodel.ModelDialogLight, OwnerUserID: ownerID, PeerType: peer.Type, PeerID: peer.ID}:   33,
+	}}
+	service = NewService(base, WithReadModelVersions(versions))
+
+	first, err := service.GetChannelReadModel(ctx, ownerID, created.Channel.ID)
+	if err != nil {
+		t.Fatalf("first GetChannel: %v", err)
+	}
+	if first.Channel.ID != created.Channel.ID || first.Self.UserID != ownerID {
+		t.Fatalf("first channel view = %+v, want owner view", first)
+	}
+	first.Channel.PhotoStripped = []byte{1, 2, 3}
+	first.Dialog.DefaultSendAs = &peer
+	second, err := service.GetChannelReadModel(ctx, ownerID, created.Channel.ID)
+	if err != nil {
+		t.Fatalf("second GetChannel: %v", err)
+	}
+	if base.getChannelCalls != 1 {
+		t.Fatalf("GetChannel calls = %d, want 1 after cache hit", base.getChannelCalls)
+	}
+	if len(second.Channel.PhotoStripped) != 0 || second.Dialog.DefaultSendAs != nil {
+		t.Fatalf("cached channel view was mutated by caller: %+v", second)
+	}
+
+	versions.hashes[store.ReadModelKey{Model: readmodel.ModelChannelMember, OwnerUserID: ownerID, PeerType: peer.Type, PeerID: peer.ID}] = 44
+	if _, err := service.GetChannelReadModel(ctx, ownerID, created.Channel.ID); err != nil {
+		t.Fatalf("GetChannel after hash bump: %v", err)
+	}
+	if base.getChannelCalls != 2 {
+		t.Fatalf("GetChannel calls after hash bump = %d, want 2", base.getChannelCalls)
+	}
+}
+
+func TestResolveChannelCachesAccessViewByCompositeReadModelHash(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	service := NewService(base)
+	created, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
+		Title:     "Cached Resolve",
+		Megagroup: true,
+		Date:      1700004103,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
+	peer := domain.Peer{Type: domain.PeerTypeChannel, ID: created.Channel.ID}
+	memberKey := store.ReadModelKey{Model: readmodel.ModelChannelMember, OwnerUserID: ownerID, PeerType: peer.Type, PeerID: peer.ID}
+	baseKey := store.ReadModelKey{Model: readmodel.ModelChannelBase, OwnerUserID: 0, PeerType: peer.Type, PeerID: peer.ID}
+	versions := &fakeReadModelVersions{hashes: map[store.ReadModelKey]int64{
+		baseKey:   51,
+		memberKey: 52,
+	}}
+	service = NewService(base, WithReadModelVersions(versions))
+
+	first, err := service.ResolveChannel(ctx, ownerID, created.Channel.ID)
+	if err != nil {
+		t.Fatalf("first ResolveChannel: %v", err)
+	}
+	if first.Channel.ID != created.Channel.ID || first.Self.UserID != ownerID {
+		t.Fatalf("first resolve view = %+v, want owner view", first)
+	}
+	first.Channel.PhotoStripped = []byte{1, 2, 3}
+	first.Dialog.DefaultSendAs = &peer
+	second, err := service.ResolveChannel(ctx, ownerID, created.Channel.ID)
+	if err != nil {
+		t.Fatalf("second ResolveChannel: %v", err)
+	}
+	if base.resolveChannelCalls != 1 {
+		t.Fatalf("ResolveChannel calls = %d, want 1 after cache hit", base.resolveChannelCalls)
+	}
+	if len(second.Channel.PhotoStripped) != 0 || second.Dialog.DefaultSendAs != nil {
+		t.Fatalf("cached resolve view was mutated by caller: %+v", second)
+	}
+
+	versions.hashes[memberKey] = 53
+	if _, err := service.ResolveChannel(ctx, ownerID, created.Channel.ID); err != nil {
+		t.Fatalf("ResolveChannel after member hash bump: %v", err)
+	}
+	if base.resolveChannelCalls != 2 {
+		t.Fatalf("ResolveChannel calls after member hash bump = %d, want 2", base.resolveChannelCalls)
+	}
+
+	versions.hashes[baseKey] = 54
+	if _, err := service.ResolveChannel(ctx, ownerID, created.Channel.ID); err != nil {
+		t.Fatalf("ResolveChannel after base hash bump: %v", err)
+	}
+	if base.resolveChannelCalls != 3 {
+		t.Fatalf("ResolveChannel calls after base hash bump = %d, want 3", base.resolveChannelCalls)
+	}
+}
+
+func TestActiveChannelIDsForUserCachesPageByReadModelHash(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	service := NewService(base)
+	firstChannel, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
+		Title:     "Active One",
+		Megagroup: true,
+		Date:      1700004110,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel first: %v", err)
+	}
+	secondChannel, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
+		Title:     "Active Two",
+		Megagroup: true,
+		Date:      1700004111,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel second: %v", err)
+	}
+	key := store.ReadModelKey{Model: readmodel.ModelChannelActiveIDs, OwnerUserID: ownerID, PeerType: domain.PeerTypeUser, PeerID: ownerID}
+	versions := &fakeReadModelVersions{hashes: map[store.ReadModelKey]int64{key: 201}}
+	service = NewService(base, WithReadModelVersions(versions))
+
+	want := []int64{firstChannel.Channel.ID, secondChannel.Channel.ID}
+	first, err := service.ActiveChannelIDsForUser(ctx, ownerID, 0, domain.MaxSynchronousChannelDialogFanout)
+	if err != nil {
+		t.Fatalf("first ActiveChannelIDsForUser: %v", err)
+	}
+	if !slices.Equal(first, want) {
+		t.Fatalf("first active ids = %v, want %v", first, want)
+	}
+	first[0] = 999
+	second, err := service.ActiveChannelIDsForUser(ctx, ownerID, 0, domain.MaxSynchronousChannelDialogFanout)
+	if err != nil {
+		t.Fatalf("second ActiveChannelIDsForUser: %v", err)
+	}
+	if base.listActiveIDsCalls != 1 {
+		t.Fatalf("ListActiveChannelIDsForUser calls = %d, want 1 after cache hit", base.listActiveIDsCalls)
+	}
+	if !slices.Equal(second, want) {
+		t.Fatalf("cached active ids were mutated: got %v, want %v", second, want)
+	}
+
+	versions.hashes[key] = 202
+	if _, err := service.ActiveChannelIDsForUser(ctx, ownerID, 0, domain.MaxSynchronousChannelDialogFanout); err != nil {
+		t.Fatalf("active ids after hash bump: %v", err)
+	}
+	if base.listActiveIDsCalls != 2 {
+		t.Fatalf("ListActiveChannelIDsForUser calls after hash bump = %d, want 2", base.listActiveIDsCalls)
+	}
+}
+
+func TestActiveChannelIDsForUserCachesEmptyMissingReadModelHash(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	service := NewService(base, WithReadModelVersions(&fakeReadModelVersions{}))
+
+	first, err := service.ActiveChannelIDsForUser(ctx, ownerID, 0, domain.MaxSynchronousChannelDialogFanout)
+	if err != nil {
+		t.Fatalf("first ActiveChannelIDsForUser: %v", err)
+	}
+	if len(first) != 0 {
+		t.Fatalf("first active ids = %v, want empty", first)
+	}
+	second, err := service.ActiveChannelIDsForUser(ctx, ownerID, 0, domain.MaxSynchronousChannelDialogFanout)
+	if err != nil {
+		t.Fatalf("second ActiveChannelIDsForUser: %v", err)
+	}
+	if len(second) != 0 {
+		t.Fatalf("second active ids = %v, want empty", second)
+	}
+	if base.listActiveIDsCalls != 1 {
+		t.Fatalf("ListActiveChannelIDsForUser calls = %d, want 1 after empty cache hit", base.listActiveIDsCalls)
+	}
+
+	created, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
+		Title:     "Now Active",
+		Megagroup: true,
+		Date:      1700004114,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
+	afterWrite, err := service.ActiveChannelIDsForUser(ctx, ownerID, 0, domain.MaxSynchronousChannelDialogFanout)
+	if err != nil {
+		t.Fatalf("active ids after write: %v", err)
+	}
+	if want := []int64{created.Channel.ID}; !slices.Equal(afterWrite, want) {
+		t.Fatalf("active ids after write = %v, want %v", afterWrite, want)
+	}
+	if base.listActiveIDsCalls != 2 {
+		t.Fatalf("ListActiveChannelIDsForUser calls after write = %d, want 2", base.listActiveIDsCalls)
+	}
+	if _, err := service.ActiveChannelIDsForUser(ctx, ownerID, 0, domain.MaxSynchronousChannelDialogFanout); err != nil {
+		t.Fatalf("active ids cached after write: %v", err)
+	}
+	if base.listActiveIDsCalls != 2 {
+		t.Fatalf("ListActiveChannelIDsForUser calls after second post-write read = %d, want 2", base.listActiveIDsCalls)
+	}
+}
+
+func TestActiveChannelIDsCacheInvalidatesOnMembershipWrite(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	key := store.ReadModelKey{Model: readmodel.ModelChannelActiveIDs, OwnerUserID: ownerID, PeerType: domain.PeerTypeUser, PeerID: ownerID}
+	versions := &fakeReadModelVersions{hashes: map[store.ReadModelKey]int64{key: 301}}
+	service := NewService(base, WithReadModelVersions(versions))
+	firstChannel, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
+		Title:     "Write One",
+		Megagroup: true,
+		Date:      1700004112,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel first: %v", err)
+	}
+	if _, err := service.ActiveChannelIDsForUser(ctx, ownerID, 0, domain.MaxSynchronousChannelDialogFanout); err != nil {
+		t.Fatalf("warm active ids: %v", err)
+	}
+	if base.listActiveIDsCalls != 1 {
+		t.Fatalf("ListActiveChannelIDsForUser calls after warm = %d, want 1", base.listActiveIDsCalls)
+	}
+
+	secondChannel, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
+		Title:     "Write Two",
+		Megagroup: true,
+		Date:      1700004113,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel second: %v", err)
+	}
+	got, err := service.ActiveChannelIDsForUser(ctx, ownerID, 0, domain.MaxSynchronousChannelDialogFanout)
+	if err != nil {
+		t.Fatalf("active ids after create: %v", err)
+	}
+	want := []int64{firstChannel.Channel.ID, secondChannel.Channel.ID}
+	if !slices.Equal(got, want) {
+		t.Fatalf("active ids after create = %v, want %v", got, want)
+	}
+	if base.listActiveIDsCalls != 2 {
+		t.Fatalf("ListActiveChannelIDsForUser calls after create invalidation = %d, want 2", base.listActiveIDsCalls)
+	}
+}
+
+func TestResolveChannelSingleflightsConcurrentMiss(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	started := make(chan struct{})
+	release := make(chan struct{})
+	base := &countingChannelStore{
+		ChannelStore:   memory.NewChannelStore(),
+		resolveStarted: started,
+		resolveRelease: release,
+	}
+	service := NewService(base)
+	created, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
+		Title:     "Concurrent Resolve",
+		Megagroup: true,
+		Date:      1700004104,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
+	peer := domain.Peer{Type: domain.PeerTypeChannel, ID: created.Channel.ID}
+	versions := &fakeReadModelVersions{hashes: map[store.ReadModelKey]int64{
+		{Model: readmodel.ModelChannelBase, OwnerUserID: 0, PeerType: peer.Type, PeerID: peer.ID}:         61,
+		{Model: readmodel.ModelChannelMember, OwnerUserID: ownerID, PeerType: peer.Type, PeerID: peer.ID}: 62,
+	}}
+	service = NewService(base, WithReadModelVersions(versions))
+
+	const goroutines = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			view, err := service.ResolveChannel(ctx, ownerID, created.Channel.ID)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if view.Channel.ID != created.Channel.ID || view.Self.UserID != ownerID {
+				errs <- errors.New("unexpected resolve view")
+			}
+		}()
+	}
+	<-started
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if base.resolveChannelCalls != 1 {
+		t.Fatalf("ResolveChannel calls = %d, want 1", base.resolveChannelCalls)
+	}
+}
+
+func TestCountChannelMediaCategoriesCachesByCompositeReadModelHash(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	service := NewService(base)
+	created, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
+		Title:     "Media Counts",
+		Megagroup: true,
+		Date:      1700004101,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
+	peer := domain.Peer{Type: domain.PeerTypeChannel, ID: created.Channel.ID}
+	versions := &fakeReadModelVersions{hashes: map[store.ReadModelKey]int64{
+		{Model: readmodel.ModelChannelMediaCounts, OwnerUserID: 0, PeerType: peer.Type, PeerID: peer.ID}:  91,
+		{Model: readmodel.ModelChannelMember, OwnerUserID: ownerID, PeerType: peer.Type, PeerID: peer.ID}: 92,
+	}}
+	service = NewService(base, WithReadModelVersions(versions))
+
+	first, err := service.CountChannelMediaCategories(ctx, ownerID, created.Channel.ID)
+	if err != nil {
+		t.Fatalf("first count media: %v", err)
+	}
+	first[domain.MediaCategoryPhoto] = 99
+	second, err := service.CountChannelMediaCategories(ctx, ownerID, created.Channel.ID)
+	if err != nil {
+		t.Fatalf("second count media: %v", err)
+	}
+	if base.countMediaCalls != 1 {
+		t.Fatalf("CountChannelMediaCategories calls = %d, want 1 after cache hit", base.countMediaCalls)
+	}
+	if second[domain.MediaCategoryPhoto] != 0 {
+		t.Fatalf("cached media counts were mutated by caller: %+v", second)
+	}
+
+	service.InvalidateChannelMediaCountReadModel(created.Channel.ID)
+	if _, err := service.CountChannelMediaCategories(ctx, ownerID, created.Channel.ID); err != nil {
+		t.Fatalf("count media after explicit invalidation: %v", err)
+	}
+	if base.countMediaCalls != 2 {
+		t.Fatalf("CountChannelMediaCategories calls after explicit invalidation = %d, want 2", base.countMediaCalls)
+	}
+
+	versions.hashes[store.ReadModelKey{Model: readmodel.ModelChannelMember, OwnerUserID: ownerID, PeerType: peer.Type, PeerID: peer.ID}] = 93
+	if _, err := service.CountChannelMediaCategories(ctx, ownerID, created.Channel.ID); err != nil {
+		t.Fatalf("count media after hash bump: %v", err)
+	}
+	if base.countMediaCalls != 3 {
+		t.Fatalf("CountChannelMediaCategories calls after hash bump = %d, want 3", base.countMediaCalls)
+	}
+}
+
+func TestGetParticipantsCachesPageByCompositeReadModelHash(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	service := NewService(base)
+	created, err := service.CreateChannel(ctx, ownerID, domain.CreateChannelRequest{
+		Title:         "Participants",
+		Megagroup:     true,
+		MemberUserIDs: []int64{1002, 1003},
+		Date:          1700004102,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
+	peer := domain.Peer{Type: domain.PeerTypeChannel, ID: created.Channel.ID}
+	versions := &fakeReadModelVersions{hashes: map[store.ReadModelKey]int64{
+		{Model: readmodel.ModelChannelBase, OwnerUserID: 0, PeerType: peer.Type, PeerID: peer.ID}:                    101,
+		{Model: readmodel.ModelChannelParticipants, OwnerUserID: 0, PeerType: peer.Type, PeerID: peer.ID}:            102,
+		{Model: readmodel.ModelChannelMember, OwnerUserID: ownerID, PeerType: peer.Type, PeerID: peer.ID}:            103,
+		{Model: readmodel.ModelContactAccount, OwnerUserID: ownerID, PeerType: domain.PeerTypeUser, PeerID: ownerID}: 104,
+	}}
+	service = NewService(base, WithReadModelVersions(versions))
+
+	first, err := service.GetParticipants(ctx, ownerID, created.Channel.ID, domain.ChannelParticipantsFilter{Kind: domain.ChannelParticipantsRecent}, 0, 20)
+	if err != nil {
+		t.Fatalf("first participants: %v", err)
+	}
+	if first.Hash == 0 || len(first.Participants) != 3 {
+		t.Fatalf("first participants = %+v, want hash and three members", first)
+	}
+	first.Channel.PhotoStripped = []byte{1, 2, 3}
+	first.Participants[0].Rank = "mutated"
+	second, err := service.GetParticipants(ctx, ownerID, created.Channel.ID, domain.ChannelParticipantsFilter{}, 0, 20)
+	if err != nil {
+		t.Fatalf("second participants: %v", err)
+	}
+	if base.getParticipantCalls != 1 {
+		t.Fatalf("GetParticipants calls = %d, want 1 after cache hit", base.getParticipantCalls)
+	}
+	if second.Hash != first.Hash {
+		t.Fatalf("second hash = %d, want %d", second.Hash, first.Hash)
+	}
+	if len(second.Channel.PhotoStripped) != 0 || second.Participants[0].Rank == "mutated" {
+		t.Fatalf("cached participants were mutated by caller: %+v", second)
+	}
+
+	versions.hashes[store.ReadModelKey{Model: readmodel.ModelContactAccount, OwnerUserID: ownerID, PeerType: domain.PeerTypeUser, PeerID: ownerID}] = 105
+	third, err := service.GetParticipants(ctx, ownerID, created.Channel.ID, domain.ChannelParticipantsFilter{Kind: domain.ChannelParticipantsRecent}, 0, 20)
+	if err != nil {
+		t.Fatalf("participants after contact hash bump: %v", err)
+	}
+	if base.getParticipantCalls != 2 {
+		t.Fatalf("GetParticipants calls after contact hash bump = %d, want 2", base.getParticipantCalls)
+	}
+	if third.Hash == first.Hash {
+		t.Fatalf("third hash = %d, want changed from %d", third.Hash, first.Hash)
+	}
+
+	versions.hashes[store.ReadModelKey{Model: readmodel.ModelChannelParticipants, OwnerUserID: 0, PeerType: peer.Type, PeerID: peer.ID}] = 106
+	fourth, err := service.GetParticipants(ctx, ownerID, created.Channel.ID, domain.ChannelParticipantsFilter{Kind: domain.ChannelParticipantsRecent}, 0, 20)
+	if err != nil {
+		t.Fatalf("participants after participant hash bump: %v", err)
+	}
+	if base.getParticipantCalls != 3 {
+		t.Fatalf("GetParticipants calls after participant hash bump = %d, want 3", base.getParticipantCalls)
+	}
+	if fourth.Hash == third.Hash {
+		t.Fatalf("fourth hash = %d, want changed from %d", fourth.Hash, third.Hash)
+	}
+}
 
 func TestCreateChatCreatesMegagroupWithChannelPts(t *testing.T) {
 	ctx := context.Background()
@@ -37,6 +595,7 @@ func TestCreateChatCreatesMegagroupWithChannelPts(t *testing.T) {
 		ChannelID: created.Channel.ID,
 		RandomID:  99,
 		Message:   "hello",
+		ViaBotID:  1003,
 		Date:      11,
 	})
 	if err != nil {
@@ -44,6 +603,9 @@ func TestCreateChatCreatesMegagroupWithChannelPts(t *testing.T) {
 	}
 	if sent.Message.ID != 2 || sent.Message.Pts != 2 || sent.Event.Pts != 2 || sent.Event.PtsCount != 1 {
 		t.Fatalf("sent = %+v event=%+v, want message id/pts=2", sent.Message, sent.Event)
+	}
+	if sent.Message.ViaBotID != 1003 || sent.Event.Message.ViaBotID != 1003 {
+		t.Fatalf("sent via_bot_id = msg %d event %d, want 1003", sent.Message.ViaBotID, sent.Event.Message.ViaBotID)
 	}
 
 	duplicate, err := service.SendMessage(ctx, 1001, domain.SendChannelMessageRequest{
@@ -58,6 +620,9 @@ func TestCreateChatCreatesMegagroupWithChannelPts(t *testing.T) {
 	if !duplicate.Duplicate || duplicate.Message.ID != sent.Message.ID || duplicate.Message.Body != "hello" {
 		t.Fatalf("duplicate = %+v, want original single-copy message", duplicate)
 	}
+	if duplicate.Message.ViaBotID != 1003 || duplicate.Event.Message.ViaBotID != 1003 {
+		t.Fatalf("duplicate via_bot_id = msg %d event %d, want 1003", duplicate.Message.ViaBotID, duplicate.Event.Message.ViaBotID)
+	}
 
 	history, err := service.GetHistory(ctx, 1002, domain.ChannelHistoryFilter{ChannelID: created.Channel.ID, Limit: 10})
 	if err != nil {
@@ -66,6 +631,9 @@ func TestCreateChatCreatesMegagroupWithChannelPts(t *testing.T) {
 	if len(history.Messages) != 2 || history.Messages[0].ID != 2 || history.Messages[1].ID != 1 {
 		t.Fatalf("history = %+v, want channel messages newest first", history.Messages)
 	}
+	if history.Messages[0].ViaBotID != 1003 {
+		t.Fatalf("history via_bot_id = %d, want 1003", history.Messages[0].ViaBotID)
+	}
 
 	diff, err := service.GetDifference(ctx, 1002, domain.ChannelDifferenceRequest{ChannelID: created.Channel.ID, Pts: 1, Limit: 10})
 	if err != nil {
@@ -73,6 +641,9 @@ func TestCreateChatCreatesMegagroupWithChannelPts(t *testing.T) {
 	}
 	if !diff.Final || diff.Pts != 2 || len(diff.NewMessages) != 1 || diff.NewMessages[0].Body != "hello" {
 		t.Fatalf("diff = %+v, want single new channel message at pts=2", diff)
+	}
+	if diff.NewMessages[0].ViaBotID != 1003 {
+		t.Fatalf("diff via_bot_id = %d, want 1003", diff.NewMessages[0].ViaBotID)
 	}
 	if _, err := service.GetDifference(ctx, 1002, domain.ChannelDifferenceRequest{ChannelID: created.Channel.ID, Pts: sent.Event.Pts + 1, Limit: 10}); !errors.Is(err, domain.ErrPersistentTimestamp) {
 		t.Fatalf("future pts diff err = %v, want persistent timestamp invalid", err)
@@ -95,6 +666,198 @@ func TestCreateChatCreatesMegagroupWithChannelPts(t *testing.T) {
 	if ownerView.Dialog.ReadOutboxMaxID != sent.Message.ID {
 		t.Fatalf("owner dialog read_outbox = %d, want %d", ownerView.Dialog.ReadOutboxMaxID, sent.Message.ID)
 	}
+}
+
+func TestGroupBotPolicies(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewChannelStore()
+	bots := testBotProfiles{
+		1003: {BotUserID: 1003, ChatHistory: false, Nochats: false},
+		1004: {BotUserID: 1004, ChatHistory: false, Nochats: true},
+	}
+	service := NewService(store, WithBotProfileResolver(bots))
+
+	if _, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
+		Title:         "Blocked",
+		MemberUserIDs: []int64{1004},
+		Date:          10,
+	}); !errors.Is(err, domain.ErrBotGroupsBlocked) {
+		t.Fatalf("create chat with nochats bot err = %v, want ErrBotGroupsBlocked", err)
+	}
+
+	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
+		Title:         "Bots",
+		MemberUserIDs: []int64{1002, 1003},
+		Date:          20,
+	})
+	if err != nil {
+		t.Fatalf("CreateMegagroupFromCreateChat: %v", err)
+	}
+	if _, err := service.InviteToChannel(ctx, 1001, created.Channel.ID, []int64{1004}, 21); !errors.Is(err, domain.ErrBotGroupsBlocked) {
+		t.Fatalf("invite nochats bot err = %v, want ErrBotGroupsBlocked", err)
+	}
+	botParticipants, err := service.GetParticipants(ctx, 1001, created.Channel.ID, domain.ChannelParticipantsFilter{Kind: domain.ChannelParticipantsBots}, 0, 20)
+	if err != nil {
+		t.Fatalf("GetParticipants bots: %v", err)
+	}
+	if botParticipants.Count != 1 || len(botParticipants.Participants) != 1 || botParticipants.Participants[0].UserID != 1003 {
+		t.Fatalf("bot participants = %+v, want bot 1003 only", botParticipants)
+	}
+
+	plain, err := service.SendMessage(ctx, 1001, domain.SendChannelMessageRequest{
+		ChannelID: created.Channel.ID,
+		RandomID:  2001,
+		Message:   "plain group text",
+		Date:      22,
+	})
+	if err != nil {
+		t.Fatalf("SendMessage plain: %v", err)
+	}
+	if testContainsInt64(plain.Recipients, 1003) {
+		t.Fatalf("plain recipients = %+v, privacy bot must be skipped", plain.Recipients)
+	}
+	hiddenDiff, err := service.GetDifference(ctx, 1003, domain.ChannelDifferenceRequest{ChannelID: created.Channel.ID, Pts: created.Event.Pts, Limit: 20})
+	if err != nil {
+		t.Fatalf("GetDifference hidden: %v", err)
+	}
+	if hiddenDiff.Pts != plain.Event.Pts || len(hiddenDiff.NewMessages) != 0 || len(hiddenDiff.Events) != 0 {
+		t.Fatalf("hidden diff = %+v, want pts advanced without messages", hiddenDiff)
+	}
+	hiddenHistory, err := service.GetHistory(ctx, 1003, domain.ChannelHistoryFilter{ChannelID: created.Channel.ID, Limit: 20})
+	if err != nil {
+		t.Fatalf("GetHistory hidden: %v", err)
+	}
+	for _, msg := range hiddenHistory.Messages {
+		if msg.Body == "plain group text" {
+			t.Fatalf("bot history leaked hidden message: %+v", hiddenHistory.Messages)
+		}
+	}
+
+	command, err := service.SendMessage(ctx, 1001, domain.SendChannelMessageRequest{
+		ChannelID: created.Channel.ID,
+		RandomID:  2002,
+		Message:   "/status",
+		Date:      23,
+	})
+	if err != nil {
+		t.Fatalf("SendMessage command: %v", err)
+	}
+	if !testContainsInt64(command.Recipients, 1003) {
+		t.Fatalf("command recipients = %+v, want privacy bot", command.Recipients)
+	}
+	visibleDiff, err := service.GetDifference(ctx, 1003, domain.ChannelDifferenceRequest{ChannelID: created.Channel.ID, Pts: plain.Event.Pts, Limit: 20})
+	if err != nil {
+		t.Fatalf("GetDifference command: %v", err)
+	}
+	if len(visibleDiff.NewMessages) != 1 || visibleDiff.NewMessages[0].Body != "/status" {
+		t.Fatalf("visible diff = %+v, want command only", visibleDiff.NewMessages)
+	}
+	view, err := service.GetChannel(ctx, 1003, created.Channel.ID)
+	if err != nil {
+		t.Fatalf("GetChannel bot: %v", err)
+	}
+	if view.Dialog.UnreadCount != 1 || view.Dialog.ReadInboxMaxID != plain.Message.ID {
+		t.Fatalf("bot dialog unread/read = %d/%d, want only command unread after hidden boundary %d", view.Dialog.UnreadCount, view.Dialog.ReadInboxMaxID, plain.Message.ID)
+	}
+
+	botMessage, err := service.SendMessage(ctx, 1003, domain.SendChannelMessageRequest{
+		ChannelID: created.Channel.ID,
+		RandomID:  3001,
+		Message:   "bot said",
+		Date:      24,
+	})
+	if err != nil {
+		t.Fatalf("SendMessage bot: %v", err)
+	}
+	reply, err := service.SendMessage(ctx, 1001, domain.SendChannelMessageRequest{
+		ChannelID: created.Channel.ID,
+		RandomID:  2003,
+		Message:   "reply to bot",
+		ReplyTo:   &domain.MessageReply{MessageID: botMessage.Message.ID},
+		Date:      25,
+	})
+	if err != nil {
+		t.Fatalf("SendMessage reply: %v", err)
+	}
+	if !testContainsInt64(reply.Recipients, 1003) {
+		t.Fatalf("reply recipients = %+v, want privacy bot", reply.Recipients)
+	}
+}
+
+// TestPrivacyBotReceivesDeleteEventsInDifference 回归: privacy-mode bot 经
+// getChannelDifference 补差必须收到删除事件。旧逻辑用 GetChannelMessages 重取已删消息
+// 判可见性,而该查询带 AND NOT deleted 恒返空→整条 delete 事件被丢弃,导致 bot 对所有删除
+// 失明、客户端缓存残留"未删"态。修复后删除事件直接放行(与在线推送一致,删除 id 不泄漏内容)。
+func TestPrivacyBotReceivesDeleteEventsInDifference(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewChannelStore()
+	bots := testBotProfiles{
+		1003: {BotUserID: 1003, ChatHistory: false, Nochats: false},
+	}
+	service := NewService(store, WithBotProfileResolver(bots))
+
+	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
+		Title:         "Bots",
+		MemberUserIDs: []int64{1002, 1003},
+		Date:          20,
+	})
+	if err != nil {
+		t.Fatalf("CreateMegagroupFromCreateChat: %v", err)
+	}
+
+	// 命令消息 privacy bot 可见(messageIsCommand)。
+	command, err := service.SendMessage(ctx, 1001, domain.SendChannelMessageRequest{
+		ChannelID: created.Channel.ID,
+		RandomID:  2001,
+		Message:   "/status",
+		Date:      22,
+	})
+	if err != nil {
+		t.Fatalf("SendMessage command: %v", err)
+	}
+
+	deleted, err := service.DeleteMessages(ctx, 1001, domain.DeleteChannelMessagesRequest{
+		ChannelID: created.Channel.ID,
+		IDs:       []int{command.Message.ID},
+		Date:      23,
+	})
+	if err != nil {
+		t.Fatalf("DeleteMessages: %v", err)
+	}
+	if deleted.Event.Type != domain.ChannelUpdateDeleteMessages {
+		t.Fatalf("delete event type = %v, want delete", deleted.Event.Type)
+	}
+
+	diff, err := service.GetDifference(ctx, 1003, domain.ChannelDifferenceRequest{ChannelID: created.Channel.ID, Pts: command.Event.Pts, Limit: 20})
+	if err != nil {
+		t.Fatalf("GetDifference: %v", err)
+	}
+	foundDelete := false
+	for _, ev := range diff.Events {
+		if ev.Type != domain.ChannelUpdateDeleteMessages {
+			continue
+		}
+		for _, id := range ev.MessageIDs {
+			if id == command.Message.ID {
+				foundDelete = true
+			}
+		}
+	}
+	if !foundDelete {
+		t.Fatalf("privacy bot diff = %+v, want delete event for msg %d", diff, command.Message.ID)
+	}
+	if diff.Pts != deleted.Event.Pts {
+		t.Fatalf("diff pts = %d, want advanced to %d", diff.Pts, deleted.Event.Pts)
+	}
+}
+
+func testContainsInt64(ids []int64, target int64) bool {
+	for _, id := range ids {
+		if id == target {
+			return true
+		}
+	}
+	return false
 }
 
 func TestChannelUnreadMentionsArePagedAndCleared(t *testing.T) {
@@ -189,8 +952,9 @@ func TestChannelUnreadMentionsArePagedAndCleared(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetHistory after read mentions: %v", err)
 	}
-	if len(history.Messages) == 0 || history.Messages[0].Mentioned || history.Messages[0].MediaUnread {
-		t.Fatalf("mentioned history after read = %+v, want mention flags cleared", history.Messages)
+	// 官方语义：mention 已读后 mentioned 高亮永久保留，仅 media_unread 清除。
+	if len(history.Messages) == 0 || !history.Messages[0].Mentioned || history.Messages[0].MediaUnread {
+		t.Fatalf("mentioned history after read = %+v, want mentioned kept with media_unread cleared", history.Messages)
 	}
 }
 
@@ -410,18 +1174,40 @@ func TestDefaultBannedRightsRestrictMemberSendAndInvite(t *testing.T) {
 	if _, err := service.InviteToChannel(ctx, 1002, created.Channel.ID, []int64{1003}, 12); !errors.Is(err, domain.ErrChannelAdminRequired) {
 		t.Fatalf("member InviteToChannel err = %v, want ErrChannelAdminRequired", err)
 	}
+	updated, err = service.SetBoostsToUnblockRestrictions(ctx, 1001, created.Channel.ID, 1)
+	if err != nil {
+		t.Fatalf("SetBoostsToUnblockRestrictions: %v", err)
+	}
+	if updated.BoostsUnrestrict != 1 {
+		t.Fatalf("boosts unrestrict = %d, want 1", updated.BoostsUnrestrict)
+	}
+	if _, err := service.ApplyPremiumBoost(ctx, 1002, created.Channel.ID, []int{domain.DefaultPremiumBoostSlotID}, 13, 1000); err != nil {
+		t.Fatalf("ApplyPremiumBoost member: %v", err)
+	}
+	boosted, err := service.SendMessage(ctx, 1002, domain.SendChannelMessageRequest{
+		ChannelID: created.Channel.ID,
+		RandomID:  4,
+		Message:   "member boosted ok",
+		Date:      14,
+	})
+	if err != nil {
+		t.Fatalf("member SendMessage after boost: %v", err)
+	}
+	if boosted.Message.FromBoostsApplied != 1 {
+		t.Fatalf("from_boosts_applied = %d, want 1", boosted.Message.FromBoostsApplied)
+	}
 	if _, err := service.SendMessage(ctx, 1001, domain.SendChannelMessageRequest{
 		ChannelID: created.Channel.ID,
 		RandomID:  2,
 		Message:   "owner ok",
-		Date:      13,
+		Date:      15,
 	}); err != nil {
 		t.Fatalf("creator SendMessage under default rights: %v", err)
 	}
 	if _, err := service.EditDefaultBannedRights(ctx, 1001, domain.EditChannelDefaultBannedRightsRequest{
 		ChannelID:    created.Channel.ID,
 		BannedRights: domain.ChannelBannedRights{},
-		Date:         14,
+		Date:         16,
 	}); err != nil {
 		t.Fatalf("clear default banned rights: %v", err)
 	}
@@ -429,7 +1215,7 @@ func TestDefaultBannedRightsRestrictMemberSendAndInvite(t *testing.T) {
 		ChannelID: created.Channel.ID,
 		RandomID:  3,
 		Message:   "member ok",
-		Date:      15,
+		Date:      17,
 	}); err != nil {
 		t.Fatalf("member SendMessage after clear: %v", err)
 	}
@@ -630,6 +1416,61 @@ func TestParticipantsHiddenHidesMemberListAndReadParticipants(t *testing.T) {
 	if len(readers.Participants) != 0 {
 		t.Fatalf("hidden readers = %+v, want none", readers.Participants)
 	}
+}
+
+func TestAnonymousAdminHiddenFromRegularParticipantLists(t *testing.T) {
+	ctx := context.Background()
+	service := NewService(memory.NewChannelStore())
+	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
+		Title:         "Anonymous Admins",
+		MemberUserIDs: []int64{1002, 1003},
+		Date:          10,
+	})
+	if err != nil {
+		t.Fatalf("CreateMegagroupFromCreateChat: %v", err)
+	}
+	if _, err := service.EditAdmin(ctx, 1001, domain.EditChannelAdminRequest{
+		ChannelID: created.Channel.ID,
+		MemberID:  1002,
+		AdminRights: domain.ChannelAdminRights{
+			Anonymous:  true,
+			ChangeInfo: true,
+		},
+		Date: 11,
+	}); err != nil {
+		t.Fatalf("EditAdmin anonymous: %v", err)
+	}
+
+	recent, err := service.GetParticipants(ctx, 1003, created.Channel.ID, domain.ChannelParticipantsFilter{Kind: domain.ChannelParticipantsRecent}, 0, 10)
+	if err != nil {
+		t.Fatalf("regular GetParticipants recent: %v", err)
+	}
+	if containsChannelParticipant(recent.Participants, 1002) || recent.Count != 2 {
+		t.Fatalf("regular recent participants = %+v count=%d, want anonymous admin hidden and count adjusted", recent.Participants, recent.Count)
+	}
+	admins, err := service.GetParticipants(ctx, 1003, created.Channel.ID, domain.ChannelParticipantsFilter{Kind: domain.ChannelParticipantsAdmins}, 0, 10)
+	if err != nil {
+		t.Fatalf("regular GetParticipants admins: %v", err)
+	}
+	if containsChannelParticipant(admins.Participants, 1002) || len(admins.Participants) != 1 || admins.Participants[0].UserID != 1001 {
+		t.Fatalf("regular admin participants = %+v, want only creator visible", admins.Participants)
+	}
+	adminView, err := service.GetParticipants(ctx, 1001, created.Channel.ID, domain.ChannelParticipantsFilter{Kind: domain.ChannelParticipantsAdmins}, 0, 10)
+	if err != nil {
+		t.Fatalf("owner GetParticipants admins: %v", err)
+	}
+	if !containsChannelParticipant(adminView.Participants, 1002) {
+		t.Fatalf("owner admin participants = %+v, want anonymous admin visible to admins", adminView.Participants)
+	}
+}
+
+func containsChannelParticipant(participants []domain.ChannelMember, userID int64) bool {
+	for _, participant := range participants {
+		if participant.UserID == userID {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBroadcastRejectsMemberPost(t *testing.T) {
@@ -1051,8 +1892,13 @@ func TestChannelBanAndDeletePermissions(t *testing.T) {
 	if banned.Participant.Status != domain.ChannelMemberKicked || banned.Channel.ParticipantsCount != 1 || banned.Channel.KickedCount != 1 {
 		t.Fatalf("banned = %+v, want kicked participant and counts", banned)
 	}
-	if banned.Channel.Pts != ptsBeforeBan {
-		t.Fatalf("banned channel pts = %d, want unchanged %d", banned.Channel.Pts, ptsBeforeBan)
+	// megagroup 踢人产生 "X removed Y" 服务消息并占一个 channel pts；
+	// participant update 自身仍是 transient。
+	if banned.Channel.Pts != ptsBeforeBan+1 || banned.ServiceEvent.Pts != ptsBeforeBan+1 {
+		t.Fatalf("banned channel pts = %d service %d, want kick service message at %d", banned.Channel.Pts, banned.ServiceEvent.Pts, ptsBeforeBan+1)
+	}
+	if banned.Message.Action == nil || banned.Message.Action.Type != domain.ChannelActionChatDelete {
+		t.Fatalf("kick service message = %+v, want ChatDelete action", banned.Message)
 	}
 	if banned.Event.Type != domain.ChannelUpdateParticipant || banned.Event.Participant.Status != domain.ChannelMemberKicked || banned.Event.Pts != 0 || banned.Event.PtsCount != 0 {
 		t.Fatalf("ban participant event = %+v, want transient kicked transition", banned.Event)
@@ -1228,6 +2074,192 @@ func TestChannelUsernameAndSignatures(t *testing.T) {
 	}
 	if !signed.Signatures {
 		t.Fatalf("signed channel = %+v, want signatures enabled", signed)
+	}
+}
+
+func TestListStoryPostableChannelsFiltersPostStoryRights(t *testing.T) {
+	ctx := context.Background()
+	service := NewService(memory.NewChannelStore())
+	userID := int64(1001)
+	creatorID := int64(2001)
+	created, err := service.CreateChannel(ctx, userID, domain.CreateChannelRequest{
+		CreatorUserID: userID,
+		Title:         "own private story channel",
+		Broadcast:     true,
+		Date:          1,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel own: %v", err)
+	}
+	postable, err := service.CreateChannel(ctx, creatorID, domain.CreateChannelRequest{
+		CreatorUserID: creatorID,
+		Title:         "post stories admin",
+		Broadcast:     true,
+		MemberUserIDs: []int64{userID},
+		Date:          2,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel postable: %v", err)
+	}
+	if _, err := service.EditAdmin(ctx, creatorID, domain.EditChannelAdminRequest{
+		ChannelID: postable.Channel.ID,
+		MemberID:  userID,
+		AdminRights: domain.ChannelAdminRights{
+			PostStories: true,
+		},
+		Date: 3,
+	}); err != nil {
+		t.Fatalf("EditAdmin post stories: %v", err)
+	}
+	editOnly, err := service.CreateChannel(ctx, creatorID, domain.CreateChannelRequest{
+		CreatorUserID: creatorID,
+		Title:         "edit stories only",
+		Broadcast:     true,
+		MemberUserIDs: []int64{userID},
+		Date:          4,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel edit-only: %v", err)
+	}
+	if _, err := service.EditAdmin(ctx, creatorID, domain.EditChannelAdminRequest{
+		ChannelID: editOnly.Channel.ID,
+		MemberID:  userID,
+		AdminRights: domain.ChannelAdminRights{
+			EditStories: true,
+		},
+		Date: 5,
+	}); err != nil {
+		t.Fatalf("EditAdmin edit stories: %v", err)
+	}
+	memberOnly, err := service.CreateChannel(ctx, creatorID, domain.CreateChannelRequest{
+		CreatorUserID: creatorID,
+		Title:         "member story channel",
+		Broadcast:     true,
+		MemberUserIDs: []int64{userID},
+		Date:          6,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel member-only: %v", err)
+	}
+
+	list, err := service.ListStoryPostableChannels(ctx, userID)
+	if err != nil {
+		t.Fatalf("ListStoryPostableChannels: %v", err)
+	}
+	got := make([]int64, 0, len(list))
+	for _, channel := range list {
+		got = append(got, channel.ID)
+	}
+	want := []int64{postable.Channel.ID, created.Channel.ID}
+	if len(got) != len(want) {
+		t.Fatalf("story postable channel ids = %v, want %v; excluded edit-only=%d member-only=%d", got, want, editOnly.Channel.ID, memberOnly.Channel.ID)
+	}
+	if got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("story postable channel ids = %v, want %v; excluded edit-only=%d member-only=%d", got, want, editOnly.Channel.ID, memberOnly.Channel.ID)
+	}
+}
+
+func TestListSendAsChannelsFiltersPostMessageRights(t *testing.T) {
+	ctx := context.Background()
+	service := NewService(memory.NewChannelStore())
+	userID := int64(1001)
+	creatorID := int64(2001)
+
+	// Broadcast channel the user created → eligible.
+	owned, err := service.CreateChannel(ctx, userID, domain.CreateChannelRequest{
+		CreatorUserID: userID,
+		Title:         "own broadcast",
+		Broadcast:     true,
+		Date:          1,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel owned: %v", err)
+	}
+	// Broadcast channel where the user is an admin holding PostMessages → eligible.
+	postAdmin, err := service.CreateChannel(ctx, creatorID, domain.CreateChannelRequest{
+		CreatorUserID: creatorID,
+		Title:         "post admin broadcast",
+		Broadcast:     true,
+		MemberUserIDs: []int64{userID},
+		Date:          2,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel post-admin: %v", err)
+	}
+	if _, err := service.EditAdmin(ctx, creatorID, domain.EditChannelAdminRequest{
+		ChannelID:   postAdmin.Channel.ID,
+		MemberID:    userID,
+		AdminRights: domain.ChannelAdminRights{PostMessages: true},
+		Date:        3,
+	}); err != nil {
+		t.Fatalf("EditAdmin post messages: %v", err)
+	}
+	// Broadcast channel where the user is an admin WITHOUT PostMessages → excluded.
+	editAdmin, err := service.CreateChannel(ctx, creatorID, domain.CreateChannelRequest{
+		CreatorUserID: creatorID,
+		Title:         "edit admin broadcast",
+		Broadcast:     true,
+		MemberUserIDs: []int64{userID},
+		Date:          4,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel edit-admin: %v", err)
+	}
+	if _, err := service.EditAdmin(ctx, creatorID, domain.EditChannelAdminRequest{
+		ChannelID:   editAdmin.Channel.ID,
+		MemberID:    userID,
+		AdminRights: domain.ChannelAdminRights{EditMessages: true, DeleteMessages: true},
+		Date:        5,
+	}); err != nil {
+		t.Fatalf("EditAdmin edit messages: %v", err)
+	}
+	// Megagroup the user created → excluded (sending as an owned megagroup is not a real capability).
+	megagroup, err := service.CreateChannel(ctx, userID, domain.CreateChannelRequest{
+		CreatorUserID: userID,
+		Title:         "own megagroup",
+		Megagroup:     true,
+		Date:          6,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel megagroup: %v", err)
+	}
+	// Broadcast channel the user is only a member of → excluded.
+	memberOnly, err := service.CreateChannel(ctx, creatorID, domain.CreateChannelRequest{
+		CreatorUserID: creatorID,
+		Title:         "member broadcast",
+		Broadcast:     true,
+		MemberUserIDs: []int64{userID},
+		Date:          7,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel member-only: %v", err)
+	}
+
+	list, err := service.ListSendAsChannels(ctx, userID)
+	if err != nil {
+		t.Fatalf("ListSendAsChannels: %v", err)
+	}
+	got := make(map[int64]bool, len(list))
+	for _, channel := range list {
+		got[channel.ID] = true
+	}
+	if !got[owned.Channel.ID] {
+		t.Fatalf("send-as channels %v missing creator-owned broadcast %d", got, owned.Channel.ID)
+	}
+	if !got[postAdmin.Channel.ID] {
+		t.Fatalf("send-as channels %v missing post-admin broadcast %d", got, postAdmin.Channel.ID)
+	}
+	if got[editAdmin.Channel.ID] {
+		t.Fatalf("send-as channels %v should exclude admin-without-post %d", got, editAdmin.Channel.ID)
+	}
+	if got[megagroup.Channel.ID] {
+		t.Fatalf("send-as channels %v should exclude owned megagroup %d", got, megagroup.Channel.ID)
+	}
+	if got[memberOnly.Channel.ID] {
+		t.Fatalf("send-as channels %v should exclude member-only broadcast %d", got, memberOnly.Channel.ID)
+	}
+	if len(list) != 2 {
+		t.Fatalf("send-as channels = %d entries, want 2 (owned + post-admin)", len(list))
 	}
 }
 

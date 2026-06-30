@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -22,6 +23,8 @@ const (
 	maxContactNoteLength  = 4096
 	maxContactSearchQLen  = 256
 	maxContactSearchLimit = 50
+	maxCloseFriendsCount  = 5000
+	maxContactSetBlocked  = 5000
 )
 
 // registerContacts 注册 contacts.* RPC handler。
@@ -33,8 +36,10 @@ func (r *Router) registerContacts(d *tg.ServerDispatcher) {
 	d.OnContactsAddContact(r.onContactsAddContact)
 	d.OnContactsAcceptContact(r.onContactsAcceptContact)
 	d.OnContactsDeleteContacts(r.onContactsDeleteContacts)
+	d.OnContactsEditCloseFriends(r.onContactsEditCloseFriends)
 	d.OnContactsBlock(r.onContactsBlock)
 	d.OnContactsUnblock(r.onContactsUnblock)
+	d.OnContactsSetBlocked(r.onContactsSetBlocked)
 	d.OnContactsUpdateContactNote(r.onContactsUpdateContactNote)
 	d.OnContactsSearch(r.onContactsSearch)
 	d.OnContactsResolveUsername(r.onContactsResolveUsername)
@@ -57,6 +62,173 @@ func (r *Router) registerContacts(d *tg.ServerDispatcher) {
 	})
 }
 
+func (r *Router) onContactsEditCloseFriends(ctx context.Context, id []int64) (bool, error) {
+	userID, _, err := r.currentUserID(ctx)
+	if err != nil {
+		return false, internalErr()
+	}
+	if len(id) > maxCloseFriendsCount {
+		return false, limitInvalidErr()
+	}
+	if r.deps.Contacts == nil {
+		return true, nil
+	}
+	result, err := r.deps.Contacts.EditCloseFriends(ctx, userID, id)
+	if err != nil {
+		return false, contactErr(err)
+	}
+	if err := r.fanoutCloseFriendStoryChanges(ctx, userID, result); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (r *Router) fanoutCloseFriendStoryChanges(ctx context.Context, ownerID int64, result domain.CloseFriendsEditResult) error {
+	if ownerID == 0 || r.deps.Stories == nil || r.deps.Updates == nil {
+		return nil
+	}
+	if len(result.AddedUserIDs) == 0 && len(result.RemovedUserIDs) == 0 {
+		return nil
+	}
+	candidateIDs := make([]int64, 0, len(result.AddedUserIDs)+len(result.RemovedUserIDs))
+	candidateIDs = append(candidateIDs, result.AddedUserIDs...)
+	candidateIDs = append(candidateIDs, result.RemovedUserIDs...)
+	blockedFacts, err := r.storyBlockedFactsForUsers(ctx, ownerID, candidateIDs)
+	if err != nil {
+		return err
+	}
+	owner := domain.Peer{Type: domain.PeerTypeUser, ID: ownerID}
+	list, err := r.deps.Stories.ListOwnerActiveStories(ctx, ownerID, owner, int(r.clock.Now().Unix()), domain.MaxStoryListLimit)
+	if err != nil {
+		return storyErr(err)
+	}
+	for _, story := range list.Stories {
+		if !story.CloseFriends {
+			continue
+		}
+		story = storyFanoutSnapshot(story)
+		for _, userID := range result.AddedUserIDs {
+			if blockedFacts[userID] {
+				continue
+			}
+			if story.VisibleToWithFacts(userID, true, true) {
+				if err := r.recordStoryFanout(ctx, userID, story); err != nil {
+					return err
+				}
+			}
+		}
+		for _, userID := range result.RemovedUserIDs {
+			if blockedFacts[userID] || story.VisibleToWithFacts(userID, true, false) {
+				continue
+			}
+			deleted := story
+			deleted.Deleted = true
+			if err := r.recordStoryFanout(ctx, userID, deleted); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (r *Router) storyBlockedFactsForUsers(ctx context.Context, ownerID int64, userIDs []int64) (map[int64]bool, error) {
+	out := make(map[int64]bool)
+	if ownerID == 0 || r.deps.Contacts == nil {
+		return out, nil
+	}
+	seen := make(map[int64]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID == 0 || userID == ownerID {
+			continue
+		}
+		if _, ok := seen[userID]; ok {
+			continue
+		}
+		seen[userID] = struct{}{}
+		blocked, err := r.deps.Contacts.IsBlocked(ctx, ownerID, userID)
+		if err != nil {
+			return nil, internalErr()
+		}
+		if blocked {
+			out[userID] = true
+		}
+	}
+	return out, nil
+}
+
+func (r *Router) fanoutStoryBlocklistChange(ctx context.Context, ownerID, viewerID int64, blocked bool) error {
+	if ownerID == 0 || viewerID == 0 || ownerID == viewerID || r.deps.Stories == nil || r.deps.Updates == nil {
+		return nil
+	}
+	facts, err := r.storyViewerFactsForOwner(ctx, ownerID, viewerID)
+	if err != nil {
+		return err
+	}
+	owner := domain.Peer{Type: domain.PeerTypeUser, ID: ownerID}
+	now := int(r.clock.Now().Unix())
+	list, err := r.deps.Stories.ListOwnerActiveStories(ctx, ownerID, owner, now, domain.MaxStoryListLimit)
+	if err != nil {
+		return storyErr(err)
+	}
+	for _, story := range list.Stories {
+		if !story.Active(now) {
+			continue
+		}
+		beforeVisible := story.VisibleToWithStoryFacts(viewerID, facts.isContact, facts.closeFriend, !blocked)
+		afterVisible := story.VisibleToWithStoryFacts(viewerID, facts.isContact, facts.closeFriend, blocked)
+		switch {
+		case afterVisible && !beforeVisible:
+			if err := r.recordStoryFanout(ctx, viewerID, storyFanoutSnapshot(story)); err != nil {
+				return err
+			}
+		case beforeVisible && !afterVisible:
+			deleted := storyFanoutSnapshot(story)
+			deleted.Deleted = true
+			if err := r.recordStoryFanout(ctx, viewerID, deleted); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (r *Router) storyViewerFactsForOwner(ctx context.Context, ownerID, viewerID int64) (storyPrivacyFanoutFacts, error) {
+	if ownerID == 0 || viewerID == 0 || r.deps.Contacts == nil {
+		return storyPrivacyFanoutFacts{}, nil
+	}
+	list, _, err := r.deps.Contacts.GetContacts(ctx, ownerID, 0)
+	if err != nil {
+		return storyPrivacyFanoutFacts{}, internalErr()
+	}
+	for _, contact := range list.Contacts {
+		if contact.User.ID != viewerID {
+			continue
+		}
+		return storyPrivacyFanoutFacts{
+			isContact:   true,
+			closeFriend: contact.CloseFriend || contact.User.CloseFriend,
+		}, nil
+	}
+	return storyPrivacyFanoutFacts{}, nil
+}
+
+func (r *Router) recordStoryFanout(ctx context.Context, userID int64, story domain.Story) error {
+	if r.deps.Updates == nil || userID == 0 {
+		return nil
+	}
+	if _, _, err := r.deps.Updates.RecordStoryFanout(ctx, userID, story); err != nil {
+		return internalErr()
+	}
+	return nil
+}
+
+func storyFanoutSnapshot(story domain.Story) domain.Story {
+	story.Out = false
+	story.Views = domain.StoryViews{}
+	story.SentReaction = nil
+	return story
+}
+
 func (r *Router) onContactsBlock(ctx context.Context, req *tg.ContactsBlockRequest) (bool, error) {
 	userID, _, err := r.currentUserID(ctx)
 	if err != nil {
@@ -69,12 +241,25 @@ func (r *Router) onContactsBlock(ctx context.Context, req *tg.ContactsBlockReque
 	if r.deps.Contacts == nil {
 		return true, nil
 	}
+	wasBlocked, err := r.deps.Contacts.IsBlocked(ctx, userID, peer.ID)
+	if err != nil {
+		return false, contactErr(err)
+	}
 	if _, err := r.deps.Contacts.BlockContact(ctx, userID, peer.ID, int(r.clock.Now().Unix())); err != nil {
 		return false, contactErr(err)
+	}
+	if !wasBlocked {
+		if err := r.recordPeerStoryBlocked(ctx, userID, peer, true); err != nil {
+			return false, internalErr()
+		}
+		if err := r.fanoutStoryBlocklistChange(ctx, userID, peer.ID, true); err != nil {
+			return false, err
+		}
 	}
 	if settings, err := r.deps.Contacts.GetPeerSettings(ctx, userID, peer); err == nil {
 		_ = r.recordPeerSettings(ctx, userID, peer, settings)
 	}
+	r.invalidateRPCProjectionForViewer(userID)
 	return true, nil
 }
 
@@ -90,13 +275,135 @@ func (r *Router) onContactsUnblock(ctx context.Context, req *tg.ContactsUnblockR
 	if r.deps.Contacts == nil {
 		return true, nil
 	}
+	wasBlocked, err := r.deps.Contacts.IsBlocked(ctx, userID, peer.ID)
+	if err != nil {
+		return false, contactErr(err)
+	}
 	if _, err := r.deps.Contacts.UnblockContact(ctx, userID, peer.ID); err != nil {
 		return false, contactErr(err)
+	}
+	if wasBlocked {
+		if err := r.recordPeerStoryBlocked(ctx, userID, peer, false); err != nil {
+			return false, internalErr()
+		}
+		if err := r.fanoutStoryBlocklistChange(ctx, userID, peer.ID, false); err != nil {
+			return false, err
+		}
 	}
 	if settings, err := r.deps.Contacts.GetPeerSettings(ctx, userID, peer); err == nil {
 		_ = r.recordPeerSettings(ctx, userID, peer, settings)
 	}
+	r.invalidateRPCProjectionForViewer(userID)
 	return true, nil
+}
+
+func (r *Router) onContactsSetBlocked(ctx context.Context, req *tg.ContactsSetBlockedRequest) (bool, error) {
+	userID, _, err := r.currentUserID(ctx)
+	if err != nil {
+		return false, internalErr()
+	}
+	if len(req.ID) > maxContactSetBlocked || req.Limit < 0 || req.Limit > maxContactSetBlocked {
+		return false, limitInvalidErr()
+	}
+	if r.deps.Contacts == nil {
+		return true, nil
+	}
+	desired := make(map[int64]domain.Peer, len(req.ID))
+	desiredOrder := make([]domain.Peer, 0, len(req.ID))
+	for _, input := range req.ID {
+		peer, ok := r.domainPeerFromInputPeer(userID, input)
+		if !ok || peer.Type != domain.PeerTypeUser || peer.ID == 0 || peer.ID == userID {
+			return false, userIDInvalidErr()
+		}
+		if _, ok := desired[peer.ID]; ok {
+			continue
+		}
+		desired[peer.ID] = peer
+		desiredOrder = append(desiredOrder, peer)
+	}
+	current, err := r.currentBlockedUserIDs(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	now := int(r.clock.Now().Unix())
+	for _, peer := range desiredOrder {
+		if current[peer.ID] {
+			continue
+		}
+		changed, err := r.deps.Contacts.BlockContact(ctx, userID, peer.ID, now)
+		if err != nil {
+			return false, contactErr(err)
+		}
+		if changed {
+			if err := r.applyContactBlocklistChange(ctx, userID, peer, true); err != nil {
+				return false, err
+			}
+		}
+	}
+	removeIDs := make([]int64, 0, len(current))
+	for id := range current {
+		if _, ok := desired[id]; ok {
+			continue
+		}
+		removeIDs = append(removeIDs, id)
+	}
+	sort.Slice(removeIDs, func(i, j int) bool { return removeIDs[i] < removeIDs[j] })
+	for _, id := range removeIDs {
+		peer := domain.Peer{Type: domain.PeerTypeUser, ID: id}
+		changed, err := r.deps.Contacts.UnblockContact(ctx, userID, id)
+		if err != nil {
+			return false, contactErr(err)
+		}
+		if changed {
+			if err := r.applyContactBlocklistChange(ctx, userID, peer, false); err != nil {
+				return false, err
+			}
+		}
+	}
+	r.invalidateRPCProjectionForViewer(userID)
+	return true, nil
+}
+
+func (r *Router) currentBlockedUserIDs(ctx context.Context, userID int64) (map[int64]bool, error) {
+	out := make(map[int64]bool)
+	if r.deps.Contacts == nil || userID == 0 {
+		return out, nil
+	}
+	offset := 0
+	for {
+		list, err := r.deps.Contacts.GetBlocked(ctx, userID, offset, 100)
+		if err != nil {
+			return nil, internalErr()
+		}
+		if list.Count > maxContactSetBlocked {
+			return nil, limitInvalidErr()
+		}
+		for _, item := range list.Blocked {
+			if item.User.ID != 0 {
+				out[item.User.ID] = true
+			}
+		}
+		offset += len(list.Blocked)
+		if len(list.Blocked) == 0 || offset >= list.Count {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (r *Router) applyContactBlocklistChange(ctx context.Context, userID int64, peer domain.Peer, blocked bool) error {
+	if err := r.recordPeerStoryBlocked(ctx, userID, peer, blocked); err != nil {
+		return internalErr()
+	}
+	if err := r.fanoutStoryBlocklistChange(ctx, userID, peer.ID, blocked); err != nil {
+		return err
+	}
+	if r.deps.Contacts != nil {
+		if settings, err := r.deps.Contacts.GetPeerSettings(ctx, userID, peer); err == nil {
+			_ = r.recordPeerSettings(ctx, userID, peer, settings)
+		}
+	}
+	return nil
 }
 
 func (r *Router) onContactsGetBlocked(ctx context.Context, req *tg.ContactsGetBlockedRequest) (tg.ContactsBlockedClass, error) {
@@ -147,7 +454,7 @@ func (r *Router) onContactsGetContacts(ctx context.Context, hash int64) (tg.Cont
 	if notModified {
 		return &tg.ContactsContactsNotModified{}, nil
 	}
-	return tgContacts(r.withContactListPresence(list)), nil
+	return r.tgContacts(ctx, userID, list), nil
 }
 
 func (r *Router) onContactsGetStatuses(ctx context.Context) ([]tg.ContactStatus, error) {
@@ -270,6 +577,7 @@ func (r *Router) onContactsImportContacts(ctx context.Context, input []tg.InputP
 	for _, contact := range res.Contacts {
 		out.Users = append(out.Users, r.tgUser(contact.User))
 	}
+	r.applyStoryMaxIDsToPeerObjects(ctx, userID, out.Users, nil)
 	out.RetryContacts = append(out.RetryContacts, res.RetryContacts...)
 	for _, contact := range res.Contacts {
 		peer := domain.Peer{Type: domain.PeerTypeUser, ID: contact.User.ID}
@@ -293,6 +601,7 @@ func (r *Router) onContactsImportContacts(ctx context.Context, input []tg.InputP
 		r.log.Warn("contacts.importContacts record contacts reset failed", append(r.contextLogFields(ctx), zap.Error(err), zap.Int("contacts", len(items)))...)
 		return nil, internalErr()
 	}
+	r.invalidateRPCProjectionForViewer(userID)
 	r.pushContactsReset(ctx, userID)
 	return out, nil
 }
@@ -356,6 +665,7 @@ func (r *Router) onContactsAddContact(ctx context.Context, req *tg.ContactsAddCo
 			return nil, err
 		}
 	}
+	r.invalidateRPCProjectionForViewer(userID)
 	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, updates)
 	return updates, nil
 }
@@ -407,6 +717,7 @@ func (r *Router) onContactsAcceptContact(ctx context.Context, id tg.InputUserCla
 		return nil, err
 	}
 
+	r.invalidateRPCProjectionForViewer(userID)
 	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, updates)
 	return updates, nil
 }
@@ -467,6 +778,7 @@ func (r *Router) onContactsDeleteContacts(ctx context.Context, ids []tg.InputUse
 			return nil, internalErr()
 		}
 	}
+	r.invalidateRPCProjectionForViewer(userID)
 	out := &tg.Updates{Updates: updates, Users: users, Date: int(r.clock.Now().Unix())}
 	r.pushUserUpdatesIfNoReliableDispatch(ctx, userID, out)
 	return out, nil
@@ -496,6 +808,7 @@ func (r *Router) onContactsUpdateContactNote(ctx context.Context, req *tg.Contac
 	if err := r.recordContactsReset(ctx, userID); err != nil {
 		return false, internalErr()
 	}
+	r.invalidateRPCProjectionForViewer(userID)
 	r.pushContactsReset(ctx, userID)
 	return true, nil
 }
@@ -538,7 +851,7 @@ func (r *Router) onContactsSearch(ctx context.Context, req *tg.ContactsSearchReq
 		res.MyChannelResults = channelRes.MyResults
 		res.ChannelResults = channelRes.Results
 	}
-	return tgContactsFound(userID, r.withUserSearchPresence(res)), nil
+	return r.tgContactsFound(ctx, userID, r.withUserSearchPresence(res)), nil
 }
 
 func (r *Router) onContactsResolveUsername(ctx context.Context, req *tg.ContactsResolveUsernameRequest) (*tg.ContactsResolvedPeer, error) {
@@ -552,7 +865,7 @@ func (r *Router) onContactsResolveUsername(ctx context.Context, req *tg.Contacts
 			return nil, usernameErr(err)
 		}
 		if found {
-			return r.tgResolvedUserPeer(userID, u), nil
+			return r.tgResolvedUserPeerWithStories(ctx, userID, u), nil
 		}
 	}
 	if r.deps.Channels != nil {
@@ -561,7 +874,11 @@ func (r *Router) onContactsResolveUsername(ctx context.Context, req *tg.Contacts
 			return nil, usernameErr(err)
 		}
 		if found {
-			return tgResolvedChannelPeer(userID, ch), nil
+			view, err := r.deps.Channels.ResolveChannel(ctx, userID, ch.ID)
+			if err != nil {
+				return nil, channelInvalidErr(err)
+			}
+			return r.tgResolvedChannelPeerWithStories(ctx, userID, view), nil
 		}
 	}
 	return nil, usernameNotOccupiedErr()
@@ -586,7 +903,7 @@ func (r *Router) onContactsResolvePhone(ctx context.Context, phone string) (*tg.
 	if !found {
 		return nil, phoneNotOccupiedErr()
 	}
-	return r.tgResolvedUserPeer(userID, u), nil
+	return r.tgResolvedUserPeerWithStories(ctx, userID, u), nil
 }
 
 func (r *Router) tgResolvedUserPeer(currentUserID int64, u domain.User) *tg.ContactsResolvedPeer {
@@ -602,10 +919,10 @@ func (r *Router) tgResolvedUserPeer(currentUserID int64, u domain.User) *tg.Cont
 	}
 }
 
-func tgResolvedChannelPeer(currentUserID int64, ch domain.Channel) *tg.ContactsResolvedPeer {
+func tgResolvedChannelPeer(currentUserID int64, view domain.ChannelView) *tg.ContactsResolvedPeer {
 	return &tg.ContactsResolvedPeer{
-		Peer:  &tg.PeerChannel{ChannelID: ch.ID},
-		Chats: []tg.ChatClass{tgChannelChat(currentUserID, ch, nil)},
+		Peer:  &tg.PeerChannel{ChannelID: view.Channel.ID},
+		Chats: []tg.ChatClass{tgChannelChatForView(currentUserID, view)},
 	}
 }
 
@@ -643,7 +960,7 @@ func (r *Router) contactPeerSettingsUpdates(ctx context.Context, userID int64, p
 		}
 	}
 	users = append(users, r.tgUser(peerUser))
-	return &tg.Updates{
+	out := &tg.Updates{
 		Updates: []tg.UpdateClass{
 			&tg.UpdatePeerSettings{
 				Peer:     &tg.PeerUser{UserID: peerUser.ID},
@@ -654,6 +971,8 @@ func (r *Router) contactPeerSettingsUpdates(ctx context.Context, userID int64, p
 		Date:  int(r.clock.Now().Unix()),
 		Seq:   0,
 	}
+	r.applyStoryMaxIDsToPeerObjects(ctx, userID, out.Users, nil)
+	return out
 }
 
 func (r *Router) recordAcceptedContactTargetUpdates(ctx context.Context, userID, targetUserID int64) error {
@@ -706,7 +1025,10 @@ func (r *Router) recordContactsResetForUser(ctx context.Context, authKeyID [8]by
 	if r.deps.Updates == nil || userID == 0 {
 		return nil
 	}
-	_, _, err := r.deps.Updates.RecordContactsReset(ctx, authKeyID, userID, excludeSessionID)
+	event, _, err := r.deps.Updates.RecordContactsReset(ctx, authKeyID, userID, excludeSessionID)
+	if err == nil && excludeSessionID != 0 {
+		r.bookkeepAuxPtsForCurrentSession(ctx, event)
+	}
 	return err
 }
 
@@ -716,11 +1038,27 @@ func (r *Router) recordPeerSettings(ctx context.Context, userID int64, peer doma
 	return r.recordPeerSettingsForUser(ctx, authKeyID, userID, peer, settings, sessionID)
 }
 
+func (r *Router) recordPeerStoryBlocked(ctx context.Context, userID int64, peer domain.Peer, blocked bool) error {
+	authKeyID, _ := AuthKeyIDFrom(ctx)
+	sessionID, _ := SessionIDFrom(ctx)
+	if r.deps.Updates == nil || userID == 0 {
+		return nil
+	}
+	event, _, err := r.deps.Updates.RecordPeerStoryBlocked(ctx, authKeyID, userID, peer, blocked, sessionID)
+	if err == nil && sessionID != 0 {
+		r.bookkeepAuxPtsForCurrentSession(ctx, event)
+	}
+	return err
+}
+
 func (r *Router) recordPeerSettingsForUser(ctx context.Context, authKeyID [8]byte, userID int64, peer domain.Peer, settings domain.PeerSettings, excludeSessionID int64) error {
 	if r.deps.Updates == nil || userID == 0 {
 		return nil
 	}
-	_, _, err := r.deps.Updates.RecordPeerSettings(ctx, authKeyID, userID, peer, settings, excludeSessionID)
+	event, _, err := r.deps.Updates.RecordPeerSettings(ctx, authKeyID, userID, peer, settings, excludeSessionID)
+	if err == nil && excludeSessionID != 0 {
+		r.bookkeepAuxPtsForCurrentSession(ctx, event)
+	}
 	return err
 }
 
@@ -748,12 +1086,23 @@ func tgPeerSettings(settings domain.PeerSettings) tg.PeerSettings {
 	if settings.HiddenPeerSettingsBar {
 		return tg.PeerSettings{}
 	}
-	return tg.PeerSettings{
+	out := tg.PeerSettings{
 		AddContact:            settings.AddContact,
 		BlockContact:          settings.BlockContact,
 		ShareContact:          settings.ShareContact,
 		NeedContactsException: settings.NeedContactsException,
 	}
+	if settings.BusinessBotID != 0 {
+		out.SetBusinessBotID(settings.BusinessBotID)
+		out.SetBusinessBotManageURL(settings.BusinessBotManageURL)
+		if settings.BusinessBotPaused {
+			out.SetBusinessBotPaused(true)
+		}
+		if settings.BusinessBotCanReply {
+			out.SetBusinessBotCanReply(true)
+		}
+	}
+	return out
 }
 
 func contactErr(err error) error {

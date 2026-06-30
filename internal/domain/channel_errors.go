@@ -33,6 +33,10 @@ var (
 	ErrUsersTooMuch              = errors.New("users too much")
 	ErrUserAlreadyParticipant    = errors.New("user already participant")
 	ErrUserKicked                = errors.New("user kicked")
+	ErrUserNotParticipant        = errors.New("user not participant")
+	ErrBotGroupsBlocked          = errors.New("bot groups blocked")
+	ErrReactionInvalid           = errors.New("reaction invalid")
+	ErrReactionsTooMany          = errors.New("reactions too many")
 )
 
 // SlowModeWaitError carries the remaining wait seconds for a channel slow mode violation.

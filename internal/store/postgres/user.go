@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
-	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"telesrv/internal/domain"
 	"telesrv/internal/store/postgres/sqlcgen"
@@ -16,12 +16,13 @@ import (
 
 // UserStore 用 PostgreSQL 实现 store.UserStore。
 type UserStore struct {
-	q *sqlcgen.Queries
+	db sqlcgen.DBTX
+	q  *sqlcgen.Queries
 }
 
 // NewUserStore 基于 pgx 连接池（或事务）创建 UserStore。
 func NewUserStore(db sqlcgen.DBTX) *UserStore {
-	return &UserStore{q: sqlcgen.New(db)}
+	return &UserStore{db: db, q: sqlcgen.New(db)}
 }
 
 func (s *UserStore) ByID(ctx context.Context, id int64) (domain.User, bool, error) {
@@ -51,6 +52,10 @@ func (s *UserStore) ByIDs(ctx context.Context, ids []int64) ([]domain.User, erro
 }
 
 func (s *UserStore) ByPhone(ctx context.Context, phone string) (domain.User, bool, error) {
+	// bot 行 phone 为空串（0090 起 phone 唯一性只覆盖非空值），空查询必须判未找到。
+	if phone == "" {
+		return domain.User{}, false, nil
+	}
 	row, err := s.q.GetUserByPhone(ctx, phone)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -62,6 +67,13 @@ func (s *UserStore) ByPhone(ctx context.Context, phone string) (domain.User, boo
 }
 
 func (s *UserStore) ByPhones(ctx context.Context, phones []string) ([]domain.User, error) {
+	filtered := make([]string, 0, len(phones))
+	for _, phone := range phones {
+		if phone != "" {
+			filtered = append(filtered, phone)
+		}
+	}
+	phones = filtered
 	if len(phones) == 0 {
 		return nil, nil
 	}
@@ -91,6 +103,14 @@ func (s *UserStore) ByUsername(ctx context.Context, username string) (domain.Use
 	return userFromModel(row), true, nil
 }
 
+func (s *UserStore) CheckUsername(ctx context.Context, userID int64, username string) (bool, error) {
+	usernameLower := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(username, "@")))
+	if usernameLower == "" {
+		return true, nil
+	}
+	return peerUsernameAvailable(ctx, s.db, usernameLower, peerUsernameTypeUser, userID)
+}
+
 func (s *UserStore) Search(ctx context.Context, currentUserID int64, query, phoneQuery string, limit int) (domain.UserSearchResult, error) {
 	query = strings.ToLower(strings.TrimSpace(query))
 	if currentUserID == 0 || query == "" {
@@ -115,19 +135,26 @@ func (s *UserStore) Search(ctx context.Context, currentUserID int64, query, phon
 	}
 	for _, row := range rows {
 		u := domain.User{
-			ID:          row.ID,
-			AccessHash:  row.AccessHash,
-			Phone:       row.Phone,
-			FirstName:   row.FirstName,
-			LastName:    row.LastName,
-			About:       row.About,
-			Username:    row.Username,
-			CountryCode: row.CountryCode,
-			Verified:    row.Verified,
-			Support:     row.Support,
-			LastSeenAt:  int(row.LastSeenAt),
-			Contact:     row.Contact,
-			Mutual:      row.Mutual,
+			ID:                    row.ID,
+			AccessHash:            row.AccessHash,
+			Phone:                 row.Phone,
+			FirstName:             row.FirstName,
+			LastName:              row.LastName,
+			About:                 row.About,
+			Username:              row.Username,
+			CountryCode:           row.CountryCode,
+			Verified:              row.Verified,
+			Support:               row.Support,
+			Bot:                   row.IsBot,
+			BotInfoVersion:        int(row.BotInfoVersion),
+			PremiumUntil:          premiumUntilFromModel(row.PremiumExpiresAt),
+			EmojiStatusDocumentID: row.EmojiStatusDocumentID,
+			EmojiStatusUntil:      int(row.EmojiStatusUntil),
+			Color:                 peerColorFromModel(row.ColorSet, row.Color, row.ColorBackgroundEmojiID),
+			ProfileColor:          peerColorFromModel(row.ProfileColorSet, row.ProfileColor, row.ProfileColorBackgroundEmojiID),
+			LastSeenAt:            int(row.LastSeenAt),
+			Contact:               row.Contact,
+			Mutual:                row.Mutual,
 		}
 		if row.Contact {
 			out.MyResults = append(out.MyResults, u)
@@ -156,13 +183,38 @@ func (s *UserStore) UpdateProfile(ctx context.Context, userID int64, firstName, 
 
 func (s *UserStore) UpdateUsername(ctx context.Context, userID int64, username string) (domain.User, error) {
 	username = strings.TrimSpace(strings.TrimPrefix(username, "@"))
-	row, err := s.q.UpdateUserUsername(ctx, sqlcgen.UpdateUserUsernameParams{
+	usernameLower := strings.ToLower(username)
+	beginner, ok := s.db.(txBeginner)
+	if !ok {
+		return domain.User{}, fmt.Errorf("update user username: db does not support transactions")
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return domain.User{}, fmt.Errorf("begin update user username: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	qtx := s.q.WithTx(tx)
+	var lockedUserID int64
+	if err := tx.QueryRow(ctx, `SELECT id FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&lockedUserID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.User{}, domain.ErrUsernameNotOccupied
+		}
+		return domain.User{}, fmt.Errorf("lock user for username update: %w", err)
+	}
+	if err := replacePeerUsernameTx(ctx, tx, peerUsernameTypeUser, userID, usernameLower); err != nil {
+		return domain.User{}, err
+	}
+	row, err := qtx.UpdateUserUsername(ctx, sqlcgen.UpdateUserUsernameParams{
 		ID:       userID,
 		Username: username,
 	})
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation && pgErr.ConstraintName == "users_username_lower_unique_idx" {
+		if isUniqueConstraint(err, "users_username_lower_unique_idx") {
 			return domain.User{}, domain.ErrUsernameOccupied
 		}
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -170,6 +222,10 @@ func (s *UserStore) UpdateUsername(ctx context.Context, userID int64, username s
 		}
 		return domain.User{}, fmt.Errorf("update user username: %w", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.User{}, fmt.Errorf("commit update user username: %w", err)
+	}
+	committed = true
 	return userFromModel(row), nil
 }
 
@@ -187,22 +243,192 @@ func (s *UserStore) UpdateLastSeen(ctx context.Context, userID int64, lastSeenAt
 }
 
 func (s *UserStore) Create(ctx context.Context, u domain.User) (domain.User, error) {
-	row, err := s.q.CreateUser(ctx, sqlcgen.CreateUserParams{
-		AccessHash:  u.AccessHash,
-		Phone:       u.Phone,
-		FirstName:   u.FirstName,
-		LastName:    u.LastName,
-		Username:    u.Username,
-		CountryCode: u.CountryCode,
+	u.Username = strings.TrimSpace(strings.TrimPrefix(u.Username, "@"))
+	beginner, ok := s.db.(txBeginner)
+	if !ok {
+		return domain.User{}, fmt.Errorf("create user: db does not support transactions")
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return domain.User{}, fmt.Errorf("begin create user: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	qtx := s.q.WithTx(tx)
+	row, err := qtx.CreateUser(ctx, sqlcgen.CreateUserParams{
+		AccessHash:       u.AccessHash,
+		Phone:            u.Phone,
+		FirstName:        u.FirstName,
+		LastName:         u.LastName,
+		Username:         u.Username,
+		CountryCode:      u.CountryCode,
+		PremiumExpiresAt: premiumUntilToModel(u.PremiumUntil),
 	})
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation && pgErr.ConstraintName == "users_username_lower_unique_idx" {
+		if isUniqueConstraint(err, "users_username_lower_unique_idx") {
 			return domain.User{}, domain.ErrUsernameOccupied
 		}
 		return domain.User{}, fmt.Errorf("create user: %w", err)
 	}
+	usernameLower := strings.ToLower(row.Username)
+	if usernameLower != "" {
+		if err := replacePeerUsernameTx(ctx, tx, peerUsernameTypeUser, row.ID, usernameLower); err != nil {
+			return domain.User{}, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.User{}, fmt.Errorf("commit create user: %w", err)
+	}
+	committed = true
 	return userFromModel(row), nil
+}
+
+// SetPremiumUntil 把会员到期时间设为绝对 Unix 秒（0 = 清除会员）。
+func (s *UserStore) SetPremiumUntil(ctx context.Context, userID int64, until int) (domain.User, error) {
+	row, err := s.q.SetUserPremiumUntil(ctx, sqlcgen.SetUserPremiumUntilParams{
+		ID:               userID,
+		PremiumExpiresAt: premiumUntilToModel(until),
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.User{}, domain.ErrUserNotFound
+		}
+		return domain.User{}, fmt.Errorf("set user premium until: %w", err)
+	}
+	return userFromModel(row), nil
+}
+
+// SetVerified 设置/取消用户认证标记。
+func (s *UserStore) SetVerified(ctx context.Context, userID int64, verified bool) (domain.User, error) {
+	row, err := s.q.SetUserVerified(ctx, sqlcgen.SetUserVerifiedParams{
+		ID:       userID,
+		Verified: verified,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.User{}, domain.ErrUserNotFound
+		}
+		return domain.User{}, fmt.Errorf("set user verified: %w", err)
+	}
+	return userFromModel(row), nil
+}
+
+// SweepExpiredPremium 清空到期会员行并返回清理后的用户。
+func (s *UserStore) SweepExpiredPremium(ctx context.Context, now int64, limit int) ([]domain.User, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.q.SweepExpiredPremium(ctx, sqlcgen.SweepExpiredPremiumParams{
+		Now:        pgtype.Timestamptz{Time: time.Unix(now, 0).UTC(), Valid: true},
+		LimitCount: int32(limit),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sweep expired premium: %w", err)
+	}
+	out := make([]domain.User, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, userFromModel(row))
+	}
+	return out, nil
+}
+
+// UpdateEmojiStatus 更新用户自定义 emoji status（documentID=0 表示清除）。
+func (s *UserStore) UpdateEmojiStatus(ctx context.Context, userID int64, documentID int64, until int) (domain.User, error) {
+	row, err := s.q.UpdateUserEmojiStatus(ctx, sqlcgen.UpdateUserEmojiStatusParams{
+		ID:                    userID,
+		EmojiStatusDocumentID: documentID,
+		EmojiStatusUntil:      int64(until),
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.User{}, domain.ErrUserNotFound
+		}
+		return domain.User{}, fmt.Errorf("update user emoji status: %w", err)
+	}
+	return userFromModel(row), nil
+}
+
+// UpdateBirthday 更新用户生日（零值 Birthday 表示清除）。
+func (s *UserStore) UpdateBirthday(ctx context.Context, userID int64, birthday domain.Birthday) (domain.User, error) {
+	row, err := s.q.UpdateUserBirthday(ctx, sqlcgen.UpdateUserBirthdayParams{
+		ID:            userID,
+		BirthdayDay:   int32(birthday.Day),
+		BirthdayMonth: int32(birthday.Month),
+		BirthdayYear:  int32(birthday.Year),
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.User{}, domain.ErrUserNotFound
+		}
+		return domain.User{}, fmt.Errorf("update user birthday: %w", err)
+	}
+	return userFromModel(row), nil
+}
+
+// UpdatePersonalChannel 设置/清除资料页个人频道（channelID=0 表示清除）。
+func (s *UserStore) UpdatePersonalChannel(ctx context.Context, userID int64, channelID int64) (domain.User, error) {
+	row, err := s.q.UpdateUserPersonalChannel(ctx, sqlcgen.UpdateUserPersonalChannelParams{
+		ID:                userID,
+		PersonalChannelID: channelID,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.User{}, domain.ErrUserNotFound
+		}
+		return domain.User{}, fmt.Errorf("update user personal channel: %w", err)
+	}
+	return userFromModel(row), nil
+}
+
+func (s *UserStore) UpdateColor(ctx context.Context, userID int64, forProfile bool, color domain.PeerColor) (domain.User, error) {
+	if forProfile {
+		row, err := s.q.UpdateUserProfileColor(ctx, sqlcgen.UpdateUserProfileColorParams{
+			ID:                userID,
+			ColorSet:          color.HasColor,
+			Color:             int32(color.Color),
+			BackgroundEmojiID: color.BackgroundEmojiID,
+		})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.User{}, domain.ErrUserNotFound
+			}
+			return domain.User{}, fmt.Errorf("update user profile color: %w", err)
+		}
+		return userFromModel(row), nil
+	}
+	row, err := s.q.UpdateUserColor(ctx, sqlcgen.UpdateUserColorParams{
+		ID:                userID,
+		ColorSet:          color.HasColor,
+		Color:             int32(color.Color),
+		BackgroundEmojiID: color.BackgroundEmojiID,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.User{}, domain.ErrUserNotFound
+		}
+		return domain.User{}, fmt.Errorf("update user color: %w", err)
+	}
+	return userFromModel(row), nil
+}
+
+// premiumUntilFromModel 把可空 timestamptz 转为 Unix 秒（NULL → 0）。
+func premiumUntilFromModel(t pgtype.Timestamptz) int {
+	if !t.Valid {
+		return 0
+	}
+	return int(t.Time.Unix())
+}
+
+// premiumUntilToModel 把 Unix 秒转为可空 timestamptz（<=0 → NULL）。
+func premiumUntilToModel(until int) pgtype.Timestamptz {
+	if until <= 0 {
+		return pgtype.Timestamptz{}
+	}
+	return pgtype.Timestamptz{Time: time.Unix(int64(until), 0).UTC(), Valid: true}
 }
 
 func escapeLike(s string) string {
@@ -219,16 +445,33 @@ func escapeLike(s string) string {
 
 func userFromModel(r sqlcgen.User) domain.User {
 	return domain.User{
-		ID:          r.ID,
-		AccessHash:  r.AccessHash,
-		Phone:       r.Phone,
-		FirstName:   r.FirstName,
-		LastName:    r.LastName,
-		About:       r.About,
-		Username:    r.Username,
-		CountryCode: r.CountryCode,
-		Verified:    r.Verified,
-		Support:     r.Support,
-		LastSeenAt:  int(r.LastSeenAt),
+		ID:                    r.ID,
+		AccessHash:            r.AccessHash,
+		Phone:                 r.Phone,
+		FirstName:             r.FirstName,
+		LastName:              r.LastName,
+		About:                 r.About,
+		Username:              r.Username,
+		CountryCode:           r.CountryCode,
+		Verified:              r.Verified,
+		Support:               r.Support,
+		Bot:                   r.IsBot,
+		BotInfoVersion:        int(r.BotInfoVersion),
+		PremiumUntil:          premiumUntilFromModel(r.PremiumExpiresAt),
+		EmojiStatusDocumentID: r.EmojiStatusDocumentID,
+		EmojiStatusUntil:      int(r.EmojiStatusUntil),
+		Birthday:              domain.Birthday{Day: int(r.BirthdayDay), Month: int(r.BirthdayMonth), Year: int(r.BirthdayYear)},
+		PersonalChannelID:     r.PersonalChannelID,
+		Color:                 peerColorFromModel(r.ColorSet, r.Color, r.ColorBackgroundEmojiID),
+		ProfileColor:          peerColorFromModel(r.ProfileColorSet, r.ProfileColor, r.ProfileColorBackgroundEmojiID),
+		LastSeenAt:            int(r.LastSeenAt),
+	}
+}
+
+func peerColorFromModel(hasColor bool, color int32, backgroundEmojiID int64) domain.PeerColor {
+	return domain.PeerColor{
+		HasColor:          hasColor,
+		Color:             int(color),
+		BackgroundEmojiID: backgroundEmojiID,
 	}
 }

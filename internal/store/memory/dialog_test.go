@@ -51,6 +51,42 @@ func TestDialogStoreFiltersAndPaginates(t *testing.T) {
 	}
 }
 
+func TestDialogStorePinnedOrderSortsHighestFirst(t *testing.T) {
+	ctx := context.Background()
+	store := NewDialogStore()
+	userID := int64(100)
+	oldPinned := domain.Peer{Type: domain.PeerTypeUser, ID: 1}
+	newPinned := domain.Peer{Type: domain.PeerTypeUser, ID: 2}
+	if err := store.SaveList(ctx, userID, domain.DialogList{
+		Dialogs: []domain.Dialog{
+			{
+				Peer:           oldPinned,
+				TopMessage:     20,
+				TopMessageDate: 2000,
+				Pinned:         true,
+				PinnedOrder:    1,
+			},
+			{
+				Peer:           newPinned,
+				TopMessage:     10,
+				TopMessageDate: 1000,
+				Pinned:         true,
+				PinnedOrder:    2,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("SaveList: %v", err)
+	}
+
+	got, err := store.ListByUser(ctx, userID, domain.DialogFilter{PinnedOnly: true, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListByUser pinned: %v", err)
+	}
+	if len(got.Dialogs) != 2 || got.Dialogs[0].Peer != newPinned || got.Dialogs[1].Peer != oldPinned {
+		t.Fatalf("pinned dialogs = %+v, want highest pinned_order first", got.Dialogs)
+	}
+}
+
 func TestDialogStoreFoldersAndCustomFilters(t *testing.T) {
 	ctx := context.Background()
 	store := NewDialogStore()
@@ -225,5 +261,90 @@ func TestDialogStoreListByPeersReturnsExistingAndPlaceholders(t *testing.T) {
 	}
 	if len(got.Users) != 1 || got.Users[0].ID != domain.OfficialSystemUserID {
 		t.Fatalf("users = %+v, want official user", got.Users)
+	}
+}
+
+func TestDialogStoreSetUnreadMarkOnlyReportsRealChanges(t *testing.T) {
+	ctx := context.Background()
+	store := NewDialogStore()
+	userID := int64(100)
+	peer := domain.Peer{Type: domain.PeerTypeUser, ID: 200}
+	missing := domain.Peer{Type: domain.PeerTypeUser, ID: 999}
+	if err := store.SaveList(ctx, userID, domain.DialogList{
+		Dialogs: []domain.Dialog{{Peer: peer, TopMessage: 10, TopMessageDate: 1000}},
+	}); err != nil {
+		t.Fatalf("SaveList: %v", err)
+	}
+
+	// 首次置位为真变化。
+	if changed, err := store.SetUnreadMark(ctx, userID, peer, true); err != nil || !changed {
+		t.Fatalf("first mark = (%v, %v), want (true, nil)", changed, err)
+	}
+	// 重复标记同值不应算 changed（值守卫；否则上层记幽灵 durable 事件 + 多推 update）。
+	if changed, err := store.SetUnreadMark(ctx, userID, peer, true); err != nil || changed {
+		t.Fatalf("repeat same value = (%v, %v), want (false, nil)", changed, err)
+	}
+	// 改回相反值是真变化。
+	if changed, err := store.SetUnreadMark(ctx, userID, peer, false); err != nil || !changed {
+		t.Fatalf("flip value = (%v, %v), want (true, nil)", changed, err)
+	}
+	// 不存在的会话行无法标记。
+	if changed, err := store.SetUnreadMark(ctx, userID, missing, true); err != nil || changed {
+		t.Fatalf("missing peer = (%v, %v), want (false, nil)", changed, err)
+	}
+}
+
+func TestDialogStoreMarkReadClampsFutureMaxID(t *testing.T) {
+	ctx := context.Background()
+	store := NewDialogStore()
+	userID := int64(100)
+	peer := domain.Peer{Type: domain.PeerTypeUser, ID: 200}
+	if err := store.SaveList(ctx, userID, domain.DialogList{
+		Dialogs: []domain.Dialog{{
+			Peer:            peer,
+			TopMessage:      10,
+			TopMessageDate:  1000,
+			ReadInboxMaxID:  4,
+			UnreadCount:     2,
+			UnreadMentions:  1,
+			UnreadReactions: 1,
+			UnreadMark:      true,
+		}},
+	}); err != nil {
+		t.Fatalf("SaveList: %v", err)
+	}
+
+	read, err := store.MarkRead(ctx, userID, peer, 8)
+	if err != nil {
+		t.Fatalf("MarkRead partial: %v", err)
+	}
+	if read.MaxID != 8 || read.StillUnreadCount != 2 {
+		t.Fatalf("partial read = %+v, want max 8 with existing unread count preserved", read)
+	}
+	list, err := store.ListByPeers(ctx, userID, []domain.Peer{peer})
+	if err != nil {
+		t.Fatalf("ListByPeers partial: %v", err)
+	}
+	if len(list.Dialogs) != 1 || list.Dialogs[0].ReadInboxMaxID != 8 || list.Dialogs[0].UnreadCount != 2 {
+		t.Fatalf("dialog after partial read = %+v, want read 8 and unread preserved", list.Dialogs)
+	}
+
+	read, err = store.MarkRead(ctx, userID, peer, domain.MaxMessageBoxID)
+	if err != nil {
+		t.Fatalf("MarkRead: %v", err)
+	}
+	if read.MaxID != 10 {
+		t.Fatalf("read max = %d, want top message 10", read.MaxID)
+	}
+	list, err = store.ListByPeers(ctx, userID, []domain.Peer{peer})
+	if err != nil {
+		t.Fatalf("ListByPeers: %v", err)
+	}
+	if len(list.Dialogs) != 1 {
+		t.Fatalf("dialogs = %+v, want one dialog", list.Dialogs)
+	}
+	dialog := list.Dialogs[0]
+	if dialog.ReadInboxMaxID != 10 || dialog.UnreadCount != 0 || dialog.UnreadMentions != 0 || dialog.UnreadReactions != 0 || dialog.UnreadMark {
+		t.Fatalf("dialog after read = %+v, want read clamped to top and unread cleared", dialog)
 	}
 }

@@ -15,6 +15,7 @@ type ContactStore interface {
 	Upsert(ctx context.Context, userID int64, input domain.ContactInput) (domain.Contact, error)
 	UpsertMany(ctx context.Context, userID int64, inputs []domain.ContactInput) ([]domain.Contact, error)
 	UpdateNote(ctx context.Context, userID, contactUserID int64, note string, entities []domain.MessageEntity) (domain.Contact, bool, error)
+	SetCloseFriends(ctx context.Context, userID int64, contactUserIDs []int64) (domain.CloseFriendsEditResult, error)
 	SetPersonalPhoto(ctx context.Context, userID, contactUserID int64, photoID int64, date int) (domain.Contact, bool, error)
 	PersonalPhotos(ctx context.Context, userID int64, contactUserIDs []int64) (map[int64]domain.ProfilePhotoRef, error)
 	Delete(ctx context.Context, userID int64, contactUserIDs []int64) (int, error)

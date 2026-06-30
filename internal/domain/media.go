@@ -29,14 +29,40 @@ type FileBlob struct {
 	MimeType    string       `json:"mime_type,omitempty"`
 }
 
-// UploadPart 是 upload.saveFilePart/saveBigFilePart 累积的一个分片（落 PG，组装后清理）。
+// UploadPart 是 upload.saveFilePart/saveBigFilePart 累积的一个分片元数据。
+// 分片字节不进 PG；PG 只记录 object_key/size/hash，组装后清理 metadata 与临时对象。
 type UploadPart struct {
 	OwnerUserID int64
 	FileID      int64
 	Part        int
 	TotalParts  int // big file 已知总数；small file 为 0
 	Big         bool
-	Bytes       []byte
+	Backend     MediaBackend
+	ObjectKey   string
+	Size        int64
+	SHA256      []byte
+}
+
+// UploadPartUsage 描述某用户当前尚未组装的上传分片占用。
+type UploadPartUsage struct {
+	Bytes int64
+	Parts int
+	Files int
+}
+
+// UploadPartSlot 描述某个 (owner,file_id,part) 槽位的当前状态，用于判断重试覆盖的配额增量。
+type UploadPartSlot struct {
+	ExistingBytes int64
+	ObjectKey     string
+	FileParts     int
+	Found         bool
+}
+
+// UploadPartQuota 限制某用户 in-flight 上传分片占用；字段 <=0 表示该维度不限制。
+type UploadPartQuota struct {
+	MaxBytes int64
+	MaxParts int
+	MaxFiles int
 }
 
 // UploadedFileRef 引用一个客户端已通过 upload.saveFilePart(Big) 上传完毕的文件。
@@ -87,22 +113,36 @@ const (
 	PhotoSizeKindPath PhotoSizeKind = "path"
 	// PhotoSizeKindProgressive → photoSizeProgressive（渐进式 jpeg 多段大小）。
 	PhotoSizeKindProgressive PhotoSizeKind = "progressive"
+	// PhotoSizeKindVideo → photo.video_sizes 里的 videoSize（animated profile video）。
+	PhotoSizeKindVideo PhotoSizeKind = "video"
+	// PhotoSizeKindVideoEmojiMarkup → photo.video_sizes 里的 videoSizeEmojiMarkup。
+	PhotoSizeKindVideoEmojiMarkup PhotoSizeKind = "video_emoji_markup"
+	// PhotoSizeKindVideoStickerMarkup → photo.video_sizes 里的 videoSizeStickerMarkup。
+	PhotoSizeKindVideoStickerMarkup PhotoSizeKind = "video_sticker_markup"
 )
 
 // PhotoSize 描述照片/缩略图的一种渲染尺寸。
 type PhotoSize struct {
-	Kind  PhotoSizeKind `json:"kind"`
-	Type  string        `json:"type"`
-	W     int           `json:"w,omitempty"`
-	H     int           `json:"h,omitempty"`
-	Size  int           `json:"size,omitempty"`
-	Bytes []byte        `json:"bytes,omitempty"` // stripped/cached/path 内联内容
-	Sizes []int         `json:"sizes,omitempty"` // progressive
+	Kind                 PhotoSizeKind `json:"kind"`
+	Type                 string        `json:"type"`
+	W                    int           `json:"w,omitempty"`
+	H                    int           `json:"h,omitempty"`
+	Size                 int           `json:"size,omitempty"`
+	Bytes                []byte        `json:"bytes,omitempty"` // stripped/cached/path 内联内容
+	Sizes                []int         `json:"sizes,omitempty"` // progressive
+	VideoStartTs         float64       `json:"video_start_ts,omitempty"`
+	EmojiID              int64         `json:"emoji_id,omitempty"`
+	BackgroundColors     []int         `json:"background_colors,omitempty"`
+	StickerSetID         int64         `json:"sticker_set_id,omitempty"`
+	StickerSetAccessHash int64         `json:"sticker_set_access_hash,omitempty"`
+	StickerSetShortName  string        `json:"sticker_set_short_name,omitempty"`
+	StickerSetSystemKey  string        `json:"sticker_set_system_key,omitempty"`
+	StickerID            int64         `json:"sticker_id,omitempty"`
 }
 
 // Downloadable 表示该尺寸需要客户端通过 upload.getFile 拉取（而非内联字节）。
 func (s PhotoSize) Downloadable() bool {
-	return s.Kind == PhotoSizeKindDefault || s.Kind == PhotoSizeKindProgressive
+	return s.Kind == PhotoSizeKindDefault || s.Kind == PhotoSizeKindProgressive || s.Kind == PhotoSizeKindVideo
 }
 
 // DocumentAttributeKind 标识 TL DocumentAttribute 变体。
@@ -175,6 +215,39 @@ func (d Document) StickerSetRef() (id, accessHash int64, ok bool) {
 	return 0, 0, false
 }
 
+// IsMusic reports whether the document is a Telegram profile/shared-music song:
+// documentAttributeAudio with voice=false. MIME type is intentionally not used
+// as the source of truth because clients key their UI off the TL attribute.
+func (d Document) IsMusic() bool {
+	for _, attr := range d.Attributes {
+		if attr.Kind == DocAttrAudio && !attr.Voice {
+			return true
+		}
+	}
+	return false
+}
+
+// IsSticker reports whether the document carries a sticker attribute
+// (static / animated / video stickers all use documentAttributeSticker).
+func (d Document) IsSticker() bool {
+	for _, attr := range d.Attributes {
+		if attr.Kind == DocAttrSticker {
+			return true
+		}
+	}
+	return false
+}
+
+// IsGif reports whether the document is a savable GIF (documentAttributeAnimated).
+func (d Document) IsGif() bool {
+	for _, attr := range d.Attributes {
+		if attr.Kind == DocAttrAnimated {
+			return true
+		}
+	}
+	return false
+}
+
 // Photo 是已存储的 Telegram 照片（头像或图片消息）。
 type Photo struct {
 	ID            int64       `json:"id"`
@@ -193,19 +266,261 @@ const (
 	MessageMediaKindNone     MessageMediaKind = ""
 	MessageMediaKindPhoto    MessageMediaKind = "photo"
 	MessageMediaKindDocument MessageMediaKind = "document"
+	MessageMediaKindContact  MessageMediaKind = "contact"
+	MessageMediaKindService  MessageMediaKind = "service"
+	MessageMediaKindGeo      MessageMediaKind = "geo"
+	MessageMediaKindVenue    MessageMediaKind = "venue"
+	MessageMediaKindDice     MessageMediaKind = "dice"
+	MessageMediaKindPoll     MessageMediaKind = "poll"
+	MessageMediaKindGeoLive  MessageMediaKind = "geo_live"
+	MessageMediaKindTodo     MessageMediaKind = "todo"
+	MessageMediaKindStory    MessageMediaKind = "story"
+	MessageMediaKindWebPage  MessageMediaKind = "web_page"
 )
+
+// MessageTodoItem 是清单中的一项（id 为列表内唯一正整数，客户端分配）。
+type MessageTodoItem struct {
+	ID       int             `json:"id"`
+	Title    string          `json:"title"`
+	Entities []MessageEntity `json:"entities,omitempty"`
+}
+
+// MessageTodoCompletion 记录某项被谁在何时勾选完成。
+type MessageTodoCompletion struct {
+	ID          int   `json:"id"`
+	CompletedBy int64 `json:"completed_by"`
+	Date        int   `json:"date"`
+}
+
+// MessageTodo 是待办清单（messageMediaToDo）。append/toggle 经 editMessage 媒体替换链路
+// 整体更新快照（与 live location 同模式）。
+type MessageTodo struct {
+	OthersCanAppend   bool                    `json:"others_can_append,omitempty"`
+	OthersCanComplete bool                    `json:"others_can_complete,omitempty"`
+	Title             string                  `json:"title"`
+	TitleEntities     []MessageEntity         `json:"title_entities,omitempty"`
+	Items             []MessageTodoItem       `json:"items"`
+	Completions       []MessageTodoCompletion `json:"completions,omitempty"`
+}
+
+// MessageGeoPoint 是消息中携带的地理坐标点（messageMediaGeo/Venue 共用）。
+// AccessHash 在发送时随机生成，客户端会原样带回 upload.getWebFile 地图缩略请求。
+type MessageGeoPoint struct {
+	Lat            float64 `json:"lat"`
+	Long           float64 `json:"long"`
+	AccessHash     int64   `json:"access_hash,omitempty"`
+	AccuracyRadius int     `json:"accuracy_radius,omitempty"`
+}
+
+// MessageVenue 是带场所信息的位置（messageMediaVenue）。
+type MessageVenue struct {
+	Geo       MessageGeoPoint `json:"geo"`
+	Title     string          `json:"title"`
+	Address   string          `json:"address,omitempty"`
+	Provider  string          `json:"provider,omitempty"`
+	VenueID   string          `json:"venue_id,omitempty"`
+	VenueType string          `json:"venue_type,omitempty"`
+}
+
+// MessageDice 是互动 emoji（messageMediaDice）。Value 在发送落库时由服务端
+// 一次定值，此后对所有 viewer 与转发快照保持不变。
+type MessageDice struct {
+	Emoticon string `json:"emoticon"`
+	Value    int    `json:"value"`
+}
+
+// MessageGeoLive 是实时位置（messageMediaGeoLive）。客户端按 message.date + Period
+// 自行计算过期；停止共享 = editMessage 把 Period 改为已逝时长（立即过期），服务端无后台任务。
+type MessageGeoLive struct {
+	Geo                         MessageGeoPoint `json:"geo"`
+	Heading                     int             `json:"heading,omitempty"`
+	Period                      int             `json:"period"`
+	ProximityNotificationRadius int             `json:"proximity_notification_radius,omitempty"`
+}
+
+// MessageStory is a story shared as messageMediaStory. Peer+ID are the stable
+// reference; Story is the viewer-visible snapshot captured when the message was
+// sent so history/difference can replay without re-resolving the source story.
+type MessageStory struct {
+	Peer       Peer   `json:"peer"`
+	ID         int    `json:"id"`
+	ViaMention bool   `json:"via_mention,omitempty"`
+	Story      *Story `json:"story,omitempty"`
+}
+
+// MessageWebPageState 区分链接预览的三种 TL 形态：pending（webPagePending，
+// 已知链接但预览尚未异步抓取完成）、done（webPage，已解析的预览卡片）、
+// empty（webPageEmpty，已解析但该链接无可展示内容）。
+type MessageWebPageState string
+
+const (
+	MessageWebPageStatePending MessageWebPageState = "pending"
+	MessageWebPageStateDone    MessageWebPageState = "done"
+	MessageWebPageStateEmpty   MessageWebPageState = "empty"
+)
+
+// MessageWebPage 是以 messageMediaWebPage 形式挂载的链接预览。URL 是稳定引用，
+// 其余字段是服务端在解析时捕获的快照，使 history/difference 无需重新抓取即可回放
+// （与 MessageStory 同模式）。State 决定投影为 webPagePending / webPage / webPageEmpty。
+//
+// ForceLargeMedia/ForceSmallMedia/Manual/Safe 是 messageMediaWebPage 外层 wrapper
+// 的标志位；HasLargeMedia 是 webPage 本体的标志位。ID 必须在 pending→done 切换前后
+// 保持稳定，客户端按 webPage id 关联占位与解析结果。
+type MessageWebPage struct {
+	State       MessageWebPageState `json:"state"`
+	ID          int64               `json:"id"`
+	URL         string              `json:"url"`
+	DisplayURL  string              `json:"display_url,omitempty"`
+	Hash        int                 `json:"hash,omitempty"`
+	Date        int                 `json:"date,omitempty"`
+	Type        string              `json:"type,omitempty"`
+	SiteName    string              `json:"site_name,omitempty"`
+	Title       string              `json:"title,omitempty"`
+	Description string              `json:"description,omitempty"`
+	Author      string              `json:"author,omitempty"`
+	Photo       *Photo              `json:"photo,omitempty"`
+
+	ForceLargeMedia bool `json:"force_large_media,omitempty"`
+	ForceSmallMedia bool `json:"force_small_media,omitempty"`
+	Manual          bool `json:"manual,omitempty"`
+	Safe            bool `json:"safe,omitempty"`
+	HasLargeMedia   bool `json:"has_large_media,omitempty"`
+}
+
+// MessageServiceActionKind 标识私聊服务消息动作。
+type MessageServiceActionKind string
+
+const (
+	MessageServiceActionSuggestProfilePhoto MessageServiceActionKind = "suggest_profile_photo"
+	// MessageServiceActionPinMessage 映射 messageActionPinMessage：非
+	// pm_oneside 私聊置顶生成的服务消息，被置顶消息经 reply_to 指向。
+	MessageServiceActionPinMessage MessageServiceActionKind = "pin_message"
+	// MessageServiceActionPhoneCall 映射 messageActionPhoneCall：私聊通话
+	// 结束（含 missed 超时）后落历史的通话条目，sender 恒为主叫。
+	MessageServiceActionPhoneCall MessageServiceActionKind = "phone_call"
+	// MessageServiceActionBotAllowed 映射 messageActionBotAllowed：用户授权
+	// bot 后在 bot 私聊中留下的服务消息。
+	MessageServiceActionBotAllowed MessageServiceActionKind = "bot_allowed"
+	// MessageServiceActionWebViewDataSent 映射 messageActionWebViewDataSent*
+	//：simple webview 把 data 回传给 bot 后在私聊中留下的服务消息。
+	MessageServiceActionWebViewDataSent MessageServiceActionKind = "web_view_data_sent"
+	// MessageServiceActionRequestedPeer 映射 messageActionRequestedPeer*：用户
+	// 响应 bot 的 request-peer 按钮后，把所选 peer 作为可恢复服务消息发给 bot。
+	MessageServiceActionRequestedPeer MessageServiceActionKind = "requested_peer"
+	// MessageServiceActionSetChatTheme 映射 messageActionSetChatTheme：
+	// 私聊双方共享的 chat theme token 变更。
+	MessageServiceActionSetChatTheme MessageServiceActionKind = "set_chat_theme"
+	// MessageServiceActionStarGift 映射 messageActionStarGift：收到一份 Star 礼物。
+	// 礼物快照（贴纸/星价）内嵌在 action 里，收礼人无需额外拉取即可渲染气泡。
+	MessageServiceActionStarGift MessageServiceActionKind = "star_gift"
+)
+
+// MessagePhoneCallAction 是 messageActionPhoneCall 的协议中立载荷。
+// Reason 取值同 PhoneCallDiscardReason；Duration 仅通话真正建立后非零。
+type MessagePhoneCallAction struct {
+	CallID   int64  `json:"call_id"`
+	Reason   string `json:"reason,omitempty"`
+	Duration int    `json:"duration,omitempty"`
+	Video    bool   `json:"video,omitempty"`
+}
+
+// MessageBotAllowedAction 是 messageActionBotAllowed 的协议中立载荷。
+type MessageBotAllowedAction struct {
+	AttachMenu  bool   `json:"attach_menu,omitempty"`
+	FromRequest bool   `json:"from_request,omitempty"`
+	Domain      string `json:"domain,omitempty"`
+}
+
+const (
+	MaxWebViewDataButtonTextLen = MaxBotMenuButtonTextLen
+	MaxWebViewDataPayloadLen    = MaxMessageTextLength
+)
+
+// MessageWebViewDataAction 是 messageActionWebViewDataSent* 的协议中立载荷。
+type MessageWebViewDataAction struct {
+	ButtonText string `json:"button_text"`
+	Data       string `json:"data,omitempty"`
+}
+
+// MessageRequestedPeerAction 是 messageActionRequestedPeer* 的协议中立载荷。
+type MessageRequestedPeerAction struct {
+	ButtonID int    `json:"button_id"`
+	Peers    []Peer `json:"peers"`
+}
+
+// MessageServiceAction 是私聊服务消息动作的协议中立表示。
+type MessageServiceAction struct {
+	Kind              MessageServiceActionKind    `json:"kind"`
+	Photo             *Photo                      `json:"photo,omitempty"`
+	Call              *MessagePhoneCallAction     `json:"call,omitempty"`
+	BotAllowed        *MessageBotAllowedAction    `json:"bot_allowed,omitempty"`
+	WebViewData       *MessageWebViewDataAction   `json:"web_view_data,omitempty"`
+	RequestedPeer     *MessageRequestedPeerAction `json:"requested_peer,omitempty"`
+	ChatThemeEmoticon string                      `json:"chat_theme_emoticon,omitempty"`
+	StarGift          *MessageStarGiftAction      `json:"star_gift,omitempty"`
+}
+
+// MessageStarGiftAction 是 messageActionStarGift 的协议中立载荷：内嵌礼物快照（贴纸/星价）
+// 使收礼人无需额外拉取即可渲染。PeerUserID/PeerChannelID 为收礼方；NameHidden 时下发不暴露 from。
+type MessageStarGiftAction struct {
+	GiftID        int64     `json:"gift_id"`
+	Stars         int64     `json:"stars"`
+	ConvertStars  int64     `json:"convert_stars,omitempty"`
+	Title         string    `json:"title,omitempty"`
+	Sticker       *Document `json:"sticker,omitempty"`
+	Message       string    `json:"message,omitempty"`
+	FromUserID    int64     `json:"from_user_id,omitempty"`
+	PeerUserID    int64     `json:"peer_user_id,omitempty"`
+	PeerChannelID int64     `json:"peer_channel_id,omitempty"`
+	SavedID       int64     `json:"saved_id,omitempty"`
+	NameHidden    bool      `json:"name_hidden,omitempty"`
+	Saved         bool      `json:"saved,omitempty"`
+	Converted     bool      `json:"converted,omitempty"`
+}
 
 // MessageMedia 是一条消息媒体载荷的业务表示（落库为消息行上的 JSONB 快照）。
 type MessageMedia struct {
-	Kind       MessageMediaKind `json:"kind"`
-	Photo      *Photo           `json:"photo,omitempty"`
-	Document   *Document        `json:"document,omitempty"`
-	Spoiler    bool             `json:"spoiler,omitempty"`
-	TTLSeconds int              `json:"ttl_seconds,omitempty"`
-	Nopremium  bool             `json:"nopremium,omitempty"`
-	Voice      bool             `json:"voice,omitempty"`
-	Round      bool             `json:"round,omitempty"`
-	Video      bool             `json:"video,omitempty"`
+	Kind          MessageMediaKind      `json:"kind"`
+	Photo         *Photo                `json:"photo,omitempty"`
+	Document      *Document             `json:"document,omitempty"`
+	Contact       *MessageContact       `json:"contact,omitempty"`
+	ServiceAction *MessageServiceAction `json:"service_action,omitempty"`
+	Geo           *MessageGeoPoint      `json:"geo,omitempty"`
+	Venue         *MessageVenue         `json:"venue,omitempty"`
+	Dice          *MessageDice          `json:"dice,omitempty"`
+	Poll          *MessagePoll          `json:"poll,omitempty"`
+	GeoLive       *MessageGeoLive       `json:"geo_live,omitempty"`
+	Todo          *MessageTodo          `json:"todo,omitempty"`
+	Story         *MessageStory         `json:"story,omitempty"`
+	WebPage       *MessageWebPage       `json:"web_page,omitempty"`
+	Spoiler       bool                  `json:"spoiler,omitempty"`
+	TTLSeconds    int                   `json:"ttl_seconds,omitempty"`
+	Nopremium     bool                  `json:"nopremium,omitempty"`
+	Voice         bool                  `json:"voice,omitempty"`
+	Round         bool                  `json:"round,omitempty"`
+	Video         bool                  `json:"video,omitempty"`
+	// InvertMedia 映射 message.invert_media：媒体（典型为链接预览）渲染在文本上方。
+	// 存于媒体快照而非消息行，避免新增消息表列；读时投影为 tg.Message.invert_media。
+	InvertMedia bool `json:"invert_media,omitempty"`
+}
+
+// IsMusic reports whether the message media is a music document rather than a
+// voice note, video, or generic file.
+func (m *MessageMedia) IsMusic() bool {
+	return m != nil &&
+		m.Kind == MessageMediaKindDocument &&
+		m.Document != nil &&
+		!m.Voice &&
+		m.Document.IsMusic()
+}
+
+// MessageContact is a shared contact card attached to a message.
+type MessageContact struct {
+	PhoneNumber string `json:"phone_number"`
+	FirstName   string `json:"first_name"`
+	LastName    string `json:"last_name,omitempty"`
+	Vcard       string `json:"vcard,omitempty"`
+	UserID      int64  `json:"user_id,omitempty"`
 }
 
 // IsZero 表示无媒体（用于落库时跳过空快照、转换时回退 MessageMediaEmpty）。
@@ -213,11 +528,26 @@ func (m *MessageMedia) IsZero() bool {
 	return m == nil || m.Kind == MessageMediaKindNone
 }
 
+// HasUnreadPayload 表示该媒体是否参与 media_unread（"未听"）状态。
+// 只有 voice/round 才有此语义：客户端只为它们渲染未听标记并上报
+// readMessageContents；photo/document 置位只会留下永不清除的脏状态。
+func (m *MessageMedia) HasUnreadPayload() bool {
+	if m.IsZero() || m.Kind != MessageMediaKindDocument {
+		return false
+	}
+	return m.Voice || m.Round
+}
+
 // StickerPack 是 emoji→文档 id 的映射条目（messages.stickerSet.packs）。
 type StickerPack struct {
 	Emoticon    string  `json:"emoticon"`
 	DocumentIDs []int64 `json:"document_ids"`
 }
+
+// StickerSetSystemKeyEmojiDefaultStatuses 是 inputStickerSetEmojiDefaultStatuses
+// 对应的系统集标识：premium 用户 emoji status 选择器的"默认状态"主体集
+// （messages.getStickerSet 与 account.getDefaultEmojiStatuses 共用）。
+const StickerSetSystemKeyEmojiDefaultStatuses = "emoji_default_statuses"
 
 // StickerSetKind 区分贴纸集用途（影响 getAllStickers / getEmojiStickers 归类）。
 type StickerSetKind string
@@ -273,6 +603,7 @@ type ProfilePhotoRef struct {
 	DCID     int
 	Stripped []byte // photoStrippedSize 内联缩略图，可空
 	Personal bool   // true 表示 viewer 私有联系人头像
+	HasVideo bool   // true 表示 photo.video_sizes 非空，需输出 userProfilePhoto.has_video
 }
 
 // StrippedFromSizes 从照片尺寸列表里取出 stripped 缩略图字节（用于 UserProfilePhoto/ChatPhoto 占位）。
@@ -283,6 +614,17 @@ func StrippedFromSizes(sizes []PhotoSize) []byte {
 		}
 	}
 	return nil
+}
+
+// PhotoHasVideo 从照片尺寸快照推导 UserProfilePhoto.has_video。
+func PhotoHasVideo(sizes []PhotoSize) bool {
+	for _, s := range sizes {
+		switch s.Kind {
+		case PhotoSizeKindVideo, PhotoSizeKindVideoEmojiMarkup, PhotoSizeKindVideoStickerMarkup:
+			return true
+		}
+	}
+	return false
 }
 
 // StickerSetRefKind 标识 InputStickerSet 的解析方式。
@@ -319,6 +661,24 @@ type AvailableReaction struct {
 	Order               int    `json:"order,omitempty"`
 }
 
+// AvailableEffect 是一条消息发送特效（messages.getAvailableEffects）。引用三个文档:
+// 选择器静态图标 / 气泡上的特效贴纸 / 全屏特效动画(后两者可为 0)。属全局静态目录,
+// 服务端 seed 后常驻内存。
+type AvailableEffect struct {
+	ID                int64  `json:"id"`
+	Emoticon          string `json:"emoticon"`
+	StaticIconID      int64  `json:"static_icon_id,omitempty"`
+	EffectStickerID   int64  `json:"effect_sticker_id"`
+	EffectAnimationID int64  `json:"effect_animation_id,omitempty"`
+	PremiumRequired   bool   `json:"premium_required,omitempty"`
+	Order             int    `json:"order,omitempty"`
+}
+
+// DocumentIDs 收集该 effect 引用的全部文档 id（去零去重）。
+func (e AvailableEffect) DocumentIDs() []int64 {
+	return dedupNonZeroIDs(e.StaticIconID, e.EffectStickerID, e.EffectAnimationID)
+}
+
 // DocumentIDs 收集该 reaction 引用的全部文档 id（去零去重，便于批量加载）。
 func (r AvailableReaction) DocumentIDs() []int64 {
 	raw := []int64{
@@ -328,6 +688,23 @@ func (r AvailableReaction) DocumentIDs() []int64 {
 	out := make([]int64, 0, len(raw))
 	seen := make(map[int64]struct{}, len(raw))
 	for _, id := range raw {
+		if id == 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+// dedupNonZeroIDs 返回去零去重后的 id 列表（保序）。
+func dedupNonZeroIDs(ids ...int64) []int64 {
+	out := make([]int64, 0, len(ids))
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
 		if id == 0 {
 			continue
 		}

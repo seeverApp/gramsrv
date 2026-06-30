@@ -1,0 +1,132 @@
+package rpc
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
+	"go.uber.org/zap/zaptest"
+
+	appchannels "telesrv/internal/app/channels"
+	appusers "telesrv/internal/app/users"
+	"telesrv/internal/domain"
+	"telesrv/internal/store/memory"
+)
+
+func TestMessagesGetFutureChatCreatorAfterLeaveAndCreatorLeaveTransfers(t *testing.T) {
+	ctx := context.Background()
+	userStore := memory.NewUserStore()
+	owner, err := userStore.Create(ctx, domain.User{AccessHash: 9101, Phone: "15550009101", FirstName: "Owner"})
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	admin, err := userStore.Create(ctx, domain.User{AccessHash: 9102, Phone: "15550009102", FirstName: "Admin"})
+	if err != nil {
+		t.Fatalf("create admin: %v", err)
+	}
+	member, err := userStore.Create(ctx, domain.User{AccessHash: 9103, Phone: "15550009103", FirstName: "Member"})
+	if err != nil {
+		t.Fatalf("create member: %v", err)
+	}
+	channelStore := memory.NewChannelStore()
+	channelService := appchannels.NewService(channelStore)
+	r := New(Config{}, Deps{
+		Users:    appusers.NewService(userStore),
+		Channels: channelService,
+	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700009100, 0)})
+	created, err := channelService.CreateChannel(ctx, owner.ID, domain.CreateChannelRequest{
+		CreatorUserID: owner.ID,
+		Title:         "leave owner transfer",
+		Megagroup:     true,
+		MemberUserIDs: []int64{admin.ID, member.ID},
+		Date:          1700009100,
+	})
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if _, err := channelService.EditAdmin(ctx, owner.ID, domain.EditChannelAdminRequest{
+		UserID:    owner.ID,
+		ChannelID: created.Channel.ID,
+		MemberID:  admin.ID,
+		AdminRights: domain.ChannelAdminRights{
+			ChangeInfo: true,
+			AddAdmins:  true,
+		},
+		Date: 1700009101,
+	}); err != nil {
+		t.Fatalf("promote admin: %v", err)
+	}
+	peer := &tg.InputPeerChannel{ChannelID: created.Channel.ID, AccessHash: created.Channel.AccessHash}
+	inputChannel := &tg.InputChannel{ChannelID: created.Channel.ID, AccessHash: created.Channel.AccessHash}
+
+	future, err := r.onMessagesGetFutureChatCreatorAfterLeave(WithUserID(ctx, owner.ID), peer)
+	if err != nil {
+		t.Fatalf("get future creator: %v", err)
+	}
+	if user, ok := future.(*tg.User); !ok || user.ID != admin.ID {
+		t.Fatalf("future creator = %T %+v, want admin user %d", future, future, admin.ID)
+	}
+
+	if _, err := r.onChannelsLeaveChannel(WithUserID(ctx, owner.ID), inputChannel); err != nil {
+		t.Fatalf("creator leaves: %v", err)
+	}
+	view, err := channelService.GetChannel(ctx, admin.ID, created.Channel.ID)
+	if err != nil {
+		t.Fatalf("get channel after leave: %v", err)
+	}
+	if view.Channel.CreatorUserID != admin.ID || view.Self.Role != domain.ChannelRoleCreator {
+		t.Fatalf("channel after leave = %+v self=%+v, want admin as creator", view.Channel, view.Self)
+	}
+	oldOwner, err := channelService.GetParticipant(ctx, admin.ID, created.Channel.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("get old owner after leave: %v", err)
+	}
+	if oldOwner.Status != domain.ChannelMemberLeft || oldOwner.Role == domain.ChannelRoleCreator {
+		t.Fatalf("old owner after leave = %+v, want left non-creator", oldOwner)
+	}
+	if _, err := r.onChannelsJoinChannel(WithUserID(ctx, owner.ID), inputChannel); err != nil {
+		t.Fatalf("old owner rejoins: %v", err)
+	}
+	rejoined, err := channelService.GetParticipant(ctx, admin.ID, created.Channel.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("get old owner after rejoin: %v", err)
+	}
+	if rejoined.Role != domain.ChannelRoleMember || rejoined.Status != domain.ChannelMemberActive || rejoined.Rank != "" {
+		t.Fatalf("rejoined old owner = %+v, want active plain member", rejoined)
+	}
+}
+
+func TestMessagesGetFutureChatCreatorAfterLeaveNoCandidate(t *testing.T) {
+	ctx := context.Background()
+	userStore := memory.NewUserStore()
+	owner, err := userStore.Create(ctx, domain.User{AccessHash: 9111, Phone: "15550009111", FirstName: "Solo"})
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	channelStore := memory.NewChannelStore()
+	channelService := appchannels.NewService(channelStore)
+	r := New(Config{}, Deps{
+		Users:    appusers.NewService(userStore),
+		Channels: channelService,
+	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700009120, 0)})
+	created, err := channelService.CreateChannel(ctx, owner.ID, domain.CreateChannelRequest{
+		CreatorUserID: owner.ID,
+		Title:         "solo owner",
+		Megagroup:     true,
+		Date:          1700009120,
+	})
+	if err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	peer := &tg.InputPeerChannel{ChannelID: created.Channel.ID, AccessHash: created.Channel.AccessHash}
+	inputChannel := &tg.InputChannel{ChannelID: created.Channel.ID, AccessHash: created.Channel.AccessHash}
+
+	if _, err := r.onMessagesGetFutureChatCreatorAfterLeave(WithUserID(ctx, owner.ID), peer); err == nil || !tgerr.Is(err, "USER_NOT_PARTICIPANT") {
+		t.Fatalf("future creator err = %v, want USER_NOT_PARTICIPANT", err)
+	}
+	if _, err := r.onChannelsLeaveChannel(WithUserID(ctx, owner.ID), inputChannel); err == nil || !tgerr.Is(err, "USER_CREATOR") {
+		t.Fatalf("creator leave err = %v, want USER_CREATOR", err)
+	}
+}

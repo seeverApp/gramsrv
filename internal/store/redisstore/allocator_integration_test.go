@@ -16,7 +16,7 @@ func (s staticCounterSource) Current(context.Context, int64) (int, error) {
 	return s.value, nil
 }
 
-func TestRedisAllocatorsRecoverFromCounterSource(t *testing.T) {
+func TestRedisBoxAllocatorRecoverFromCounterSource(t *testing.T) {
 	addr := os.Getenv("TELESRV_TEST_REDIS_ADDR")
 	if addr == "" {
 		t.Skip("set TELESRV_TEST_REDIS_ADDR to run redis integration test")
@@ -29,23 +29,7 @@ func TestRedisAllocatorsRecoverFromCounterSource(t *testing.T) {
 	t.Cleanup(func() { _ = c.Close() })
 
 	userID := time.Now().UnixNano()
-	t.Cleanup(func() { _ = c.Del(ctx, ptsKey(userID), boxIDKey(userID)).Err() })
-
-	pts := NewPtsAllocator(c, staticCounterSource{value: 41})
-	currentPts, err := pts.CurrentPts(ctx, userID)
-	if err != nil {
-		t.Fatalf("CurrentPts: %v", err)
-	}
-	if currentPts != 41 {
-		t.Fatalf("current pts = %d, want recovered 41", currentPts)
-	}
-	nextPts, err := pts.NextPts(ctx, userID)
-	if err != nil {
-		t.Fatalf("NextPts: %v", err)
-	}
-	if nextPts != 42 {
-		t.Fatalf("next pts = %d, want 42", nextPts)
-	}
+	t.Cleanup(func() { _ = c.Del(ctx, boxIDKey(userID)).Err() })
 
 	boxes := NewBoxIDAllocator(c, staticCounterSource{value: 100})
 	currentBox, err := boxes.CurrentBoxID(ctx, userID)
@@ -64,7 +48,7 @@ func TestRedisAllocatorsRecoverFromCounterSource(t *testing.T) {
 	}
 }
 
-func TestRedisAllocatorConcurrentFirstUse(t *testing.T) {
+func TestRedisBoxAllocatorConcurrentFirstUse(t *testing.T) {
 	addr := os.Getenv("TELESRV_TEST_REDIS_ADDR")
 	if addr == "" {
 		t.Skip("set TELESRV_TEST_REDIS_ADDR to run redis integration test")
@@ -77,10 +61,10 @@ func TestRedisAllocatorConcurrentFirstUse(t *testing.T) {
 	t.Cleanup(func() { _ = c.Close() })
 
 	userID := time.Now().UnixNano()
-	t.Cleanup(func() { _ = c.Del(ctx, ptsKey(userID)).Err() })
+	t.Cleanup(func() { _ = c.Del(ctx, boxIDKey(userID)).Err() })
 
 	const workers = 32
-	pts := NewPtsAllocator(c, staticCounterSource{value: 1000})
+	boxes := NewBoxIDAllocator(c, staticCounterSource{value: 1000})
 	values := make(chan int, workers)
 	errs := make(chan error, workers)
 	var wg sync.WaitGroup
@@ -88,7 +72,7 @@ func TestRedisAllocatorConcurrentFirstUse(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			v, err := pts.NextPts(ctx, userID)
+			v, err := boxes.NextBoxID(ctx, userID)
 			if err != nil {
 				errs <- err
 				return
@@ -101,29 +85,29 @@ func TestRedisAllocatorConcurrentFirstUse(t *testing.T) {
 	close(errs)
 
 	for err := range errs {
-		t.Fatalf("NextPts: %v", err)
+		t.Fatalf("NextBoxID: %v", err)
 	}
 	seen := make(map[int]bool, workers)
 	for v := range values {
 		if v < 1001 || v > 1000+workers {
-			t.Fatalf("pts = %d, want recovered contiguous range", v)
+			t.Fatalf("box id = %d, want recovered contiguous range", v)
 		}
 		if seen[v] {
-			t.Fatalf("duplicate pts %d", v)
+			t.Fatalf("duplicate box id %d", v)
 		}
 		seen[v] = true
 	}
 	for want := 1001; want <= 1000+workers; want++ {
 		if !seen[want] {
-			t.Fatalf("missing pts %d", want)
+			t.Fatalf("missing box id %d", want)
 		}
 	}
-	current, err := pts.CurrentPts(ctx, userID)
+	current, err := boxes.CurrentBoxID(ctx, userID)
 	if err != nil {
-		t.Fatalf("CurrentPts: %v", err)
+		t.Fatalf("CurrentBoxID: %v", err)
 	}
 	if current != 1000+workers {
-		t.Fatalf("current pts = %d, want %d", current, 1000+workers)
+		t.Fatalf("current box id = %d, want %d", current, 1000+workers)
 	}
 }
 
@@ -156,5 +140,22 @@ func TestRedisRateLimiterWindow(t *testing.T) {
 	}
 	if allowed || retry <= 0 {
 		t.Fatalf("second allowed=%v retry=%d, want limited with retry", allowed, retry)
+	}
+
+	batchKey := key + ":batch"
+	t.Cleanup(func() { _ = c.Del(ctx, rateLimitKey(batchKey)).Err() })
+	allowed, retry, err = limiter.AllowN(ctx, batchKey, 2, 3, time.Minute)
+	if err != nil {
+		t.Fatalf("AllowN first: %v", err)
+	}
+	if !allowed || retry != 0 {
+		t.Fatalf("AllowN first allowed=%v retry=%d, want allowed", allowed, retry)
+	}
+	allowed, retry, err = limiter.AllowN(ctx, batchKey, 2, 3, time.Minute)
+	if err != nil {
+		t.Fatalf("AllowN second: %v", err)
+	}
+	if allowed || retry <= 0 {
+		t.Fatalf("AllowN second allowed=%v retry=%d, want limited with retry", allowed, retry)
 	}
 }

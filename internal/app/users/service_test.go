@@ -91,6 +91,62 @@ func TestServiceUpdateProfile(t *testing.T) {
 	}
 }
 
+func TestServiceUpdateBirthday(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewUserStore()
+	owner, err := store.Create(ctx, domain.User{AccessHash: 1, Phone: "15550000010", FirstName: "Owner"})
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	svc := NewService(store)
+
+	// 设置带年份的生日。
+	u, err := svc.UpdateBirthday(ctx, owner.ID, domain.Birthday{Day: 14, Month: 2, Year: 1990})
+	if err != nil {
+		t.Fatalf("UpdateBirthday: %v", err)
+	}
+	if u.Birthday != (domain.Birthday{Day: 14, Month: 2, Year: 1990}) {
+		t.Fatalf("birthday = %+v, want 14/2/1990", u.Birthday)
+	}
+	// 非法月份被拒。
+	if _, err := svc.UpdateBirthday(ctx, owner.ID, domain.Birthday{Day: 1, Month: 13}); !errors.Is(err, domain.ErrBirthdayInvalid) {
+		t.Fatalf("invalid month err = %v, want birthday invalid", err)
+	}
+	// 清除（零值）后 IsSet=false。
+	u, err = svc.UpdateBirthday(ctx, owner.ID, domain.Birthday{})
+	if err != nil {
+		t.Fatalf("clear birthday: %v", err)
+	}
+	if u.Birthday.IsSet() {
+		t.Fatalf("birthday after clear = %+v, want unset", u.Birthday)
+	}
+}
+
+func TestServiceUpdatePersonalChannel(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewUserStore()
+	owner, err := store.Create(ctx, domain.User{AccessHash: 1, Phone: "15550000011", FirstName: "Owner"})
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	svc := NewService(store)
+
+	u, err := svc.UpdatePersonalChannel(ctx, owner.ID, 4242)
+	if err != nil {
+		t.Fatalf("UpdatePersonalChannel: %v", err)
+	}
+	if u.PersonalChannelID != 4242 {
+		t.Fatalf("personal channel = %d, want 4242", u.PersonalChannelID)
+	}
+	u, err = svc.UpdatePersonalChannel(ctx, owner.ID, 0)
+	if err != nil {
+		t.Fatalf("clear personal channel: %v", err)
+	}
+	if u.PersonalChannelID != 0 {
+		t.Fatalf("personal channel after clear = %d, want 0", u.PersonalChannelID)
+	}
+}
+
 func TestServiceByIDDoesNotReloadSelf(t *testing.T) {
 	ctx := context.Background()
 	base := memory.NewUserStore()
@@ -109,11 +165,175 @@ func TestServiceByIDDoesNotReloadSelf(t *testing.T) {
 	if err != nil || !found || got.ID != target.ID {
 		t.Fatalf("ByID = %+v found %v err %v, want target", got, found, err)
 	}
-	if store.byIDCalls != 1 {
-		t.Fatalf("store ByID calls = %d, want 1 target lookup only", store.byIDCalls)
+	if store.byIDCalls != 0 {
+		t.Fatalf("store ByID calls = %d, want 0 because service uses batch lookup", store.byIDCalls)
 	}
-	if store.lastByID != target.ID {
-		t.Fatalf("last ByID id = %d, want target %d", store.lastByID, target.ID)
+	if store.byIDsCalls != 1 {
+		t.Fatalf("store ByIDs calls = %d, want 1 target lookup only", store.byIDsCalls)
+	}
+	if len(store.lastByIDs) != 1 || store.lastByIDs[0] != target.ID {
+		t.Fatalf("last ByIDs ids = %v, want target %d only", store.lastByIDs, target.ID)
+	}
+}
+
+func TestServiceUsesBaseCacheWithoutCachingViewerOverlay(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewUserStore()
+	contacts := memory.NewContactStore()
+	owner, err := base.Create(ctx, domain.User{AccessHash: 1, Phone: "15550000001", FirstName: "Owner"})
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	target, err := base.Create(ctx, domain.User{AccessHash: 2, Phone: "15550000002", FirstName: "Target"})
+	if err != nil {
+		t.Fatalf("create target: %v", err)
+	}
+	store := &countingUserStore{UserStore: base}
+	cache := newMemoryBaseUserCache()
+	svc := NewService(store, WithBaseUserCache(cache), WithContactStore(contacts))
+
+	first, found, err := svc.ByID(ctx, owner.ID, target.ID)
+	if err != nil || !found {
+		t.Fatalf("first ByID found=%v err=%v", found, err)
+	}
+	if first.Contact || first.Phone != "" || first.FirstName != "Target" {
+		t.Fatalf("first projected user = %+v, want non-contact base projection", first)
+	}
+	if store.byIDsCalls != 1 {
+		t.Fatalf("store ByIDs calls after first read = %d, want 1", store.byIDsCalls)
+	}
+	if _, err := contacts.Upsert(ctx, owner.ID, domain.ContactInput{
+		ContactUserID: target.ID,
+		Phone:         "15550000002",
+		FirstName:     "Remark",
+		LastName:      "Friend",
+	}); err != nil {
+		t.Fatalf("upsert contact: %v", err)
+	}
+	second, found, err := svc.ByID(ctx, owner.ID, target.ID)
+	if err != nil || !found {
+		t.Fatalf("second ByID found=%v err=%v", found, err)
+	}
+	if !second.Contact || second.FirstName != "Remark" || second.LastName != "Friend" || second.Phone != "15550000002" {
+		t.Fatalf("second projected user = %+v, want fresh contact overlay from cached base", second)
+	}
+	if store.byIDsCalls != 1 {
+		t.Fatalf("store ByIDs calls after cached read = %d, want still 1", store.byIDsCalls)
+	}
+}
+
+func TestServiceRefreshesBaseCacheAfterProfileUpdate(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewUserStore()
+	owner, err := base.Create(ctx, domain.User{AccessHash: 1, Phone: "15550000001", FirstName: "Owner"})
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	target, err := base.Create(ctx, domain.User{AccessHash: 2, Phone: "15550000002", FirstName: "Before"})
+	if err != nil {
+		t.Fatalf("create target: %v", err)
+	}
+	store := &countingUserStore{UserStore: base}
+	cache := newMemoryBaseUserCache()
+	svc := NewService(store, WithBaseUserCache(cache))
+
+	if _, found, err := svc.ByID(ctx, owner.ID, target.ID); err != nil || !found {
+		t.Fatalf("prime cache found=%v err=%v", found, err)
+	}
+	updated, err := svc.UpdateProfile(ctx, target.ID, domain.UserProfileUpdate{FirstName: "After", HasFirstName: true})
+	if err != nil {
+		t.Fatalf("UpdateProfile: %v", err)
+	}
+	if updated.FirstName != "After" {
+		t.Fatalf("updated first name = %q, want After", updated.FirstName)
+	}
+	got, found, err := svc.ByID(ctx, owner.ID, target.ID)
+	if err != nil || !found {
+		t.Fatalf("ByID after update found=%v err=%v", found, err)
+	}
+	if got.FirstName != "After" {
+		t.Fatalf("cached user first name = %q, want After", got.FirstName)
+	}
+}
+
+func TestServiceSetVerifiedRefreshesBaseCache(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewUserStore()
+	owner, err := base.Create(ctx, domain.User{AccessHash: 1, Phone: "15550000021", FirstName: "Owner"})
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	target, err := base.Create(ctx, domain.User{AccessHash: 2, Phone: "15550000022", FirstName: "Target"})
+	if err != nil {
+		t.Fatalf("create target: %v", err)
+	}
+	store := &countingUserStore{UserStore: base}
+	cache := newMemoryBaseUserCache()
+	svc := NewService(store, WithBaseUserCache(cache))
+
+	if _, found, err := svc.ByID(ctx, owner.ID, target.ID); err != nil || !found {
+		t.Fatalf("prime cache found=%v err=%v", found, err)
+	}
+	updated, err := svc.SetVerified(ctx, target.ID, true)
+	if err != nil {
+		t.Fatalf("SetVerified: %v", err)
+	}
+	if !updated.Verified {
+		t.Fatalf("updated verified = false, want true")
+	}
+	got, found, err := svc.ByID(ctx, owner.ID, target.ID)
+	if err != nil || !found {
+		t.Fatalf("ByID after verified found=%v err=%v", found, err)
+	}
+	if !got.Verified {
+		t.Fatalf("cached verified = false, want true")
+	}
+	cleared, err := svc.SetVerified(ctx, target.ID, false)
+	if err != nil {
+		t.Fatalf("clear verified: %v", err)
+	}
+	if cleared.Verified {
+		t.Fatalf("cleared verified = true, want false")
+	}
+}
+
+func TestServiceRefreshesBaseCacheAfterColorUpdate(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewUserStore()
+	owner, err := base.Create(ctx, domain.User{AccessHash: 1, Phone: "15550000001", FirstName: "Owner"})
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	store := &countingUserStore{UserStore: base}
+	cache := newMemoryBaseUserCache()
+	svc := NewService(store, WithBaseUserCache(cache))
+
+	if _, found, err := svc.ByID(ctx, owner.ID, owner.ID); err != nil || !found {
+		t.Fatalf("prime cache found=%v err=%v", found, err)
+	}
+	if store.byIDsCalls != 1 {
+		t.Fatalf("store ByIDs calls after prime = %d, want 1", store.byIDsCalls)
+	}
+	updated, err := svc.UpdateColor(ctx, owner.ID, true, domain.PeerColor{
+		HasColor:          true,
+		Color:             0,
+		BackgroundEmojiID: 123456,
+	})
+	if err != nil {
+		t.Fatalf("UpdateColor: %v", err)
+	}
+	if !updated.ProfileColor.HasColor || updated.ProfileColor.Color != 0 || updated.ProfileColor.BackgroundEmojiID != 123456 {
+		t.Fatalf("updated profile color = %+v, want explicit color=0 bg=123456", updated.ProfileColor)
+	}
+	got, found, err := svc.ByID(ctx, owner.ID, owner.ID)
+	if err != nil || !found {
+		t.Fatalf("ByID after color update found=%v err=%v", found, err)
+	}
+	if store.byIDsCalls != 1 {
+		t.Fatalf("store ByIDs calls after cached color read = %d, want still 1", store.byIDsCalls)
+	}
+	if !got.ProfileColor.HasColor || got.ProfileColor.Color != 0 || got.ProfileColor.BackgroundEmojiID != 123456 {
+		t.Fatalf("cached profile color = %+v, want explicit color=0 bg=123456", got.ProfileColor)
 	}
 }
 
@@ -161,12 +381,54 @@ func TestServiceProjectsUsersForViewerContacts(t *testing.T) {
 
 type countingUserStore struct {
 	*memory.UserStore
-	byIDCalls int
-	lastByID  int64
+	byIDCalls  int
+	byIDsCalls int
+	lastByID   int64
+	lastByIDs  []int64
 }
 
 func (s *countingUserStore) ByID(ctx context.Context, id int64) (domain.User, bool, error) {
 	s.byIDCalls++
 	s.lastByID = id
 	return s.UserStore.ByID(ctx, id)
+}
+
+func (s *countingUserStore) ByIDs(ctx context.Context, ids []int64) ([]domain.User, error) {
+	s.byIDsCalls++
+	s.lastByIDs = append([]int64(nil), ids...)
+	return s.UserStore.ByIDs(ctx, ids)
+}
+
+type memoryBaseUserCache struct {
+	users map[int64]domain.User
+}
+
+func newMemoryBaseUserCache() *memoryBaseUserCache {
+	return &memoryBaseUserCache{users: map[int64]domain.User{}}
+}
+
+func (c *memoryBaseUserCache) GetByIDs(_ context.Context, ids []int64) (map[int64]domain.User, error) {
+	out := make(map[int64]domain.User, len(ids))
+	for _, id := range ids {
+		if u, ok := c.users[id]; ok {
+			out[id] = u
+		}
+	}
+	return out, nil
+}
+
+func (c *memoryBaseUserCache) PutMany(_ context.Context, users []domain.User) error {
+	for _, u := range users {
+		if u.ID != 0 {
+			c.users[u.ID] = u
+		}
+	}
+	return nil
+}
+
+func (c *memoryBaseUserCache) Delete(_ context.Context, ids []int64) error {
+	for _, id := range ids {
+		delete(c.users, id)
+	}
+	return nil
 }

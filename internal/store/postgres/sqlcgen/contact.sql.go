@@ -7,6 +7,8 @@ package sqlcgen
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const deleteContacts = `-- name: DeleteContacts :one
@@ -45,6 +47,7 @@ const getContact = `-- name: GetContact :one
 SELECT
   c.contact_user_id,
   c.mutual,
+  c.close_friend,
   c.contact_phone,
   c.contact_first_name,
   c.contact_last_name,
@@ -59,6 +62,11 @@ SELECT
   u.country_code,
   u.verified,
   u.support,
+  u.is_bot,
+  u.bot_info_version,
+  u.premium_expires_at,
+  u.emoji_status_document_id,
+  u.emoji_status_until,
   u.last_seen_at
 FROM contacts c
 JOIN users u ON u.id = c.contact_user_id
@@ -72,23 +80,29 @@ type GetContactParams struct {
 }
 
 type GetContactRow struct {
-	ContactUserID    int64
-	Mutual           bool
-	ContactPhone     string
-	ContactFirstName string
-	ContactLastName  string
-	Note             string
-	NoteEntitiesJson string
-	ID               int64
-	AccessHash       int64
-	Phone            string
-	FirstName        string
-	LastName         string
-	Username         string
-	CountryCode      string
-	Verified         bool
-	Support          bool
-	LastSeenAt       int64
+	ContactUserID         int64
+	Mutual                bool
+	CloseFriend           bool
+	ContactPhone          string
+	ContactFirstName      string
+	ContactLastName       string
+	Note                  string
+	NoteEntitiesJson      string
+	ID                    int64
+	AccessHash            int64
+	Phone                 string
+	FirstName             string
+	LastName              string
+	Username              string
+	CountryCode           string
+	Verified              bool
+	Support               bool
+	IsBot                 bool
+	BotInfoVersion        int32
+	PremiumExpiresAt      pgtype.Timestamptz
+	EmojiStatusDocumentID int64
+	EmojiStatusUntil      int64
+	LastSeenAt            int64
 }
 
 func (q *Queries) GetContact(ctx context.Context, arg GetContactParams) (GetContactRow, error) {
@@ -97,6 +111,7 @@ func (q *Queries) GetContact(ctx context.Context, arg GetContactParams) (GetCont
 	err := row.Scan(
 		&i.ContactUserID,
 		&i.Mutual,
+		&i.CloseFriend,
 		&i.ContactPhone,
 		&i.ContactFirstName,
 		&i.ContactLastName,
@@ -111,6 +126,11 @@ func (q *Queries) GetContact(ctx context.Context, arg GetContactParams) (GetCont
 		&i.CountryCode,
 		&i.Verified,
 		&i.Support,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
 		&i.LastSeenAt,
 	)
 	return i, err
@@ -120,6 +140,7 @@ const listContactsByUser = `-- name: ListContactsByUser :many
 SELECT
   c.contact_user_id,
   c.mutual,
+  c.close_friend,
   c.contact_phone,
   c.contact_first_name,
   c.contact_last_name,
@@ -134,6 +155,11 @@ SELECT
   u.country_code,
   u.verified,
   u.support,
+  u.is_bot,
+  u.bot_info_version,
+  u.premium_expires_at,
+  u.emoji_status_document_id,
+  u.emoji_status_until,
   u.last_seen_at
 FROM contacts c
 JOIN users u ON u.id = c.contact_user_id
@@ -142,23 +168,29 @@ ORDER BY c.contact_first_name, c.contact_last_name, u.first_name, u.last_name, u
 `
 
 type ListContactsByUserRow struct {
-	ContactUserID    int64
-	Mutual           bool
-	ContactPhone     string
-	ContactFirstName string
-	ContactLastName  string
-	Note             string
-	NoteEntitiesJson string
-	ID               int64
-	AccessHash       int64
-	Phone            string
-	FirstName        string
-	LastName         string
-	Username         string
-	CountryCode      string
-	Verified         bool
-	Support          bool
-	LastSeenAt       int64
+	ContactUserID         int64
+	Mutual                bool
+	CloseFriend           bool
+	ContactPhone          string
+	ContactFirstName      string
+	ContactLastName       string
+	Note                  string
+	NoteEntitiesJson      string
+	ID                    int64
+	AccessHash            int64
+	Phone                 string
+	FirstName             string
+	LastName              string
+	Username              string
+	CountryCode           string
+	Verified              bool
+	Support               bool
+	IsBot                 bool
+	BotInfoVersion        int32
+	PremiumExpiresAt      pgtype.Timestamptz
+	EmojiStatusDocumentID int64
+	EmojiStatusUntil      int64
+	LastSeenAt            int64
 }
 
 func (q *Queries) ListContactsByUser(ctx context.Context, userID int64) ([]ListContactsByUserRow, error) {
@@ -173,6 +205,7 @@ func (q *Queries) ListContactsByUser(ctx context.Context, userID int64) ([]ListC
 		if err := rows.Scan(
 			&i.ContactUserID,
 			&i.Mutual,
+			&i.CloseFriend,
 			&i.ContactPhone,
 			&i.ContactFirstName,
 			&i.ContactLastName,
@@ -187,6 +220,11 @@ func (q *Queries) ListContactsByUser(ctx context.Context, userID int64) ([]ListC
 			&i.CountryCode,
 			&i.Verified,
 			&i.Support,
+			&i.IsBot,
+			&i.BotInfoVersion,
+			&i.PremiumExpiresAt,
+			&i.EmojiStatusDocumentID,
+			&i.EmojiStatusUntil,
 			&i.LastSeenAt,
 		); err != nil {
 			return nil, err
@@ -207,11 +245,12 @@ WITH updated AS (
       updated_at = now()
   WHERE c.user_id = $3::bigint
     AND c.contact_user_id = $4::bigint
-  RETURNING user_id, contact_user_id, mutual, created_at, updated_at, contact_phone, contact_first_name, contact_last_name, note, note_entities, close_friend, stories_hidden
+  RETURNING user_id, contact_user_id, mutual, created_at, updated_at, contact_phone, contact_first_name, contact_last_name, note, note_entities, close_friend, stories_hidden, personal_photo_id, personal_photo_date
 )
 SELECT
   c.contact_user_id,
   c.mutual,
+  c.close_friend,
   c.contact_phone,
   c.contact_first_name,
   c.contact_last_name,
@@ -226,6 +265,11 @@ SELECT
   u.country_code,
   u.verified,
   u.support,
+  u.is_bot,
+  u.bot_info_version,
+  u.premium_expires_at,
+  u.emoji_status_document_id,
+  u.emoji_status_until,
   u.last_seen_at
 FROM updated c
 JOIN users u ON u.id = c.contact_user_id
@@ -239,23 +283,29 @@ type UpdateContactNoteParams struct {
 }
 
 type UpdateContactNoteRow struct {
-	ContactUserID    int64
-	Mutual           bool
-	ContactPhone     string
-	ContactFirstName string
-	ContactLastName  string
-	Note             string
-	NoteEntitiesJson string
-	ID               int64
-	AccessHash       int64
-	Phone            string
-	FirstName        string
-	LastName         string
-	Username         string
-	CountryCode      string
-	Verified         bool
-	Support          bool
-	LastSeenAt       int64
+	ContactUserID         int64
+	Mutual                bool
+	CloseFriend           bool
+	ContactPhone          string
+	ContactFirstName      string
+	ContactLastName       string
+	Note                  string
+	NoteEntitiesJson      string
+	ID                    int64
+	AccessHash            int64
+	Phone                 string
+	FirstName             string
+	LastName              string
+	Username              string
+	CountryCode           string
+	Verified              bool
+	Support               bool
+	IsBot                 bool
+	BotInfoVersion        int32
+	PremiumExpiresAt      pgtype.Timestamptz
+	EmojiStatusDocumentID int64
+	EmojiStatusUntil      int64
+	LastSeenAt            int64
 }
 
 func (q *Queries) UpdateContactNote(ctx context.Context, arg UpdateContactNoteParams) (UpdateContactNoteRow, error) {
@@ -269,6 +319,7 @@ func (q *Queries) UpdateContactNote(ctx context.Context, arg UpdateContactNotePa
 	err := row.Scan(
 		&i.ContactUserID,
 		&i.Mutual,
+		&i.CloseFriend,
 		&i.ContactPhone,
 		&i.ContactFirstName,
 		&i.ContactLastName,
@@ -283,6 +334,11 @@ func (q *Queries) UpdateContactNote(ctx context.Context, arg UpdateContactNotePa
 		&i.CountryCode,
 		&i.Verified,
 		&i.Support,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
 		&i.LastSeenAt,
 	)
 	return i, err
@@ -326,7 +382,7 @@ upserted AS (
     note_entities = EXCLUDED.note_entities,
     mutual = contacts.mutual OR EXCLUDED.mutual,
     updated_at = now()
-  RETURNING user_id, contact_user_id, mutual, created_at, updated_at, contact_phone, contact_first_name, contact_last_name, note, note_entities, close_friend, stories_hidden
+  RETURNING user_id, contact_user_id, mutual, created_at, updated_at, contact_phone, contact_first_name, contact_last_name, note, note_entities, close_friend, stories_hidden, personal_photo_id, personal_photo_date
 ),
 reverse_updated AS (
   UPDATE contacts c
@@ -340,6 +396,7 @@ reverse_updated AS (
 SELECT
   c.contact_user_id,
   c.mutual,
+  c.close_friend,
   c.contact_phone,
   c.contact_first_name,
   c.contact_last_name,
@@ -354,6 +411,11 @@ SELECT
   u.country_code,
   u.verified,
   u.support,
+  u.is_bot,
+  u.bot_info_version,
+  u.premium_expires_at,
+  u.emoji_status_document_id,
+  u.emoji_status_until,
   u.last_seen_at,
   EXISTS (SELECT 1 FROM reverse_updated)::boolean AS reverse_mutual_changed
 FROM upserted c
@@ -371,24 +433,30 @@ type UpsertContactParams struct {
 }
 
 type UpsertContactRow struct {
-	ContactUserID        int64
-	Mutual               bool
-	ContactPhone         string
-	ContactFirstName     string
-	ContactLastName      string
-	Note                 string
-	NoteEntitiesJson     string
-	ID                   int64
-	AccessHash           int64
-	Phone                string
-	FirstName            string
-	LastName             string
-	Username             string
-	CountryCode          string
-	Verified             bool
-	Support              bool
-	LastSeenAt           int64
-	ReverseMutualChanged bool
+	ContactUserID         int64
+	Mutual                bool
+	CloseFriend           bool
+	ContactPhone          string
+	ContactFirstName      string
+	ContactLastName       string
+	Note                  string
+	NoteEntitiesJson      string
+	ID                    int64
+	AccessHash            int64
+	Phone                 string
+	FirstName             string
+	LastName              string
+	Username              string
+	CountryCode           string
+	Verified              bool
+	Support               bool
+	IsBot                 bool
+	BotInfoVersion        int32
+	PremiumExpiresAt      pgtype.Timestamptz
+	EmojiStatusDocumentID int64
+	EmojiStatusUntil      int64
+	LastSeenAt            int64
+	ReverseMutualChanged  bool
 }
 
 func (q *Queries) UpsertContact(ctx context.Context, arg UpsertContactParams) (UpsertContactRow, error) {
@@ -405,6 +473,7 @@ func (q *Queries) UpsertContact(ctx context.Context, arg UpsertContactParams) (U
 	err := row.Scan(
 		&i.ContactUserID,
 		&i.Mutual,
+		&i.CloseFriend,
 		&i.ContactPhone,
 		&i.ContactFirstName,
 		&i.ContactLastName,
@@ -419,6 +488,11 @@ func (q *Queries) UpsertContact(ctx context.Context, arg UpsertContactParams) (U
 		&i.CountryCode,
 		&i.Verified,
 		&i.Support,
+		&i.IsBot,
+		&i.BotInfoVersion,
+		&i.PremiumExpiresAt,
+		&i.EmojiStatusDocumentID,
+		&i.EmojiStatusUntil,
 		&i.LastSeenAt,
 		&i.ReverseMutualChanged,
 	)

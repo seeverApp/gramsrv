@@ -24,6 +24,13 @@ func rateLimitKey(key string) string {
 }
 
 func (l *RateLimiter) Allow(ctx context.Context, key string, limit int, window time.Duration) (bool, int, error) {
+	return l.AllowN(ctx, key, 1, limit, window)
+}
+
+func (l *RateLimiter) AllowN(ctx context.Context, key string, cost, limit int, window time.Duration) (bool, int, error) {
+	if cost <= 0 {
+		return true, 0, nil
+	}
 	if limit <= 0 {
 		return true, 0, nil
 	}
@@ -34,11 +41,11 @@ func (l *RateLimiter) Allow(ctx context.Context, key string, limit int, window t
 		return false, 0, fmt.Errorf("redis rate limiter: nil client")
 	}
 	redisKey := rateLimitKey(key)
-	count, err := l.c.Incr(ctx, redisKey).Result()
+	count, err := l.c.IncrBy(ctx, redisKey, int64(cost)).Result()
 	if err != nil {
-		return false, 0, fmt.Errorf("redis incr rate limit: %w", err)
+		return false, 0, fmt.Errorf("redis incrby rate limit: %w", err)
 	}
-	if count == 1 {
+	if count == int64(cost) {
 		if err := l.c.Expire(ctx, redisKey, window).Err(); err != nil {
 			return false, 0, fmt.Errorf("redis expire rate limit: %w", err)
 		}

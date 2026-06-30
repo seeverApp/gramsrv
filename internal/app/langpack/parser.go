@@ -13,7 +13,7 @@ import (
 
 var tdesktopStringRE = regexp.MustCompile(`(?s)"((?:\\.|[^"\\])*)"\s*=\s*"((?:\\.|[^"\\])*)";`)
 
-// ParseTDesktopFile 解析 TDesktop .strings 文件为 domain 语言包。
+// ParseTDesktopFile 解析客户端 .strings 文件为 domain 语言包。
 func ParseTDesktopFile(path string) (domain.LangPack, error) {
 	pack, err := packFromFilename(path)
 	if err != nil {
@@ -21,7 +21,7 @@ func ParseTDesktopFile(path string) (domain.LangPack, error) {
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return domain.LangPack{}, fmt.Errorf("read tdesktop langpack %q: %w", path, err)
+		return domain.LangPack{}, fmt.Errorf("read langpack %q: %w", path, err)
 	}
 
 	plain := make([]domain.LangPackString, 0)
@@ -54,22 +54,37 @@ func ParseTDesktopFile(path string) (domain.LangPack, error) {
 
 func packFromFilename(path string) (domain.LangPack, error) {
 	name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	const prefix = "tdesktop_"
-	if !strings.HasPrefix(name, prefix) {
-		return domain.LangPack{}, fmt.Errorf("invalid tdesktop langpack filename %q", filepath.Base(path))
+	idx := strings.LastIndex(name, "_v")
+	if idx <= 0 || idx+2 >= len(name) {
+		return domain.LangPack{}, fmt.Errorf("invalid langpack filename %q", filepath.Base(path))
 	}
-	rest := strings.TrimPrefix(name, prefix)
-	idx := strings.LastIndex(rest, "_v")
-	if idx <= 0 || idx+2 >= len(rest) {
-		return domain.LangPack{}, fmt.Errorf("invalid tdesktop langpack filename %q", filepath.Base(path))
-	}
-	version, err := strconv.Atoi(rest[idx+2:])
+	version, err := strconv.Atoi(name[idx+2:])
 	if err != nil {
-		return domain.LangPack{}, fmt.Errorf("parse langpack version %q: %w", rest[idx+2:], err)
+		return domain.LangPack{}, fmt.Errorf("parse langpack version %q: %w", name[idx+2:], err)
+	}
+
+	head := name[:idx]
+	dirPack := filepath.Base(filepath.Dir(path))
+	prefix := dirPack + "_"
+	langPack := ""
+	langCode := ""
+	if dirPack != "." && dirPack != "" && strings.HasPrefix(head, prefix) {
+		langPack = dirPack
+		langCode = strings.TrimPrefix(head, prefix)
+	} else {
+		sep := strings.Index(head, "_")
+		if sep <= 0 || sep+1 >= len(head) {
+			return domain.LangPack{}, fmt.Errorf("invalid langpack filename %q", filepath.Base(path))
+		}
+		langPack = head[:sep]
+		langCode = head[sep+1:]
+	}
+	if langPack == "" || langCode == "" {
+		return domain.LangPack{}, fmt.Errorf("invalid langpack filename %q", filepath.Base(path))
 	}
 	return domain.LangPack{
-		LangPack: "tdesktop",
-		LangCode: rest[:idx],
+		LangPack: langPack,
+		LangCode: langCode,
 		Version:  version,
 	}, nil
 }

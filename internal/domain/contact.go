@@ -12,12 +12,19 @@ type Contact struct {
 	Note         string
 	NoteEntities []MessageEntity
 	Mutual       bool
+	CloseFriend  bool
 }
 
 // ContactList 是通讯录查询结果。
 type ContactList struct {
 	Contacts []Contact
 	Hash     int64
+}
+
+// CloseFriendsEditResult describes a full close-friends list replacement.
+type CloseFriendsEditResult struct {
+	AddedUserIDs   []int64
+	RemovedUserIDs []int64
 }
 
 // BlockedContact is one owner-visible blocked peer.
@@ -74,4 +81,8 @@ type PeerSettings struct {
 	ShareContact          bool
 	NeedContactsException bool
 	HiddenPeerSettingsBar bool
+	BusinessBotID         int64
+	BusinessBotManageURL  string
+	BusinessBotPaused     bool
+	BusinessBotCanReply   bool
 }

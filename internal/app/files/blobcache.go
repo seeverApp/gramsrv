@@ -2,10 +2,73 @@ package files
 
 import (
 	"container/list"
+	"strconv"
 	"sync"
+	"time"
 
 	"telesrv/internal/domain"
 )
+
+// stickerSetNegativeCache 是「按 ref 查不到的贴纸集」的短 TTL 负缓存。未 seed 的 short_name
+// 集合会被客户端反复 getStickerSet（每次都打一发 PG GetStickerSetByShortName），这里缓存
+// not-found 结果，TTL 内直接短路、不再查库。TTL 短（自愈）：运营/运行时新增的集合最多 TTL 后
+// 才被解析，避免负缓存长期遮住真实存在的集合。
+type stickerSetNegativeCache struct {
+	mu      sync.Mutex
+	ttl     time.Duration
+	entries map[string]time.Time
+}
+
+const stickerSetNegativeCacheMaxEntries = 100000
+
+func newStickerSetNegativeCache(ttl time.Duration) *stickerSetNegativeCache {
+	return &stickerSetNegativeCache{ttl: ttl, entries: map[string]time.Time{}}
+}
+
+func stickerSetRefKey(ref domain.StickerSetRef) string {
+	switch ref.Kind {
+	case domain.StickerSetRefByID:
+		return "id:" + strconv.FormatInt(ref.ID, 10)
+	case domain.StickerSetRefByShortName:
+		return "short:" + ref.ShortName
+	case domain.StickerSetRefBySystem:
+		return "sys:" + ref.SystemKey
+	default:
+		return ""
+	}
+}
+
+func (c *stickerSetNegativeCache) has(ref domain.StickerSetRef) bool {
+	key := stickerSetRefKey(ref)
+	if key == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	exp, ok := c.entries[key]
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		delete(c.entries, key)
+		return false
+	}
+	return true
+}
+
+func (c *stickerSetNegativeCache) put(ref domain.StickerSetRef) {
+	key := stickerSetRefKey(ref)
+	if key == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// 简单上限防无界增长：超限整表清空（短 TTL 下冷启代价可忽略）。
+	if len(c.entries) >= stickerSetNegativeCacheMaxEntries {
+		c.entries = make(map[string]time.Time, 1024)
+	}
+	c.entries[key] = time.Now().Add(c.ttl)
+}
 
 // blobMetaCache 是 location_key → FileBlob 元数据的进程内 LRU，用于消除 upload.getFile
 // 每个 chunk 一次 GetFileBlob 的 PG 往返（一个文件按 ≤512KB/1MB 分多次 getFile，热门贴纸/

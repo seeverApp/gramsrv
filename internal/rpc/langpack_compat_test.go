@@ -24,7 +24,7 @@ func TestLangpackGetLanguagesCurrentAndLegacy(t *testing.T) {
 
 	t.Run("legacy android no args", func(t *testing.T) {
 		var in bin.Buffer
-		in.PutID(legacyLangpackGetLanguagesTypeID)
+		in.PutID(0x800fd57d)
 		ctx := WithClientInfo(context.Background(), ClientInfo{
 			DeviceModel: "Android",
 			AppVersion:  "12.7.3",
@@ -34,11 +34,35 @@ func TestLangpackGetLanguagesCurrentAndLegacy(t *testing.T) {
 	})
 }
 
+func TestLangpackGetLanguage(t *testing.T) {
+	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{}, zaptest.NewLogger(t), clock.System)
+
+	var in bin.Buffer
+	if err := (&tg.LangpackGetLanguageRequest{LangPack: "tdesktop", LangCode: "zh-hans"}).Encode(&in); err != nil {
+		t.Fatalf("encode request: %v", err)
+	}
+	enc, err := r.Dispatch(context.Background(), [8]byte{}, 0, &in)
+	if err != nil {
+		t.Fatalf("dispatch langpack.getLanguage: %v", err)
+	}
+	var out bin.Buffer
+	if err := enc.Encode(&out); err != nil {
+		t.Fatalf("encode response: %v", err)
+	}
+	var lang tg.LangPackLanguage
+	if err := lang.Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if lang.LangCode != "zh-hans" || lang.PluralCode != "zh" {
+		t.Fatalf("language = %+v, want zh-hans", lang)
+	}
+}
+
 func TestLegacyLangpackGetLangPack(t *testing.T) {
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{}, zaptest.NewLogger(t), clock.System)
 
 	var in bin.Buffer
-	in.PutID(legacyLangpackGetLangPackTypeID)
+	in.PutID(0x9ab5c58e)
 	in.PutString("en")
 	enc, err := r.Dispatch(androidClientContext(), [8]byte{}, 0, &in)
 	if err != nil {
@@ -61,7 +85,7 @@ func TestLegacyLangpackGetStrings(t *testing.T) {
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{}, zaptest.NewLogger(t), clock.System)
 
 	var in bin.Buffer
-	in.PutID(legacyLangpackGetStringsTypeID)
+	in.PutID(0x2e1ee318)
 	in.PutString("en")
 	in.PutVectorHeader(1)
 	in.PutString("lng_intro_about")
@@ -85,7 +109,7 @@ func TestLegacyUpdatesGetDifference(t *testing.T) {
 	var flags bin.Fields
 	flags.Set(0)
 	var in bin.Buffer
-	in.PutID(legacyUpdatesGetDifferenceTypeID)
+	in.PutID(0x25939651)
 	if err := flags.Encode(&in); err != nil {
 		t.Fatalf("encode flags: %v", err)
 	}
@@ -112,7 +136,7 @@ func TestLegacyAccountRegisterDevice(t *testing.T) {
 	r := New(Config{DC: 2, IP: "127.0.0.1", Port: 2398}, Deps{}, zaptest.NewLogger(t), clock.System)
 
 	var in bin.Buffer
-	in.PutID(legacyAccountRegisterDeviceTypeID)
+	in.PutID(0x637ea878)
 	in.PutInt(2)
 	in.PutString("android-fcm-token")
 

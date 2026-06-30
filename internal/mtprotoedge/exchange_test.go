@@ -10,6 +10,7 @@ import (
 
 	"go.uber.org/zap/zaptest"
 
+	"github.com/gotd/log/logzap"
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/mt"
@@ -64,7 +65,7 @@ func TestKeyExchange(t *testing.T) {
 	defer ec()
 	res, err := exchange.NewExchanger(conn, dc).
 		WithRand(rand.Reader).
-		WithLogger(zaptest.NewLogger(t).Named("client")).
+		WithLogger(logzap.New(zaptest.NewLogger(t).Named("client"))).
 		Client([]exchange.PublicKey{pub}).
 		Run(exchCtx)
 	if err != nil {
@@ -144,7 +145,7 @@ func TestKeyExchangeIgnoresUnencryptedMsgsAck(t *testing.T) {
 	defer ec()
 	res, err := exchange.NewExchanger(&ackingExchangeConn{Conn: conn, t: t}, dc).
 		WithRand(rand.Reader).
-		WithLogger(zaptest.NewLogger(t).Named("client")).
+		WithLogger(logzap.New(zaptest.NewLogger(t).Named("client"))).
 		Client([]exchange.PublicKey{pub}).
 		Run(exchCtx)
 	if err != nil {

@@ -18,7 +18,19 @@ type WarmStats struct {
 // SeedMedia 在已有数据时会跳过导入；该方法保证普通 server 重启后历史 sticker 首次渲染也不是冷缓存。
 func (s *Service) WarmCaches(ctx context.Context) (WarmStats, error) {
 	var stats WarmStats
+	// 第一阶段：收集所有待预热文档（贴纸集 + reaction），按 doc ID 去重。
 	seenDocs := make(map[int64]struct{})
+	docs := make([]domain.Document, 0, 256)
+	collect := func(doc domain.Document) {
+		if doc.ID == 0 {
+			return
+		}
+		if _, ok := seenDocs[doc.ID]; ok {
+			return
+		}
+		seenDocs[doc.ID] = struct{}{}
+		docs = append(docs, doc)
+	}
 	for _, kind := range []domain.StickerSetKind{
 		domain.StickerSetKindStickers,
 		domain.StickerSetKindEmoji,
@@ -30,24 +42,15 @@ func (s *Service) WarmCaches(ctx context.Context) (WarmStats, error) {
 			return stats, err
 		}
 		for _, set := range sets {
-			docs, err := s.media.GetDocuments(ctx, set.DocumentIDs)
+			setDocs, err := s.media.GetDocuments(ctx, set.DocumentIDs)
 			if err != nil {
 				return stats, err
 			}
-			ordered := orderDocuments(docs, set.DocumentIDs)
+			ordered := orderDocuments(setDocs, set.DocumentIDs)
 			s.stickerSetCache.put(set, ordered)
 			stats.StickerSets++
 			for _, doc := range ordered {
-				if _, ok := seenDocs[doc.ID]; ok {
-					continue
-				}
-				seenDocs[doc.ID] = struct{}{}
-				stats.Documents++
-				warmed, err := s.prewarmDocumentBlobs(ctx, doc)
-				if err != nil {
-					return stats, err
-				}
-				stats.Blobs += warmed
+				collect(doc)
 			}
 		}
 	}
@@ -59,68 +62,62 @@ func (s *Service) WarmCaches(ctx context.Context) (WarmStats, error) {
 	for _, reaction := range reactions {
 		reactionIDs = append(reactionIDs, reaction.DocumentIDs()...)
 	}
-	docs, err := s.media.GetDocuments(ctx, reactionIDs)
+	reactionDocs, err := s.media.GetDocuments(ctx, reactionIDs)
 	if err != nil {
 		return stats, err
 	}
+	for _, doc := range reactionDocs {
+		collect(doc)
+	}
+	stats.Documents = len(docs)
+
+	// 第二阶段：一发 ANY 查询批量取所有 location key 的 blob 元数据，替代过去逐个
+	// GetFileBlob 的启动期 N+1（~2400 个 blob 各打一次 PG → 一次往返）。
+	keys := make([]string, 0, len(docs)*2)
 	for _, doc := range docs {
-		if _, ok := seenDocs[doc.ID]; ok {
+		keys = append(keys, blobLocationKeys(doc)...)
+	}
+	blobs, err := s.media.GetFileBlobs(ctx, keys)
+	if err != nil {
+		return stats, err
+	}
+	// 第三阶段：填充元数据缓存，并把小 blob 的全量字节读入字节缓存（blob backend 读，非 PG）。
+	for _, key := range keys {
+		blob, ok := blobs[key]
+		if !ok {
 			continue
 		}
-		seenDocs[doc.ID] = struct{}{}
-		stats.Documents++
-		warmed, err := s.prewarmDocumentBlobs(ctx, doc)
+		s.blobCache.put(key, blob)
+		warmed, err := s.warmBlobBytes(ctx, blob)
 		if err != nil {
 			return stats, err
 		}
-		stats.Blobs += warmed
+		if warmed {
+			stats.Blobs++
+		}
 	}
 	return stats, nil
 }
 
-func (s *Service) prewarmDocumentBlobs(ctx context.Context, doc domain.Document) (int, error) {
+// blobLocationKeys 返回一个文档需预热的全部 location key（主体 + 可下载缩略图）。
+func blobLocationKeys(doc domain.Document) []string {
 	if doc.ID == 0 {
-		return 0, nil
+		return nil
 	}
-	warmed := 0
-	ok, err := s.prewarmLocationKey(ctx, fmt.Sprintf("doc:%d", doc.ID))
-	if err != nil {
-		return 0, err
-	}
-	if ok {
-		warmed++
-	}
+	keys := make([]string, 0, 1+len(doc.Thumbs))
+	keys = append(keys, fmt.Sprintf("doc:%d", doc.ID))
 	for _, thumb := range doc.Thumbs {
 		if !thumb.Downloadable() {
 			continue
 		}
-		ok, err := s.prewarmLocationKey(ctx, fmt.Sprintf("doc:%d:%s", doc.ID, thumb.Type))
-		if err != nil {
-			return 0, err
-		}
-		if ok {
-			warmed++
-		}
+		keys = append(keys, fmt.Sprintf("doc:%d:%s", doc.ID, thumb.Type))
 	}
-	return warmed, nil
+	return keys
 }
 
-func (s *Service) prewarmLocationKey(ctx context.Context, locationKey string) (bool, error) {
-	blob, ok := s.blobCache.get(locationKey)
-	if !ok {
-		var (
-			found bool
-			err   error
-		)
-		blob, found, err = s.media.GetFileBlob(ctx, locationKey)
-		if err != nil {
-			return false, err
-		}
-		if !found {
-			return false, nil
-		}
-		s.blobCache.put(locationKey, blob)
-	}
+// warmBlobBytes 把小 blob 的全量字节读入 byteCache（大 blob 跳过，仍由 GetRange 分段读）。
+// 返回是否实际写入了字节缓存。
+func (s *Service) warmBlobBytes(ctx context.Context, blob domain.FileBlob) (bool, error) {
 	if blob.Size <= 0 || blob.Size > blobBytesCacheMaxEntryBytes || s.byteCache.has(blob.ObjectKey) {
 		return false, nil
 	}

@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"fmt"
 	"net"
 	"testing"
 	"time"
 
 	"go.uber.org/zap/zaptest"
 
+	"github.com/gotd/log/logzap"
 	"github.com/gotd/td/clock"
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/session"
@@ -56,9 +58,12 @@ func TestLoginRegisterFlow(t *testing.T) {
 	authzStore := memory.NewAuthorizationStore()
 	authKeyStore := memory.NewAuthKeyStore()
 	helpStore := memory.NewHelpStore()
+	// seed hash 必须高于 help service 的代码默认 hash（低于默认值的 store 行会被
+	// 视为陈旧 seed 残留而被默认 config 覆盖），否则断言拿到的是默认 config。
+	const seedAppConfigHash = 1_000_000
 	if err := helpStore.UpsertAppConfig(context.Background(), domain.AppConfig{
 		Client: "tdesktop",
-		Hash:   4,
+		Hash:   seedAppConfigHash,
 		JSON:   []byte(`{"chat_read_mark_expire_period":604800,"chat_read_mark_size_threshold":50,"pm_read_date_expire_period":604800,"quote_length_max":1024,"telegram_antispam_group_size_min":200,"telegram_antispam_user_id":"5434988373"}`),
 	}); err != nil {
 		t.Fatalf("seed app config: %v", err)
@@ -99,7 +104,7 @@ func TestLoginRegisterFlow(t *testing.T) {
 		PublicKeys:     []exchange.PublicKey{{RSA: &rsaKey.PublicKey}},
 		Resolver:       dcs.Plain(dcs.PlainOptions{Protocol: transport.Intermediate}),
 		DCList:         dcs.List{Options: []tg.DCOption{{ID: dc, IPAddress: tcpAddr.IP.String(), Port: tcpAddr.Port, Static: true}}},
-		Logger:         zaptest.NewLogger(t).Named("client"),
+		Logger:         logzap.New(zaptest.NewLogger(t).Named("client")),
 		SessionStorage: &session.StorageMemory{},
 		UpdateHandler:  telegram.UpdateHandlerFunc(func(context.Context, tg.UpdatesClass) error { return nil }),
 	}
@@ -180,8 +185,10 @@ func TestLoginRegisterFlow(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if cfg, ok := appConfig.(*tg.HelpAppConfig); !ok || cfg.Hash != 4 {
-			t.Fatalf("help.getAppConfig = %T %+v, want hash=4 config", appConfig, appConfig)
+		// 注意：client.Run 回调里 t.Fatalf 只会杀当前 goroutine、测试主协程
+		// 会等到 ctx 超时——断言失败用 return fmt.Errorf 让 Run 立即返回。
+		if cfg, ok := appConfig.(*tg.HelpAppConfig); !ok || cfg.Hash != seedAppConfigHash {
+			return fmt.Errorf("help.getAppConfig = %T %+v, want seeded hash=%d config", appConfig, appConfig, seedAppConfigHash)
 		}
 		countriesRes, err := raw.HelpGetCountriesList(ctx, &tg.HelpGetCountriesListRequest{LangCode: "en"})
 		if err != nil {
@@ -319,7 +326,7 @@ func TestPrivateMessageRoundTripFlow(t *testing.T) {
 			PublicKeys:     []exchange.PublicKey{{RSA: &rsaKey.PublicKey}},
 			Resolver:       dcs.Plain(dcs.PlainOptions{Protocol: transport.Intermediate}),
 			DCList:         dcs.List{Options: []tg.DCOption{{ID: dc, IPAddress: tcpAddr.IP.String(), Port: tcpAddr.Port, Static: true}}},
-			Logger:         zaptest.NewLogger(t).Named("client"),
+			Logger:         logzap.New(zaptest.NewLogger(t).Named("client")),
 			SessionStorage: storage,
 			UpdateHandler:  telegram.UpdateHandlerFunc(func(context.Context, tg.UpdatesClass) error { return nil }),
 		}

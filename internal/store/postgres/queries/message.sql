@@ -81,6 +81,8 @@ INSERT INTO private_messages (
   recipient_user_id,
   random_id,
   message_date,
+  ttl_period,
+  expires_at,
   body,
   entities,
   silent,
@@ -89,6 +91,7 @@ INSERT INTO private_messages (
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities,
   quote_offset,
@@ -96,15 +99,21 @@ INSERT INTO private_messages (
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
-  media
+  media,
+  reply_markup,
+  rich_message,
+  via_bot_id,
+  grouped_id,
+  effect
 ) VALUES (
-  $1, $2, $3, $4, $5, sqlc.arg(entities_json)::jsonb,
+  $1, $2, $3, $4, sqlc.arg(ttl_period)::int, sqlc.arg(expires_at)::int, $5, sqlc.arg(entities_json)::jsonb,
   sqlc.arg(silent)::boolean,
   sqlc.arg(noforwards)::boolean,
   sqlc.arg(reply_to_msg_id)::int,
   sqlc.arg(reply_to_peer_type)::text,
   sqlc.arg(reply_to_peer_id)::bigint,
   sqlc.arg(reply_to_top_id)::int,
+  sqlc.arg(reply_to_story_id)::int,
   sqlc.arg(quote_text)::text,
   sqlc.arg(quote_entities_json)::jsonb,
   sqlc.arg(quote_offset)::int,
@@ -112,7 +121,12 @@ INSERT INTO private_messages (
   sqlc.arg(fwd_from_peer_id)::bigint,
   sqlc.arg(fwd_from_name)::text,
   sqlc.arg(fwd_date)::int,
-  sqlc.arg(media_json)::jsonb
+  sqlc.arg(media_json)::jsonb,
+  sqlc.arg(reply_markup_json)::jsonb,
+  sqlc.arg(rich_message_json)::jsonb,
+  sqlc.arg(via_bot_id)::bigint,
+  sqlc.arg(grouped_id)::bigint,
+  sqlc.arg(effect)::bigint
 )
 ON CONFLICT (sender_user_id, random_id) WHERE random_id <> 0 DO NOTHING
 RETURNING
@@ -121,6 +135,8 @@ RETURNING
   recipient_user_id,
   random_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   body,
   entities::text AS entities_json;
@@ -132,6 +148,8 @@ SELECT
   recipient_user_id,
   random_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   body,
   entities::text AS entities_json
@@ -150,6 +168,8 @@ INSERT INTO message_boxes (
   peer_id,
   from_user_id,
   message_date,
+  ttl_period,
+  expires_at,
   outgoing,
   body,
   entities,
@@ -159,6 +179,7 @@ INSERT INTO message_boxes (
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities,
   quote_offset,
@@ -166,18 +187,32 @@ INSERT INTO message_boxes (
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
   pts,
   media,
   media_unread,
-  reaction_unread
+  reaction_unread,
+  reply_markup,
+  rich_message,
+  via_bot_id,
+  grouped_id,
+  effect
 ) VALUES (
-  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, sqlc.arg(entities_json)::jsonb,
+  $1, $2, $3, $4, $5, $6, $7, $8,
+  sqlc.arg(ttl_period)::int,
+  sqlc.arg(expires_at)::int,
+  $9, $10, sqlc.arg(entities_json)::jsonb,
   sqlc.arg(silent)::boolean,
   sqlc.arg(noforwards)::boolean,
   sqlc.arg(reply_to_msg_id)::int,
   sqlc.arg(reply_to_peer_type)::text,
   sqlc.arg(reply_to_peer_id)::bigint,
   sqlc.arg(reply_to_top_id)::int,
+  sqlc.arg(reply_to_story_id)::int,
   sqlc.arg(quote_text)::text,
   sqlc.arg(quote_entities_json)::jsonb,
   sqlc.arg(quote_offset)::int,
@@ -185,10 +220,20 @@ INSERT INTO message_boxes (
   sqlc.arg(fwd_from_peer_id)::bigint,
   sqlc.arg(fwd_from_name)::text,
   sqlc.arg(fwd_date)::int,
+  sqlc.arg(fwd_saved_from_peer_type)::text,
+  sqlc.arg(fwd_saved_from_peer_id)::bigint,
+  sqlc.arg(fwd_saved_from_msg_id)::int,
+  sqlc.arg(saved_peer_type)::text,
+  sqlc.arg(saved_peer_id)::bigint,
   sqlc.arg(pts)::int,
   sqlc.arg(media_json)::jsonb,
   sqlc.arg(media_unread)::boolean,
-  sqlc.arg(reaction_unread)::boolean
+  sqlc.arg(reaction_unread)::boolean,
+  sqlc.arg(reply_markup_json)::jsonb,
+  sqlc.arg(rich_message_json)::jsonb,
+  sqlc.arg(via_bot_id)::bigint,
+  sqlc.arg(grouped_id)::bigint,
+  sqlc.arg(effect)::bigint
 )
 RETURNING
   box_id,
@@ -198,6 +243,8 @@ RETURNING
   peer_id,
   from_user_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   outgoing,
   body,
@@ -208,6 +255,7 @@ RETURNING
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities::text AS quote_entities_json,
   quote_offset,
@@ -215,10 +263,21 @@ RETURNING
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
   pts,
   media::text AS media_json,
   media_unread,
-  reaction_unread;
+  reaction_unread,
+  pinned,
+  via_bot_id,
+  grouped_id,
+  effect,
+  reply_markup::text AS reply_markup_json,
+  rich_message::text AS rich_message_json;
 
 -- name: GetMessageBoxByPrivateMessage :one
 SELECT
@@ -229,6 +288,8 @@ SELECT
   peer_id,
   from_user_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   outgoing,
   body,
@@ -239,6 +300,7 @@ SELECT
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities::text AS quote_entities_json,
   quote_offset,
@@ -246,10 +308,21 @@ SELECT
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
   pts,
   media::text AS media_json,
   media_unread,
-  reaction_unread
+  reaction_unread,
+  pinned,
+  via_bot_id,
+  grouped_id,
+  effect,
+  reply_markup::text AS reply_markup_json,
+  rich_message::text AS rich_message_json
 FROM message_boxes
 WHERE owner_user_id = $1
   AND private_message_id = $2
@@ -285,6 +358,8 @@ SELECT
   m.peer_id,
   m.from_user_id,
   m.message_date,
+  m.ttl_period,
+  m.expires_at,
   m.edit_date,
   m.outgoing,
   m.body,
@@ -295,6 +370,7 @@ SELECT
   m.reply_to_peer_type,
   m.reply_to_peer_id,
   m.reply_to_top_id,
+  m.reply_to_story_id,
   m.quote_text,
   m.quote_entities::text AS quote_entities_json,
   m.quote_offset,
@@ -302,10 +378,18 @@ SELECT
   m.fwd_from_peer_id,
   m.fwd_from_name,
   m.fwd_date,
+  m.fwd_saved_from_peer_type,
+  m.fwd_saved_from_peer_id,
+  m.fwd_saved_from_msg_id,
+  m.saved_peer_type,
+  m.saved_peer_id,
   m.pts,
   m.media::text AS media_json,
   m.media_unread,
-  m.reaction_unread
+  m.reaction_unread,
+  m.pinned,
+  m.via_bot_id,
+  m.grouped_id
 FROM requested r
 JOIN message_boxes m
   ON m.owner_user_id = sqlc.arg(owner_user_id)::bigint
@@ -342,6 +426,8 @@ base AS NOT MATERIALIZED (
     m.peer_id,
     m.from_user_id,
     m.message_date,
+    m.ttl_period,
+    m.expires_at,
     m.edit_date,
     m.outgoing,
     m.body,
@@ -352,6 +438,7 @@ base AS NOT MATERIALIZED (
     m.reply_to_peer_type,
     m.reply_to_peer_id,
     m.reply_to_top_id,
+    m.reply_to_story_id,
     m.quote_text,
     m.quote_entities::text AS quote_entities_json,
     m.quote_offset,
@@ -359,10 +446,21 @@ base AS NOT MATERIALIZED (
     m.fwd_from_peer_id,
     m.fwd_from_name,
     m.fwd_date,
+    m.fwd_saved_from_peer_type,
+    m.fwd_saved_from_peer_id,
+    m.fwd_saved_from_msg_id,
+    m.saved_peer_type,
+    m.saved_peer_id,
     m.pts,
     m.media::text AS media_json,
     m.media_unread,
     m.reaction_unread,
+    m.pinned,
+    m.via_bot_id,
+    m.grouped_id,
+    m.effect,
+    m.reply_markup::text AS reply_markup_json,
+    m.rich_message::text AS rich_message_json,
     COALESCE(peer_u.id, 0)::bigint AS peer_user_id,
     COALESCE(peer_u.access_hash, 0)::bigint AS peer_access_hash,
     COALESCE(peer_u.phone, '')::text AS peer_phone,
@@ -372,6 +470,11 @@ base AS NOT MATERIALIZED (
     COALESCE(peer_u.country_code, '')::text AS peer_country_code,
     COALESCE(peer_u.verified, false)::boolean AS peer_verified,
     COALESCE(peer_u.support, false)::boolean AS peer_support,
+    COALESCE(peer_u.is_bot, false)::boolean AS peer_is_bot,
+    COALESCE(peer_u.bot_info_version, 0)::int AS peer_bot_info_version,
+    COALESCE(EXTRACT(EPOCH FROM peer_u.premium_expires_at), 0)::bigint AS peer_premium_until,
+    COALESCE(peer_u.emoji_status_document_id, 0)::bigint AS peer_emoji_status_document_id,
+    COALESCE(peer_u.emoji_status_until, 0)::bigint AS peer_emoji_status_until,
     COALESCE(peer_u.last_seen_at, 0)::bigint AS peer_last_seen_at,
     COALESCE(from_u.id, 0)::bigint AS from_user_user_id,
     COALESCE(from_u.access_hash, 0)::bigint AS from_user_access_hash,
@@ -382,6 +485,11 @@ base AS NOT MATERIALIZED (
     COALESCE(from_u.country_code, '')::text AS from_user_country_code,
     COALESCE(from_u.verified, false)::boolean AS from_user_verified,
     COALESCE(from_u.support, false)::boolean AS from_user_support,
+    COALESCE(from_u.is_bot, false)::boolean AS from_user_is_bot,
+    COALESCE(from_u.bot_info_version, 0)::int AS from_user_bot_info_version,
+    COALESCE(EXTRACT(EPOCH FROM from_u.premium_expires_at), 0)::bigint AS from_user_premium_until,
+    COALESCE(from_u.emoji_status_document_id, 0)::bigint AS from_user_emoji_status_document_id,
+    COALESCE(from_u.emoji_status_until, 0)::bigint AS from_user_emoji_status_until,
     COALESCE(from_u.last_seen_at, 0)::bigint AS from_user_last_seen_at
   FROM message_boxes m
   LEFT JOIN users peer_u ON m.peer_type = 'user' AND peer_u.id = m.peer_id
@@ -398,6 +506,23 @@ base AS NOT MATERIALIZED (
     )
     AND (sqlc.arg(max_id)::int <= 0 OR m.box_id < sqlc.arg(max_id)::int)
     AND (sqlc.arg(min_id)::int <= 0 OR m.box_id > sqlc.arg(min_id)::int)
+    AND (NOT sqlc.arg(pinned_only)::boolean OR m.pinned)
+    AND (
+      NOT sqlc.arg(music_only)::boolean
+      OR (
+        m.media->>'kind' = 'document'
+        AND EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements(COALESCE(m.media #> '{document,attributes}', '[]'::jsonb)) AS attr
+          WHERE attr->>'kind' = 'audio'
+            AND COALESCE((attr->>'voice')::boolean, false) = false
+        )
+      )
+    )
+    AND (
+      sqlc.arg(saved_peer_type)::text = ''
+      OR (m.saved_peer_type = sqlc.arg(saved_peer_type)::text AND m.saved_peer_id = sqlc.arg(saved_peer_id)::bigint)
+    )
 ),
 total AS (
   SELECT count(*)::int AS total_count
@@ -476,6 +601,8 @@ SELECT
   peer_id,
   from_user_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   outgoing,
   body,
@@ -486,6 +613,7 @@ SELECT
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities_json,
   quote_offset,
@@ -493,10 +621,21 @@ SELECT
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
   pts,
   media_json,
   media_unread,
   reaction_unread,
+  pinned,
+  via_bot_id,
+  grouped_id,
+  effect,
+  reply_markup_json,
+  rich_message_json,
   peer_user_id,
   peer_access_hash,
   peer_phone,
@@ -506,6 +645,11 @@ SELECT
   peer_country_code,
   peer_verified,
   peer_support,
+  peer_is_bot,
+  peer_bot_info_version,
+  peer_premium_until,
+  peer_emoji_status_document_id,
+  peer_emoji_status_until,
   peer_last_seen_at,
   from_user_user_id,
   from_user_access_hash,
@@ -516,11 +660,170 @@ SELECT
   from_user_country_code,
   from_user_verified,
   from_user_support,
+  from_user_is_bot,
+  from_user_bot_info_version,
+  from_user_premium_until,
+  from_user_emoji_status_document_id,
+  from_user_emoji_status_until,
   from_user_last_seen_at,
   COALESCE(total.total_count, 0)::int AS total_count
 FROM paged
 CROSS JOIN total
 ORDER BY box_id DESC;
+
+-- name: ListMessagesBackward :many
+-- backward 热路径(add_offset>=0:初始加载/上滑翻页)的扁平静态查询。
+-- 与 ListMessagesByUser 的 backward 分支逐位等价(相同 base 过滤 + 相同 anchor +
+-- ORDER BY box_id DESC + OFFSET GREATEST(add_offset,0) + LIMIT),但只规划单次
+-- index scan + 2 LEFT JOIN,避免大 CTE 把 4 个分支+total 全树规划。total 走
+-- 独立 CountMessagesByUser,仅 NeedTotalCount 时发。
+SELECT
+  m.box_id,
+  m.private_message_id,
+  m.owner_user_id,
+  m.peer_type,
+  m.peer_id,
+  m.from_user_id,
+  m.message_date,
+  m.ttl_period,
+  m.expires_at,
+  m.edit_date,
+  m.outgoing,
+  m.body,
+  m.entities::text AS entities_json,
+  m.silent,
+  m.noforwards,
+  m.reply_to_msg_id,
+  m.reply_to_peer_type,
+  m.reply_to_peer_id,
+  m.reply_to_top_id,
+  m.reply_to_story_id,
+  m.quote_text,
+  m.quote_entities::text AS quote_entities_json,
+  m.quote_offset,
+  m.fwd_from_peer_type,
+  m.fwd_from_peer_id,
+  m.fwd_from_name,
+  m.fwd_date,
+  m.fwd_saved_from_peer_type,
+  m.fwd_saved_from_peer_id,
+  m.fwd_saved_from_msg_id,
+  m.saved_peer_type,
+  m.saved_peer_id,
+  m.pts,
+  m.media::text AS media_json,
+  m.media_unread,
+  m.reaction_unread,
+  m.pinned,
+  m.via_bot_id,
+  m.grouped_id,
+  m.effect,
+  m.reply_markup::text AS reply_markup_json,
+  m.rich_message::text AS rich_message_json,
+  COALESCE(peer_u.id, 0)::bigint AS peer_user_id,
+  COALESCE(peer_u.access_hash, 0)::bigint AS peer_access_hash,
+  COALESCE(peer_u.phone, '')::text AS peer_phone,
+  COALESCE(peer_u.first_name, '')::text AS peer_first_name,
+  COALESCE(peer_u.last_name, '')::text AS peer_last_name,
+  COALESCE(peer_u.username, '')::text AS peer_username,
+  COALESCE(peer_u.country_code, '')::text AS peer_country_code,
+  COALESCE(peer_u.verified, false)::boolean AS peer_verified,
+  COALESCE(peer_u.support, false)::boolean AS peer_support,
+  COALESCE(peer_u.is_bot, false)::boolean AS peer_is_bot,
+  COALESCE(peer_u.bot_info_version, 0)::int AS peer_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM peer_u.premium_expires_at), 0)::bigint AS peer_premium_until,
+  COALESCE(peer_u.emoji_status_document_id, 0)::bigint AS peer_emoji_status_document_id,
+  COALESCE(peer_u.emoji_status_until, 0)::bigint AS peer_emoji_status_until,
+  COALESCE(peer_u.last_seen_at, 0)::bigint AS peer_last_seen_at,
+  COALESCE(from_u.id, 0)::bigint AS from_user_user_id,
+  COALESCE(from_u.access_hash, 0)::bigint AS from_user_access_hash,
+  COALESCE(from_u.phone, '')::text AS from_user_phone,
+  COALESCE(from_u.first_name, '')::text AS from_user_first_name,
+  COALESCE(from_u.last_name, '')::text AS from_user_last_name,
+  COALESCE(from_u.username, '')::text AS from_user_username,
+  COALESCE(from_u.country_code, '')::text AS from_user_country_code,
+  COALESCE(from_u.verified, false)::boolean AS from_user_verified,
+  COALESCE(from_u.support, false)::boolean AS from_user_support,
+  COALESCE(from_u.is_bot, false)::boolean AS from_user_is_bot,
+  COALESCE(from_u.bot_info_version, 0)::int AS from_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM from_u.premium_expires_at), 0)::bigint AS from_user_premium_until,
+  COALESCE(from_u.emoji_status_document_id, 0)::bigint AS from_user_emoji_status_document_id,
+  COALESCE(from_u.emoji_status_until, 0)::bigint AS from_user_emoji_status_until,
+  COALESCE(from_u.last_seen_at, 0)::bigint AS from_user_last_seen_at
+FROM message_boxes m
+LEFT JOIN users peer_u ON m.peer_type = 'user' AND peer_u.id = m.peer_id
+LEFT JOIN users from_u ON from_u.id = m.from_user_id
+WHERE m.owner_user_id = sqlc.arg(owner_user_id)::bigint
+  AND NOT m.deleted
+  AND (
+    NOT sqlc.arg(has_peer)::boolean
+    OR (m.peer_type = sqlc.arg(peer_type)::text AND m.peer_id = sqlc.arg(peer_id)::bigint)
+  )
+  AND (
+    sqlc.arg(query)::text = ''
+    OR m.body ILIKE ('%' || sqlc.arg(query)::text || '%')
+  )
+  AND (sqlc.arg(max_id)::int <= 0 OR m.box_id < sqlc.arg(max_id)::int)
+  AND (sqlc.arg(min_id)::int <= 0 OR m.box_id > sqlc.arg(min_id)::int)
+  AND (NOT sqlc.arg(pinned_only)::boolean OR m.pinned)
+  AND (
+    NOT sqlc.arg(music_only)::boolean
+    OR (
+      m.media->>'kind' = 'document'
+      AND EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(COALESCE(m.media #> '{document,attributes}', '[]'::jsonb)) AS attr
+        WHERE attr->>'kind' = 'audio'
+          AND COALESCE((attr->>'voice')::boolean, false) = false
+      )
+    )
+  )
+  AND (
+    sqlc.arg(saved_peer_type)::text = ''
+    OR (m.saved_peer_type = sqlc.arg(saved_peer_type)::text AND m.saved_peer_id = sqlc.arg(saved_peer_id)::bigint)
+  )
+  AND (
+    (sqlc.arg(offset_date)::int > 0 AND m.message_date < sqlc.arg(offset_date)::int)
+    OR (sqlc.arg(offset_date)::int <= 0 AND (sqlc.arg(offset_id)::int <= 0 OR m.box_id < sqlc.arg(offset_id)::int))
+  )
+ORDER BY m.box_id DESC
+OFFSET GREATEST(sqlc.arg(row_offset)::int, 0)
+LIMIT sqlc.arg(limit_count)::int;
+
+-- name: CountMessagesByUser :one
+-- ListMessagesByUser total CTE 的独立化:相同 base 过滤(不含分页 anchor),
+-- 仅 NeedTotalCount 时发,避免热路径(getHistory 恒不需 total)次次规划 count 子树。
+SELECT count(*)::int AS total_count
+FROM message_boxes m
+WHERE m.owner_user_id = sqlc.arg(owner_user_id)::bigint
+  AND NOT m.deleted
+  AND (
+    NOT sqlc.arg(has_peer)::boolean
+    OR (m.peer_type = sqlc.arg(peer_type)::text AND m.peer_id = sqlc.arg(peer_id)::bigint)
+  )
+  AND (
+    sqlc.arg(query)::text = ''
+    OR m.body ILIKE ('%' || sqlc.arg(query)::text || '%')
+  )
+  AND (sqlc.arg(max_id)::int <= 0 OR m.box_id < sqlc.arg(max_id)::int)
+  AND (sqlc.arg(min_id)::int <= 0 OR m.box_id > sqlc.arg(min_id)::int)
+  AND (NOT sqlc.arg(pinned_only)::boolean OR m.pinned)
+  AND (
+    NOT sqlc.arg(music_only)::boolean
+    OR (
+      m.media->>'kind' = 'document'
+      AND EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(COALESCE(m.media #> '{document,attributes}', '[]'::jsonb)) AS attr
+        WHERE attr->>'kind' = 'audio'
+          AND COALESCE((attr->>'voice')::boolean, false) = false
+      )
+    )
+  )
+  AND (
+    sqlc.arg(saved_peer_type)::text = ''
+    OR (m.saved_peer_type = sqlc.arg(saved_peer_type)::text AND m.saved_peer_id = sqlc.arg(saved_peer_id)::bigint)
+  );
 
 -- name: GetMessageBoxesByIDs :many
 SELECT
@@ -532,6 +835,8 @@ SELECT
   m.peer_id,
   m.from_user_id,
   m.message_date,
+  m.ttl_period,
+  m.expires_at,
   m.edit_date,
   m.outgoing,
   m.body,
@@ -542,6 +847,7 @@ SELECT
   m.reply_to_peer_type,
   m.reply_to_peer_id,
   m.reply_to_top_id,
+  m.reply_to_story_id,
   m.quote_text,
   m.quote_entities::text AS quote_entities_json,
   m.quote_offset,
@@ -549,10 +855,21 @@ SELECT
   m.fwd_from_peer_id,
   m.fwd_from_name,
   m.fwd_date,
+  m.fwd_saved_from_peer_type,
+  m.fwd_saved_from_peer_id,
+  m.fwd_saved_from_msg_id,
+  m.saved_peer_type,
+  m.saved_peer_id,
   m.pts,
   m.media::text AS media_json,
   m.media_unread,
   m.reaction_unread,
+  m.pinned,
+  m.via_bot_id,
+  m.grouped_id,
+  m.effect,
+  m.reply_markup::text AS reply_markup_json,
+  m.rich_message::text AS rich_message_json,
   COALESCE(peer_u.id, 0)::bigint AS peer_user_id,
   COALESCE(peer_u.access_hash, 0)::bigint AS peer_access_hash,
   COALESCE(peer_u.phone, '')::text AS peer_phone,
@@ -562,6 +879,11 @@ SELECT
   COALESCE(peer_u.country_code, '')::text AS peer_country_code,
   COALESCE(peer_u.verified, false)::boolean AS peer_verified,
   COALESCE(peer_u.support, false)::boolean AS peer_support,
+  COALESCE(peer_u.is_bot, false)::boolean AS peer_is_bot,
+  COALESCE(peer_u.bot_info_version, 0)::int AS peer_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM peer_u.premium_expires_at), 0)::bigint AS peer_premium_until,
+  COALESCE(peer_u.emoji_status_document_id, 0)::bigint AS peer_emoji_status_document_id,
+  COALESCE(peer_u.emoji_status_until, 0)::bigint AS peer_emoji_status_until,
   COALESCE(peer_u.last_seen_at, 0)::bigint AS peer_last_seen_at,
   COALESCE(from_u.id, 0)::bigint AS from_user_user_id,
   COALESCE(from_u.access_hash, 0)::bigint AS from_user_access_hash,
@@ -572,6 +894,11 @@ SELECT
   COALESCE(from_u.country_code, '')::text AS from_user_country_code,
   COALESCE(from_u.verified, false)::boolean AS from_user_verified,
   COALESCE(from_u.support, false)::boolean AS from_user_support,
+  COALESCE(from_u.is_bot, false)::boolean AS from_user_is_bot,
+  COALESCE(from_u.bot_info_version, 0)::int AS from_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM from_u.premium_expires_at), 0)::bigint AS from_user_premium_until,
+  COALESCE(from_u.emoji_status_document_id, 0)::bigint AS from_user_emoji_status_document_id,
+  COALESCE(from_u.emoji_status_until, 0)::bigint AS from_user_emoji_status_until,
   COALESCE(from_u.last_seen_at, 0)::bigint AS from_user_last_seen_at
 FROM unnest(@box_ids::int[]) WITH ORDINALITY AS wanted(box_id, ord)
 JOIN message_boxes m
@@ -592,6 +919,8 @@ SELECT
   peer_id,
   from_user_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   outgoing,
   body,
@@ -602,6 +931,7 @@ SELECT
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities::text AS quote_entities_json,
   quote_offset,
@@ -609,10 +939,21 @@ SELECT
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
   pts,
   media::text AS media_json,
   media_unread,
-  reaction_unread
+  reaction_unread,
+  pinned,
+  via_bot_id,
+  grouped_id,
+  effect,
+  reply_markup::text AS reply_markup_json,
+  rich_message::text AS rich_message_json
 FROM message_boxes
 WHERE owner_user_id = sqlc.arg(owner_user_id)::bigint
   AND box_id = sqlc.arg(box_id)::int
@@ -632,6 +973,8 @@ SELECT
   peer_id,
   from_user_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   outgoing,
   body,
@@ -642,6 +985,7 @@ SELECT
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities::text AS quote_entities_json,
   quote_offset,
@@ -649,12 +993,24 @@ SELECT
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
   pts,
   media::text AS media_json,
   media_unread,
-  reaction_unread
+  reaction_unread,
+  pinned,
+  via_bot_id,
+  grouped_id,
+  effect,
+  reply_markup::text AS reply_markup_json,
+  rich_message::text AS rich_message_json
 FROM message_boxes
-WHERE message_sender_id = sqlc.arg(message_sender_id)::bigint
+WHERE owner_user_id = ANY(sqlc.arg(owner_user_ids)::bigint[])
+  AND message_sender_id = sqlc.arg(message_sender_id)::bigint
   AND private_message_id = sqlc.arg(private_message_id)::bigint
   AND NOT deleted
 ORDER BY owner_user_id ASC, box_id ASC
@@ -664,7 +1020,11 @@ FOR UPDATE;
 UPDATE private_messages
 SET body = sqlc.arg(body)::text,
     entities = sqlc.arg(entities_json)::jsonb,
-    edit_date = sqlc.arg(edit_date)::int
+    edit_date = sqlc.arg(edit_date)::int,
+    reply_markup = CASE
+      WHEN sqlc.arg(set_reply_markup)::boolean THEN sqlc.arg(reply_markup_json)::jsonb
+      ELSE reply_markup
+    END
 WHERE sender_user_id = sqlc.arg(sender_user_id)::bigint
   AND id = sqlc.arg(private_message_id)::bigint;
 
@@ -673,7 +1033,11 @@ UPDATE message_boxes
 SET body = sqlc.arg(body)::text,
     entities = sqlc.arg(entities_json)::jsonb,
     edit_date = sqlc.arg(edit_date)::int,
-    pts = sqlc.arg(pts)::int
+    pts = sqlc.arg(pts)::int,
+    reply_markup = CASE
+      WHEN sqlc.arg(set_reply_markup)::boolean THEN sqlc.arg(reply_markup_json)::jsonb
+      ELSE reply_markup
+    END
 WHERE owner_user_id = sqlc.arg(owner_user_id)::bigint
   AND box_id = sqlc.arg(box_id)::int
   AND NOT deleted
@@ -686,6 +1050,8 @@ RETURNING
   peer_id,
   from_user_id,
   message_date,
+  ttl_period,
+  expires_at,
   edit_date,
   outgoing,
   body,
@@ -696,6 +1062,7 @@ RETURNING
   reply_to_peer_type,
   reply_to_peer_id,
   reply_to_top_id,
+  reply_to_story_id,
   quote_text,
   quote_entities::text AS quote_entities_json,
   quote_offset,
@@ -703,10 +1070,21 @@ RETURNING
   fwd_from_peer_id,
   fwd_from_name,
   fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
   pts,
   media::text AS media_json,
   media_unread,
-  reaction_unread;
+  reaction_unread,
+  pinned,
+  via_bot_id,
+  grouped_id,
+  effect,
+  reply_markup::text AS reply_markup_json,
+  rich_message::text AS rich_message_json;
 
 -- name: GetDialogReadStateForUpdate :one
 SELECT
@@ -761,7 +1139,6 @@ SET
   ),
   unread_mark = false,
   unread_mentions_count = 0,
-  unread_reactions_count = 0,
   updated_at = now()
 WHERE d.user_id = sqlc.arg(user_id)::bigint
   AND d.peer_type = sqlc.arg(peer_type)::text
@@ -863,6 +1240,8 @@ WITH target AS (
     AND m.peer_type = sqlc.arg(peer_type)::text
     AND m.peer_id = sqlc.arg(peer_id)::bigint
     AND (sqlc.arg(max_id)::int <= 0 OR m.box_id <= sqlc.arg(max_id)::int)
+    AND (sqlc.arg(min_date)::int <= 0 OR m.message_date >= sqlc.arg(min_date)::int)
+    AND (sqlc.arg(max_date)::int <= 0 OR m.message_date <= sqlc.arg(max_date)::int)
     AND NOT m.deleted
   ORDER BY m.box_id DESC
   LIMIT sqlc.arg(limit_count)::int
@@ -900,6 +1279,8 @@ SELECT EXISTS (
     AND m.peer_type = sqlc.arg(peer_type)::text
     AND m.peer_id = sqlc.arg(peer_id)::bigint
     AND (sqlc.arg(max_id)::int <= 0 OR m.box_id <= sqlc.arg(max_id)::int)
+    AND (sqlc.arg(min_date)::int <= 0 OR m.message_date >= sqlc.arg(min_date)::int)
+    AND (sqlc.arg(max_date)::int <= 0 OR m.message_date <= sqlc.arg(max_date)::int)
     AND NOT m.deleted
   LIMIT 1
 )::boolean AS more;
@@ -908,19 +1289,24 @@ SELECT EXISTS (
 WITH requested AS (
   SELECT
     (sqlc.arg(message_sender_ids)::bigint[])[i] AS message_sender_id,
-    (sqlc.arg(private_message_ids)::bigint[])[i] AS private_message_id
+    (sqlc.arg(private_message_ids)::bigint[])[i] AS private_message_id,
+    (sqlc.arg(owner_user_ids)::bigint[])[i] AS owner_user_id
   FROM generate_subscripts(sqlc.arg(private_message_ids)::bigint[], 1) AS g(i)
   WHERE i <= cardinality(sqlc.arg(message_sender_ids)::bigint[])
+    AND i <= cardinality(sqlc.arg(owner_user_ids)::bigint[])
 ),
 deduped AS (
-  SELECT DISTINCT message_sender_id, private_message_id
+  SELECT DISTINCT message_sender_id, private_message_id, owner_user_id
   FROM requested
+  WHERE owner_user_id <> 0
 ),
 updated AS (
   UPDATE message_boxes m
   SET deleted = true
   FROM deduped d
-  WHERE m.message_sender_id = d.message_sender_id
+  WHERE m.owner_user_id = ANY(sqlc.arg(owner_user_ids)::bigint[])
+    AND m.owner_user_id = d.owner_user_id
+    AND m.message_sender_id = d.message_sender_id
     AND m.private_message_id = d.private_message_id
     AND NOT m.deleted
   RETURNING
@@ -952,3 +1338,132 @@ WHERE owner_user_id = $1
   AND NOT deleted
 ORDER BY box_id DESC
 LIMIT 1;
+
+-- name: ListUnreadReactionMessageBoxes :many
+SELECT
+  box_id,
+  private_message_id,
+  owner_user_id,
+  peer_type,
+  peer_id,
+  from_user_id,
+  message_date,
+  ttl_period,
+  expires_at,
+  edit_date,
+  outgoing,
+  body,
+  entities::text AS entities_json,
+  silent,
+  noforwards,
+  reply_to_msg_id,
+  reply_to_peer_type,
+  reply_to_peer_id,
+  reply_to_top_id,
+  reply_to_story_id,
+  quote_text,
+  quote_entities::text AS quote_entities_json,
+  quote_offset,
+  fwd_from_peer_type,
+  fwd_from_peer_id,
+  fwd_from_name,
+  fwd_date,
+  fwd_saved_from_peer_type,
+  fwd_saved_from_peer_id,
+  fwd_saved_from_msg_id,
+  saved_peer_type,
+  saved_peer_id,
+  pts,
+  media::text AS media_json,
+  media_unread,
+  reaction_unread,
+  pinned,
+  via_bot_id,
+  grouped_id,
+  effect,
+  reply_markup::text AS reply_markup_json,
+  rich_message::text AS rich_message_json
+FROM message_boxes
+WHERE owner_user_id = @owner_user_id
+  AND peer_type = @peer_type
+  AND peer_id = @peer_id
+  AND NOT deleted
+  AND reaction_unread
+ORDER BY box_id DESC
+LIMIT @page_limit;
+
+-- name: GetMessageBoxForPin :one
+SELECT
+  box_id,
+  private_message_id,
+  message_sender_id,
+  pinned,
+  media::text AS media_json
+FROM message_boxes
+WHERE owner_user_id = sqlc.arg(owner_user_id)::bigint
+  AND peer_type = sqlc.arg(peer_type)::text
+  AND peer_id = sqlc.arg(peer_id)::bigint
+  AND box_id = sqlc.arg(box_id)::int
+  AND NOT deleted
+LIMIT 1
+FOR UPDATE;
+
+-- name: SetMessageBoxPinned :execrows
+UPDATE message_boxes
+SET pinned = sqlc.arg(pinned)::boolean
+WHERE owner_user_id = sqlc.arg(owner_user_id)::bigint
+  AND box_id = sqlc.arg(box_id)::int
+  AND NOT deleted
+  AND pinned <> sqlc.arg(pinned)::boolean;
+
+-- name: UnpinAllMessageBoxesByPeer :many
+-- 按批清除（affectedHistory.offset 续清语义），单条 updatePinnedMessages
+-- 的 messages 向量随之有界。
+WITH target AS (
+  SELECT m.owner_user_id, m.box_id
+  FROM message_boxes m
+  WHERE m.owner_user_id = sqlc.arg(owner_user_id)::bigint
+    AND m.peer_type = sqlc.arg(peer_type)::text
+    AND m.peer_id = sqlc.arg(peer_id)::bigint
+    AND m.pinned
+    AND NOT m.deleted
+  ORDER BY m.box_id DESC
+  LIMIT sqlc.arg(limit_count)::int
+  FOR UPDATE
+)
+UPDATE message_boxes m
+SET pinned = false
+FROM target t
+WHERE m.owner_user_id = t.owner_user_id
+  AND m.box_id = t.box_id
+RETURNING m.box_id, m.private_message_id, m.message_sender_id;
+
+-- name: HasPinnedMessageBoxByPeer :one
+SELECT EXISTS (
+  SELECT 1
+  FROM message_boxes m
+  WHERE m.owner_user_id = sqlc.arg(owner_user_id)::bigint
+    AND m.peer_type = sqlc.arg(peer_type)::text
+    AND m.peer_id = sqlc.arg(peer_id)::bigint
+    AND m.pinned
+    AND NOT m.deleted
+  LIMIT 1
+)::boolean AS more;
+
+-- name: UnpinMessageBoxesByPrivateMessages :many
+WITH requested AS (
+  SELECT
+    (sqlc.arg(message_sender_ids)::bigint[])[i] AS message_sender_id,
+    (sqlc.arg(private_message_ids)::bigint[])[i] AS private_message_id
+  FROM generate_subscripts(sqlc.arg(private_message_ids)::bigint[], 1) AS g(i)
+  WHERE i <= cardinality(sqlc.arg(message_sender_ids)::bigint[])
+)
+UPDATE message_boxes m
+SET pinned = false
+FROM requested r
+WHERE m.owner_user_id = sqlc.arg(owner_user_id)::bigint
+  AND m.message_sender_id = r.message_sender_id
+  AND m.private_message_id = r.private_message_id
+  AND m.pinned
+  AND NOT m.deleted
+RETURNING m.box_id;

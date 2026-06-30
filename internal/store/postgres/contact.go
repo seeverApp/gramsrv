@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"sort"
 
 	"github.com/jackc/pgx/v5"
 
@@ -68,6 +69,7 @@ func (s *ContactStore) GetMany(ctx context.Context, userID int64, contactUserIDs
 SELECT
   c.contact_user_id,
   c.mutual,
+  c.close_friend,
   c.contact_phone,
   c.contact_first_name,
   c.contact_last_name,
@@ -82,6 +84,9 @@ SELECT
   u.country_code,
   u.verified,
   u.support,
+  COALESCE(EXTRACT(EPOCH FROM u.premium_expires_at), 0)::bigint AS premium_until,
+  u.emoji_status_document_id,
+  u.emoji_status_until,
   u.last_seen_at
 FROM contacts c
 JOIN users u ON u.id = c.contact_user_id
@@ -114,6 +119,7 @@ func (s *ContactStore) GetReverseContacts(ctx context.Context, userID int64, own
 SELECT
   c.user_id AS owner_user_id,
   c.mutual,
+  c.close_friend,
   c.contact_phone,
   c.contact_first_name,
   c.contact_last_name,
@@ -128,6 +134,9 @@ SELECT
   u.country_code,
   u.verified,
   u.support,
+  COALESCE(EXTRACT(EPOCH FROM u.premium_expires_at), 0)::bigint AS premium_until,
+  u.emoji_status_document_id,
+  u.emoji_status_until,
   u.last_seen_at
 FROM contacts c
 JOIN users u ON u.id = c.contact_user_id
@@ -251,6 +260,7 @@ reverse_updated AS (
 SELECT
   c.contact_user_id,
   c.mutual,
+  c.close_friend,
   c.contact_phone,
   c.contact_first_name,
   c.contact_last_name,
@@ -265,6 +275,9 @@ SELECT
   u.country_code,
   u.verified,
   u.support,
+  COALESCE(EXTRACT(EPOCH FROM u.premium_expires_at), 0)::bigint AS premium_until,
+  u.emoji_status_document_id,
+  u.emoji_status_until,
   u.last_seen_at,
   EXISTS (SELECT 1 FROM reverse_updated ru WHERE ru.user_id = c.contact_user_id)::boolean AS reverse_mutual_changed
 FROM upserted c
@@ -311,6 +324,7 @@ func (s *ContactStore) UpsertMany(ctx context.Context, userID int64, inputs []do
 		var (
 			contactUserID        int64
 			mutual               bool
+			closeFriend          bool
 			contactPhone         string
 			contactFirstName     string
 			contactLastName      string
@@ -325,12 +339,16 @@ func (s *ContactStore) UpsertMany(ctx context.Context, userID int64, inputs []do
 			countryCode          string
 			verified             bool
 			support              bool
+			premiumUntil         int64
+			emojiStatusDocID     int64
+			emojiStatusUntil     int64
 			lastSeenAt           int64
 			reverseMutualChanged bool
 		)
 		if err := rows.Scan(
 			&contactUserID,
 			&mutual,
+			&closeFriend,
 			&contactPhone,
 			&contactFirstName,
 			&contactLastName,
@@ -345,6 +363,9 @@ func (s *ContactStore) UpsertMany(ctx context.Context, userID int64, inputs []do
 			&countryCode,
 			&verified,
 			&support,
+			&premiumUntil,
+			&emojiStatusDocID,
+			&emojiStatusUntil,
 			&lastSeenAt,
 			&reverseMutualChanged,
 		); err != nil {
@@ -355,7 +376,7 @@ func (s *ContactStore) UpsertMany(ctx context.Context, userID int64, inputs []do
 		if err != nil {
 			return nil, fmt.Errorf("decode contact note entities: %w", err)
 		}
-		out = append(out, contactFromFields(id, accessHash, phone, firstName, lastName, username, countryCode, verified, support, int(lastSeenAt), contactFirstName, contactLastName, contactPhone, note, entities, mutual))
+		out = append(out, contactFromFields(id, accessHash, phone, firstName, lastName, username, countryCode, verified, support, false, 0, int(premiumUntil), emojiStatusDocID, int(emojiStatusUntil), int(lastSeenAt), contactFirstName, contactLastName, contactPhone, note, entities, mutual, closeFriend))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate upsert contacts many: %w", err)
@@ -385,6 +406,70 @@ func (s *ContactStore) UpdateNote(ctx context.Context, userID, contactUserID int
 		return domain.Contact{}, false, err
 	}
 	return contact, true, nil
+}
+
+func (s *ContactStore) SetCloseFriends(ctx context.Context, userID int64, contactUserIDs []int64) (domain.CloseFriendsEditResult, error) {
+	if userID == 0 {
+		return domain.CloseFriendsEditResult{}, nil
+	}
+	if contactUserIDs == nil {
+		contactUserIDs = []int64{}
+	}
+	beforeList, err := s.ListByUser(ctx, userID)
+	if err != nil {
+		return domain.CloseFriendsEditResult{}, err
+	}
+	contactSet := make(map[int64]struct{}, len(beforeList.Contacts))
+	before := make(map[int64]struct{})
+	for _, contact := range beforeList.Contacts {
+		id := contact.User.ID
+		if id == 0 {
+			continue
+		}
+		contactSet[id] = struct{}{}
+		if contact.CloseFriend || contact.User.CloseFriend {
+			before[id] = struct{}{}
+		}
+	}
+	after := make(map[int64]struct{}, len(contactUserIDs))
+	for _, id := range contactUserIDs {
+		if id <= 0 || id == userID {
+			continue
+		}
+		if _, ok := contactSet[id]; ok {
+			after[id] = struct{}{}
+		}
+	}
+	_, err = s.db.Exec(ctx, `
+UPDATE contacts
+SET close_friend = contact_user_id = ANY($2::bigint[]),
+    updated_at = now()
+WHERE user_id = $1
+  AND (
+    close_friend
+    OR contact_user_id = ANY($2::bigint[])
+  )`, userID, contactUserIDs)
+	if err != nil {
+		return domain.CloseFriendsEditResult{}, fmt.Errorf("set close friends: %w", err)
+	}
+	return closeFriendsEditDiff(before, after), nil
+}
+
+func closeFriendsEditDiff(before, after map[int64]struct{}) domain.CloseFriendsEditResult {
+	var result domain.CloseFriendsEditResult
+	for id := range after {
+		if _, ok := before[id]; !ok {
+			result.AddedUserIDs = append(result.AddedUserIDs, id)
+		}
+	}
+	for id := range before {
+		if _, ok := after[id]; !ok {
+			result.RemovedUserIDs = append(result.RemovedUserIDs, id)
+		}
+	}
+	sort.Slice(result.AddedUserIDs, func(i, j int) bool { return result.AddedUserIDs[i] < result.AddedUserIDs[j] })
+	sort.Slice(result.RemovedUserIDs, func(i, j int) bool { return result.RemovedUserIDs[i] < result.RemovedUserIDs[j] })
+	return result
 }
 
 func (s *ContactStore) SetPersonalPhoto(ctx context.Context, userID, contactUserID int64, photoID int64, date int) (domain.Contact, bool, error) {
@@ -443,6 +528,7 @@ WHERE c.user_id = $1
 			DCID:     int(dcID),
 			Stripped: domain.StrippedFromSizes(sizes),
 			Personal: true,
+			HasVideo: domain.PhotoHasVideo(sizes),
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -470,7 +556,7 @@ func contactFromListRow(row sqlcgen.ListContactsByUserRow) (domain.Contact, erro
 	if err != nil {
 		return domain.Contact{}, fmt.Errorf("decode contact note entities: %w", err)
 	}
-	return contactFromFields(row.ID, row.AccessHash, row.Phone, row.FirstName, row.LastName, row.Username, row.CountryCode, row.Verified, row.Support, int(row.LastSeenAt), row.ContactFirstName, row.ContactLastName, row.ContactPhone, row.Note, entities, row.Mutual), nil
+	return contactFromFields(row.ID, row.AccessHash, row.Phone, row.FirstName, row.LastName, row.Username, row.CountryCode, row.Verified, row.Support, row.IsBot, int(row.BotInfoVersion), premiumUntilFromModel(row.PremiumExpiresAt), row.EmojiStatusDocumentID, int(row.EmojiStatusUntil), int(row.LastSeenAt), row.ContactFirstName, row.ContactLastName, row.ContactPhone, row.Note, entities, row.Mutual, row.CloseFriend), nil
 }
 
 func contactFromGetRow(row sqlcgen.GetContactRow) (domain.Contact, error) {
@@ -478,7 +564,7 @@ func contactFromGetRow(row sqlcgen.GetContactRow) (domain.Contact, error) {
 	if err != nil {
 		return domain.Contact{}, fmt.Errorf("decode contact note entities: %w", err)
 	}
-	return contactFromFields(row.ID, row.AccessHash, row.Phone, row.FirstName, row.LastName, row.Username, row.CountryCode, row.Verified, row.Support, int(row.LastSeenAt), row.ContactFirstName, row.ContactLastName, row.ContactPhone, row.Note, entities, row.Mutual), nil
+	return contactFromFields(row.ID, row.AccessHash, row.Phone, row.FirstName, row.LastName, row.Username, row.CountryCode, row.Verified, row.Support, row.IsBot, int(row.BotInfoVersion), premiumUntilFromModel(row.PremiumExpiresAt), row.EmojiStatusDocumentID, int(row.EmojiStatusUntil), int(row.LastSeenAt), row.ContactFirstName, row.ContactLastName, row.ContactPhone, row.Note, entities, row.Mutual, row.CloseFriend), nil
 }
 
 func contactFromUpsertRow(row sqlcgen.UpsertContactRow) (domain.Contact, error) {
@@ -486,7 +572,7 @@ func contactFromUpsertRow(row sqlcgen.UpsertContactRow) (domain.Contact, error) 
 	if err != nil {
 		return domain.Contact{}, fmt.Errorf("decode contact note entities: %w", err)
 	}
-	return contactFromFields(row.ID, row.AccessHash, row.Phone, row.FirstName, row.LastName, row.Username, row.CountryCode, row.Verified, row.Support, int(row.LastSeenAt), row.ContactFirstName, row.ContactLastName, row.ContactPhone, row.Note, entities, row.Mutual), nil
+	return contactFromFields(row.ID, row.AccessHash, row.Phone, row.FirstName, row.LastName, row.Username, row.CountryCode, row.Verified, row.Support, row.IsBot, int(row.BotInfoVersion), premiumUntilFromModel(row.PremiumExpiresAt), row.EmojiStatusDocumentID, int(row.EmojiStatusUntil), int(row.LastSeenAt), row.ContactFirstName, row.ContactLastName, row.ContactPhone, row.Note, entities, row.Mutual, row.CloseFriend), nil
 }
 
 func contactFromUpdateNoteRow(row sqlcgen.UpdateContactNoteRow) (domain.Contact, error) {
@@ -494,24 +580,35 @@ func contactFromUpdateNoteRow(row sqlcgen.UpdateContactNoteRow) (domain.Contact,
 	if err != nil {
 		return domain.Contact{}, fmt.Errorf("decode contact note entities: %w", err)
 	}
-	return contactFromFields(row.ID, row.AccessHash, row.Phone, row.FirstName, row.LastName, row.Username, row.CountryCode, row.Verified, row.Support, int(row.LastSeenAt), row.ContactFirstName, row.ContactLastName, row.ContactPhone, row.Note, entities, row.Mutual), nil
+	return contactFromFields(row.ID, row.AccessHash, row.Phone, row.FirstName, row.LastName, row.Username, row.CountryCode, row.Verified, row.Support, row.IsBot, int(row.BotInfoVersion), premiumUntilFromModel(row.PremiumExpiresAt), row.EmojiStatusDocumentID, int(row.EmojiStatusUntil), int(row.LastSeenAt), row.ContactFirstName, row.ContactLastName, row.ContactPhone, row.Note, entities, row.Mutual, row.CloseFriend), nil
 }
 
-func contactFromFields(id, accessHash int64, phone, firstName, lastName, username, countryCode string, verified, support bool, lastSeenAt int, contactFirstName, contactLastName, contactPhone, note string, noteEntities []domain.MessageEntity, mutual bool) domain.Contact {
+// contactFromFields 组装 domain.Contact。getContacts 主路径（List/Get/Upsert/UpdateNote
+// 四个 sqlc 查询）传真实 is_bot/bot_info_version；ImportContacts 等手机号批量导入的
+// raw-scan 调用传 false/0——bot 无 phone 不经手机号导入，bot 加联系人走 username
+// 的单条 UpsertContact 路径（已带真实 bot 列）。premium/emoji status 列所有路径必须
+// 传真实值：TDesktop 对任何缺 emoji_status 字段的 user TL 一律清空本地状态。
+func contactFromFields(id, accessHash int64, phone, firstName, lastName, username, countryCode string, verified, support, isBot bool, botInfoVersion, premiumUntil int, emojiStatusDocumentID int64, emojiStatusUntil, lastSeenAt int, contactFirstName, contactLastName, contactPhone, note string, noteEntities []domain.MessageEntity, mutual, closeFriend bool) domain.Contact {
 	return domain.Contact{
 		User: domain.User{
-			ID:          id,
-			AccessHash:  accessHash,
-			Phone:       phone,
-			FirstName:   firstName,
-			LastName:    lastName,
-			Username:    username,
-			CountryCode: countryCode,
-			Verified:    verified,
-			Support:     support,
-			LastSeenAt:  lastSeenAt,
-			Contact:     true,
-			Mutual:      mutual,
+			ID:                    id,
+			AccessHash:            accessHash,
+			Phone:                 phone,
+			FirstName:             firstName,
+			LastName:              lastName,
+			Username:              username,
+			CountryCode:           countryCode,
+			Verified:              verified,
+			Support:               support,
+			Bot:                   isBot,
+			BotInfoVersion:        botInfoVersion,
+			PremiumUntil:          premiumUntil,
+			EmojiStatusDocumentID: emojiStatusDocumentID,
+			EmojiStatusUntil:      emojiStatusUntil,
+			LastSeenAt:            lastSeenAt,
+			Contact:               true,
+			Mutual:                mutual,
+			CloseFriend:           closeFriend,
 		},
 		FirstName:    contactFirstName,
 		LastName:     contactLastName,
@@ -519,6 +616,7 @@ func contactFromFields(id, accessHash int64, phone, firstName, lastName, usernam
 		Note:         note,
 		NoteEntities: noteEntities,
 		Mutual:       mutual,
+		CloseFriend:  closeFriend,
 	}
 }
 
@@ -530,6 +628,7 @@ func scanContactRows(row contactScanner) (domain.Contact, error) {
 	var (
 		contactUserID    int64
 		mutual           bool
+		closeFriend      bool
 		contactPhone     string
 		contactFirstName string
 		contactLastName  string
@@ -544,11 +643,15 @@ func scanContactRows(row contactScanner) (domain.Contact, error) {
 		countryCode      string
 		verified         bool
 		support          bool
+		premiumUntil     int64
+		emojiStatusDocID int64
+		emojiStatusUntil int64
 		lastSeenAt       int32
 	)
 	if err := row.Scan(
 		&contactUserID,
 		&mutual,
+		&closeFriend,
 		&contactPhone,
 		&contactFirstName,
 		&contactLastName,
@@ -563,6 +666,9 @@ func scanContactRows(row contactScanner) (domain.Contact, error) {
 		&countryCode,
 		&verified,
 		&support,
+		&premiumUntil,
+		&emojiStatusDocID,
+		&emojiStatusUntil,
 		&lastSeenAt,
 	); err != nil {
 		return domain.Contact{}, err
@@ -571,13 +677,14 @@ func scanContactRows(row contactScanner) (domain.Contact, error) {
 	if err != nil {
 		return domain.Contact{}, err
 	}
-	return contactFromFields(id, accessHash, phone, firstName, lastName, username, countryCode, verified, support, int(lastSeenAt), contactFirstName, contactLastName, contactPhone, note, entities, mutual), nil
+	return contactFromFields(id, accessHash, phone, firstName, lastName, username, countryCode, verified, support, false, 0, int(premiumUntil), emojiStatusDocID, int(emojiStatusUntil), int(lastSeenAt), contactFirstName, contactLastName, contactPhone, note, entities, mutual, closeFriend), nil
 }
 
 func scanReverseContactRows(row contactScanner) (int64, domain.Contact, error) {
 	var (
 		ownerUserID      int64
 		mutual           bool
+		closeFriend      bool
 		contactPhone     string
 		contactFirstName string
 		contactLastName  string
@@ -592,11 +699,15 @@ func scanReverseContactRows(row contactScanner) (int64, domain.Contact, error) {
 		countryCode      string
 		verified         bool
 		support          bool
+		premiumUntil     int64
+		emojiStatusDocID int64
+		emojiStatusUntil int64
 		lastSeenAt       int32
 	)
 	if err := row.Scan(
 		&ownerUserID,
 		&mutual,
+		&closeFriend,
 		&contactPhone,
 		&contactFirstName,
 		&contactLastName,
@@ -611,6 +722,9 @@ func scanReverseContactRows(row contactScanner) (int64, domain.Contact, error) {
 		&countryCode,
 		&verified,
 		&support,
+		&premiumUntil,
+		&emojiStatusDocID,
+		&emojiStatusUntil,
 		&lastSeenAt,
 	); err != nil {
 		return 0, domain.Contact{}, err
@@ -619,7 +733,7 @@ func scanReverseContactRows(row contactScanner) (int64, domain.Contact, error) {
 	if err != nil {
 		return 0, domain.Contact{}, err
 	}
-	contact := contactFromFields(id, accessHash, phone, firstName, lastName, username, countryCode, verified, support, int(lastSeenAt), contactFirstName, contactLastName, contactPhone, note, entities, mutual)
+	contact := contactFromFields(id, accessHash, phone, firstName, lastName, username, countryCode, verified, support, false, 0, int(premiumUntil), emojiStatusDocID, int(emojiStatusUntil), int(lastSeenAt), contactFirstName, contactLastName, contactPhone, note, entities, mutual, closeFriend)
 	return ownerUserID, contact, nil
 }
 
@@ -748,7 +862,12 @@ func contactListHash(contacts []domain.Contact) int64 {
 		} else {
 			buf[8] = 0
 		}
-		_, _ = h.Write(buf[:9])
+		if c.CloseFriend || c.User.CloseFriend {
+			buf[9] = 1
+		} else {
+			buf[9] = 0
+		}
+		_, _ = h.Write(buf[:10])
 		_, _ = h.Write([]byte(c.FirstName))
 		_, _ = h.Write([]byte{0})
 		_, _ = h.Write([]byte(c.LastName))

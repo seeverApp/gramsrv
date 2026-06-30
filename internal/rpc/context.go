@@ -1,6 +1,10 @@
 package rpc
 
-import "context"
+import (
+	"context"
+	"regexp"
+	"strings"
+)
 
 type ctxKey int
 
@@ -11,6 +15,19 @@ const (
 	authKeyIDKey
 	sessionIDKey
 	userIDKey
+	invokeWithoutUpdatesKey
+)
+
+const currentClientLayer = 227
+
+var androidSDKVersionRE = regexp.MustCompile(`\bsdk\s+\d+\b`)
+
+type ClientType string
+
+const (
+	ClientTypeUnknown  ClientType = "unknown"
+	ClientTypeTDesktop ClientType = "tdesktop"
+	ClientTypeAndroid  ClientType = "android"
 )
 
 // ClientInfo 是 initConnection 携带的客户端信息。
@@ -22,6 +39,7 @@ type ClientInfo struct {
 	SystemLangCode string
 	LangPack       string
 	LangCode       string
+	Type           ClientType
 }
 
 // WithLayer 在 ctx 注入客户端 layer（来自 invokeWithLayer）。
@@ -39,6 +57,7 @@ func LayerFrom(ctx context.Context) int {
 
 // WithClientInfo 在 ctx 注入客户端信息（来自 initConnection）。
 func WithClientInfo(ctx context.Context, info ClientInfo) context.Context {
+	info = normalizeClientInfo(info)
 	return context.WithValue(ctx, clientInfoKey, info)
 }
 
@@ -46,6 +65,54 @@ func WithClientInfo(ctx context.Context, info ClientInfo) context.Context {
 func ClientInfoFrom(ctx context.Context) (ClientInfo, bool) {
 	v, ok := ctx.Value(clientInfoKey).(ClientInfo)
 	return v, ok
+}
+
+func ClientTypeFrom(ctx context.Context) ClientType {
+	if info, ok := ClientInfoFrom(ctx); ok {
+		return info.ClientType()
+	}
+	return ClientTypeUnknown
+}
+
+func normalizeClientInfo(info ClientInfo) ClientInfo {
+	if !knownClientType(info.Type) {
+		info.Type = detectClientType(info)
+	}
+	return info
+}
+
+func (info ClientInfo) ClientType() ClientType {
+	if knownClientType(info.Type) {
+		return info.Type
+	}
+	return detectClientType(info)
+}
+
+func knownClientType(t ClientType) bool {
+	switch t {
+	case ClientTypeTDesktop, ClientTypeAndroid:
+		return true
+	default:
+		return false
+	}
+}
+
+func detectClientType(info ClientInfo) ClientType {
+	if strings.EqualFold(info.LangPack, string(ClientTypeAndroid)) {
+		return ClientTypeAndroid
+	}
+	if strings.EqualFold(info.LangPack, string(ClientTypeTDesktop)) {
+		return ClientTypeTDesktop
+	}
+	client := strings.ToLower(info.DeviceModel + " " + info.SystemVersion + " " + info.AppVersion)
+	switch {
+	case strings.Contains(client, "android"), androidSDKVersionRE.MatchString(client):
+		return ClientTypeAndroid
+	case strings.Contains(client, "tdesktop"), strings.Contains(client, "desktop"):
+		return ClientTypeTDesktop
+	default:
+		return ClientTypeUnknown
+	}
 }
 
 // WithRawAuthKeyID 在 ctx 注入连接实际使用的 auth_key_id。
@@ -93,4 +160,15 @@ func UserIDFrom(ctx context.Context) (int64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// withInvokeWithoutUpdates 标记当前请求被 invokeWithoutUpdates 包装：
+// 客户端声明该 session 不接收主动 updates（media/temp 连接的请求一律带此包装）。
+func withInvokeWithoutUpdates(ctx context.Context) context.Context {
+	return context.WithValue(ctx, invokeWithoutUpdatesKey, true)
+}
+
+func invokeWithoutUpdatesFrom(ctx context.Context) bool {
+	v, _ := ctx.Value(invokeWithoutUpdatesKey).(bool)
+	return v
 }

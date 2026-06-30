@@ -2,6 +2,7 @@ package mtprotoedge
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -59,11 +60,9 @@ func TestRPCGetConfig(t *testing.T) {
 	if cfg.ThisDC != dc {
 		t.Fatalf("config.ThisDC = %d, want %d", cfg.ThisDC, dc)
 	}
-	if len(cfg.DCOptions) != 1 {
-		t.Fatalf("config.DCOptions count = %d, want 1", len(cfg.DCOptions))
-	}
-	if got := cfg.DCOptions[0]; got.ID != dc || got.IPAddress != advIP || got.Port != advPort {
-		t.Fatalf("DCOption = %+v, want id=%d ip=%s port=%d", got, dc, advIP, advPort)
+	// 不下发 DCOptions：客户端使用写死的 static DC 地址（空列表令其保留本地地址）。
+	if len(cfg.DCOptions) != 0 {
+		t.Fatalf("config.DCOptions = %+v, want empty (client uses pinned static address)", cfg.DCOptions)
 	}
 }
 
@@ -107,6 +106,52 @@ func TestInboundRPCQueueFullReturnsFloodWait(t *testing.T) {
 	close(handler.release)
 }
 
+func TestDuplicateRPCResultAcrossReconnectUsesSessionCache(t *testing.T) {
+	const dc = 2
+	handler := &countingConfigRPC{}
+	addr, pub, _ := startTestServer(t, Options{DC: dc, RPC: handler})
+	conn, auth, cipher := dialHandshake(t, addr, dc, pub)
+
+	clientMsgID := proto.NewMessageIDGen(time.Now)
+	reqMsgID := clientMsgID.New(proto.MessageFromClient)
+	sendEncrypted(t, conn, cipher, auth, reqMsgID, &tg.HelpGetConfigRequest{})
+
+	first := readRPCResultForRequest(t, conn, cipher, auth.AuthKey, reqMsgID)
+	if calls := handler.calls.Load(); calls != 1 {
+		t.Fatalf("handler calls after first request = %d, want 1", calls)
+	}
+	var firstConfig tg.Config
+	if err := firstConfig.Decode(&bin.Buffer{Buf: first.Result}); err != nil {
+		t.Fatalf("decode first config: %v", err)
+	}
+	if firstConfig.ThisDC != dc {
+		t.Fatalf("first config.ThisDC = %d, want %d", firstConfig.ThisDC, dc)
+	}
+
+	_ = conn.Close()
+	replayConn := dialTransportOnly(t, addr)
+	sendEncrypted(t, replayConn, cipher, auth, reqMsgID, &tg.HelpGetConfigRequest{})
+
+	second := readRPCResultForRequest(t, replayConn, cipher, auth.AuthKey, reqMsgID)
+	if calls := handler.calls.Load(); calls != 1 {
+		t.Fatalf("handler calls after replay = %d, want 1", calls)
+	}
+	if string(second.Result) != string(first.Result) {
+		t.Fatalf("replayed rpc_result payload changed")
+	}
+}
+
+type countingConfigRPC struct {
+	calls atomic.Int32
+}
+
+func (h *countingConfigRPC) Dispatch(context.Context, [8]byte, int64, *bin.Buffer) (bin.Encoder, error) {
+	h.calls.Add(1)
+	return &tg.Config{ThisDC: 2}, nil
+}
+
+func (h *countingConfigRPC) NegotiatedLayer([8]byte, int64) (int, bool) { return 227, true }
+
 type blockingRPC struct {
 	started chan struct{}
 	release chan struct{}
@@ -124,6 +169,8 @@ func (h *blockingRPC) Dispatch(ctx context.Context, _ [8]byte, _ int64, _ *bin.B
 		return nil, ctx.Err()
 	}
 }
+
+func (h *blockingRPC) NegotiatedLayer([8]byte, int64) (int, bool) { return 227, true }
 
 func readRPCResultForRequest(t *testing.T, conn transport.Conn, cipher crypto.Cipher, key crypto.AuthKey, reqMsgID int64) proto.Result {
 	t.Helper()

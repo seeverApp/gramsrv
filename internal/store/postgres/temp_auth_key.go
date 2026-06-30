@@ -35,6 +35,22 @@ func (s *TempAuthKeyBindingStore) Save(ctx context.Context, b domain.TempAuthKey
 	return nil
 }
 
+// DeleteExpired 实现 store.TempAuthKeyBindingStore：删除 auth_keys 中过期的 temp key，
+// temp_auth_key_bindings 经 ON DELETE CASCADE 一并清除，过期 key 的入站帧随之失效。
+func (s *TempAuthKeyBindingStore) DeleteExpired(ctx context.Context, expiredBefore int64, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	n, err := s.q.DeleteExpiredTempAuthKeys(ctx, sqlcgen.DeleteExpiredTempAuthKeysParams{
+		ExpiresAt: int32(expiredBefore),
+		Limit:     int32(limit),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("delete expired temp auth keys: %w", err)
+	}
+	return int(n), nil
+}
+
 func (s *TempAuthKeyBindingStore) GetByTemp(ctx context.Context, tempAuthKeyID [8]byte) (domain.TempAuthKeyBinding, bool, error) {
 	row, err := s.q.GetTempAuthKeyBinding(ctx, authKeyIDToInt64(tempAuthKeyID))
 	if err != nil {

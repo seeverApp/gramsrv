@@ -1,10 +1,14 @@
 package files
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
 )
@@ -25,6 +31,7 @@ import (
 type SeedStats struct {
 	Reactions   int
 	StickerSets int
+	Effects     int
 	Documents   int
 	Blobs       int
 	Skipped     bool
@@ -38,11 +45,19 @@ func (s *Service) SeedMedia(ctx context.Context, root string, maxRegularSets int
 		return stats, nil
 	}
 	if _, err := os.Stat(root); err != nil {
-		// 目录不存在：跳过而非失败（开发机可能未放资源）。
+		// 目录不存在：跳过而非失败（开发机可能未放资源）。但显式 WARN——否则「配置的 seed 目录
+		// 不存在 → 静默不导入贴纸/reaction」会被埋没（DB 已有旧数据时尤其隐蔽，表现为客户端反复
+		// 拉取未 seed 的集）。配置 TELESRV_STICKER_SEED_DIR 指向真实导出目录即可。
+		if s.log != nil {
+			s.log.Warn("sticker/reaction seed 目录不存在，跳过媒体种子导入（配置 TELESRV_STICKER_SEED_DIR）",
+				zap.String("dir", root), zap.Error(err))
+		}
 		stats.Skipped = true
 		return stats, nil
 	}
 
+	phaseStarted := time.Now()
+	phaseBefore := stats
 	// reactions
 	if n, err := s.media.CountAvailableReactions(ctx); err != nil {
 		return stats, err
@@ -57,26 +72,56 @@ func (s *Service) SeedMedia(ctx context.Context, root string, maxRegularSets int
 			return stats, fmt.Errorf("repair reactions: %w", err)
 		}
 	}
+	s.logSeedPhase("reactions", phaseStarted, phaseBefore, stats)
 
-	// sticker sets（default 系统集 + 常规集）
+	phaseStarted = time.Now()
+	phaseBefore = stats
+	// sticker sets（default 系统集 + 常规集 + emoji 集）：始终扫描导出目录以**增量**拾取
+	// 新增的 set 目录——importStickerSetDir 跳过内容(hash)未变的已有集,只导入新集/变更集。
+	// 这样向已部署(非空 store)的 data/sticker-seed 丢新集后重启即可生效,无需清库重 seed。
+	// 仅当检测到旧版缩略图/可渲染预览元数据缺失时 force=true 全量重导修复。
+	forceSticker := false
 	if n, err := s.media.CountStickerSets(ctx); err != nil {
 		return stats, err
-	} else if n == 0 {
-		if err := s.seedStickerSets(ctx, root, maxRegularSets, &stats); err != nil {
-			return stats, fmt.Errorf("seed sticker sets: %w", err)
+	} else if n > 0 {
+		stale, err := s.stickerSetDocumentsNeedSeedRepair(ctx)
+		if err != nil {
+			return stats, err
 		}
-	} else if stale, err := s.stickerSetDocumentThumbsNeedInlineCache(ctx); err != nil {
-		return stats, err
-	} else if stale {
-		if err := s.seedStickerSets(ctx, root, maxRegularSets, &stats); err != nil {
-			return stats, fmt.Errorf("repair sticker set thumbs: %w", err)
-		}
+		forceSticker = stale
 	}
+	if err := s.seedStickerSets(ctx, root, maxRegularSets, forceSticker, &stats); err != nil {
+		return stats, fmt.Errorf("seed sticker sets: %w", err)
+	}
+	s.logSeedPhase("sticker_sets", phaseStarted, phaseBefore, stats)
 
-	if stats.Reactions == 0 && stats.StickerSets == 0 {
+	phaseStarted = time.Now()
+	phaseBefore = stats
+	// 消息发送特效:全局静态目录,每次启动重建内存 s.effects(文档导入幂等)。
+	if err := s.seedEffects(ctx, root, &stats); err != nil {
+		return stats, fmt.Errorf("seed effects: %w", err)
+	}
+	s.logSeedPhase("effects", phaseStarted, phaseBefore, stats)
+
+	if stats.Reactions == 0 && stats.StickerSets == 0 && stats.Effects == 0 {
 		stats.Skipped = true
 	}
 	return stats, nil
+}
+
+func (s *Service) logSeedPhase(phase string, started time.Time, before, after SeedStats) {
+	if s.log == nil {
+		return
+	}
+	s.log.Info("媒体种子阶段完成",
+		zap.String("phase", phase),
+		zap.Duration("elapsed", time.Since(started)),
+		zap.Int("reactions", after.Reactions-before.Reactions),
+		zap.Int("sticker_sets", after.StickerSets-before.StickerSets),
+		zap.Int("effects", after.Effects-before.Effects),
+		zap.Int("documents", after.Documents-before.Documents),
+		zap.Int("blobs", after.Blobs-before.Blobs),
+	)
 }
 
 // ---- reactions ----
@@ -175,7 +220,7 @@ func (s *Service) availableReactionSeedNeedsRepair(ctx context.Context) (bool, e
 
 // ---- sticker sets ----
 
-func (s *Service) seedStickerSets(ctx context.Context, root string, maxRegular int, stats *SeedStats) error {
+func (s *Service) seedStickerSets(ctx context.Context, root string, maxRegular int, force bool, stats *SeedStats) error {
 	// default 系统集：目录名 → system_key。
 	defaultDir := filepath.Join(root, "telegram_default_stickers_export")
 	order := 0
@@ -190,8 +235,28 @@ func (s *Service) seedStickerSets(ctx context.Context, root string, maxRegular i
 		for _, name := range names {
 			systemKey := systemKeyForDefaultSet(name)
 			setDir := filepath.Join(defaultDir, name)
-			if err := s.importStickerSetDir(ctx, setDir, systemKey, order, stats); err != nil {
+			if err := s.importStickerSetDir(ctx, setDir, systemKey, order, force, stats); err != nil {
 				return fmt.Errorf("import default set %s: %w", name, err)
+			}
+			order++
+		}
+	}
+
+	// custom-emoji 集（telegram_emoji_export/<set>/）：不受 maxRegular 限制,按 set_info 的
+	// emojis 标志归入 StickerSetKindEmoji(getEmojiStickers/getFeaturedEmojiStickers 下发)。
+	emojiDir := filepath.Join(root, "telegram_emoji_export")
+	if entries, err := os.ReadDir(emojiDir); err == nil {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			if e.IsDir() {
+				names = append(names, e.Name())
+			}
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			setDir := filepath.Join(emojiDir, name)
+			if err := s.importStickerSetDir(ctx, setDir, "", order, force, stats); err != nil {
+				return fmt.Errorf("import emoji set %s: %w", name, err)
 			}
 			order++
 		}
@@ -213,7 +278,7 @@ func (s *Service) seedStickerSets(ctx context.Context, root string, maxRegular i
 				break
 			}
 			setDir := filepath.Join(regularDir, name)
-			if err := s.importStickerSetDir(ctx, setDir, "", order, stats); err != nil {
+			if err := s.importStickerSetDir(ctx, setDir, "", order, force, stats); err != nil {
 				return fmt.Errorf("import sticker set %s: %w", name, err)
 			}
 			order++
@@ -223,7 +288,7 @@ func (s *Service) seedStickerSets(ctx context.Context, root string, maxRegular i
 	return nil
 }
 
-func (s *Service) importStickerSetDir(ctx context.Context, setDir, systemKey string, order int, stats *SeedStats) error {
+func (s *Service) importStickerSetDir(ctx context.Context, setDir, systemKey string, order int, force bool, stats *SeedStats) error {
 	infoPath := filepath.Join(setDir, "set_info.json")
 	raw, err := os.ReadFile(infoPath)
 	if err != nil {
@@ -238,6 +303,16 @@ func (s *Service) importStickerSetDir(ctx context.Context, setDir, systemKey str
 	sj := info.Result.Set
 	if sj.ID == 0 {
 		return nil
+	}
+	// 增量 seed：集已存在且内容 hash 未变则跳过（不重读文档/重传 blob）。force 时强制重导
+	// （缩略图内联缓存修复路径）。这让 seedStickerSets 可在非空 store 上每次启动安全重扫,
+	// 仅导入新增/变更集。
+	if !force {
+		if existing, found, err := s.media.GetStickerSetByID(ctx, sj.ID); err != nil {
+			return err
+		} else if found && existing.Hash == sj.Hash {
+			return nil
+		}
 	}
 	stickersDir := filepath.Join(setDir, "stickers")
 	index, err := scanSeedDir(stickersDir)
@@ -382,6 +457,10 @@ func (s *Service) importDocument(ctx context.Context, dj seedDocumentJSON, binDi
 	}
 	doc.Thumbs = thumbs
 
+	if err := s.ensureTGStickerPreviewThumb(ctx, &doc, stats); err != nil {
+		return domain.Document{}, err
+	}
+
 	if err := s.media.PutDocument(ctx, doc); err != nil {
 		return domain.Document{}, err
 	}
@@ -406,6 +485,7 @@ var seedTrailingDigits = regexp.MustCompile(`(\d{6,})`)
 var seedThumbMarker = regexp.MustCompile(`_thumb\d+_`)
 
 const seedInlineCachedDocumentThumbMaxBytes = 32 * 1024
+const seedSyntheticDocumentThumbType = "m"
 
 // Exported Telegram resources keep their original id in filenames/JSON, but
 // telesrv owns the document catalog it serves. Imported high source ids are
@@ -413,6 +493,7 @@ const seedInlineCachedDocumentThumbMaxBytes = 32 * 1024
 const seedExternalDocumentIDOffset int64 = 4_000_000_000_000_000_000
 
 var seedThumbType = regexp.MustCompile(`PhotoSize_type([a-z])`)
+var seedSyntheticTGStickerPreviewThumbPNG = makeSeedSyntheticTGStickerPreviewThumbPNG()
 
 func seedDocumentStorageID(sourceID int64) int64 {
 	if sourceID <= 0 {
@@ -559,17 +640,6 @@ func seedDocumentAttributes(attrs []seedAttrJSON) []domain.DocumentAttribute {
 	return out
 }
 
-func seedPhotoSizes(thumbs []seedThumbJSON) []domain.PhotoSize {
-	out := make([]domain.PhotoSize, 0, len(thumbs))
-	for _, t := range thumbs {
-		ps, _ := seedPhotoSize(t)
-		if ps.Kind != "" {
-			out = append(out, ps)
-		}
-	}
-	return out
-}
-
 func seedStickerSetPhotoSizes(thumbs []seedThumbJSON) []domain.PhotoSize {
 	out := make([]domain.PhotoSize, 0, len(thumbs))
 	for _, t := range thumbs {
@@ -612,6 +682,63 @@ func seedInlineCachedDocumentThumb(ps domain.PhotoSize, data []byte) domain.Phot
 	return ps
 }
 
+func (s *Service) ensureTGStickerPreviewThumb(ctx context.Context, doc *domain.Document, stats *SeedStats) error {
+	if !seedDocumentNeedsSyntheticTGStickerPreviewThumb(*doc) {
+		return nil
+	}
+	if s.blobs == nil {
+		return fmt.Errorf("blob backend not configured for synthetic sticker preview thumb")
+	}
+	data := seedSyntheticTGStickerPreviewThumbPNG
+	objectKey, err := s.blobs.Put(ctx, data)
+	if err != nil {
+		return err
+	}
+	if err := s.media.PutFileBlob(ctx, domain.FileBlob{
+		LocationKey: fmt.Sprintf("doc:%d:%s", doc.ID, seedSyntheticDocumentThumbType),
+		Backend:     domain.MediaBackend(s.blobs.Name()),
+		ObjectKey:   objectKey,
+		Size:        int64(len(data)),
+		MimeType:    "image/png",
+	}); err != nil {
+		return err
+	}
+	doc.Thumbs = append(doc.Thumbs, domain.PhotoSize{
+		Kind:  domain.PhotoSizeKindCached,
+		Type:  seedSyntheticDocumentThumbType,
+		W:     1,
+		H:     1,
+		Bytes: append([]byte(nil), data...),
+	})
+	s.prewarmSmallBlob(objectKey, data)
+	stats.Blobs++
+	return nil
+}
+
+func seedDocumentNeedsSyntheticTGStickerPreviewThumb(doc domain.Document) bool {
+	if doc.MimeType != "application/x-tgsticker" || len(doc.Thumbs) > 0 {
+		return false
+	}
+	return seedDocumentHasAttribute(doc.Attributes, domain.DocAttrCustomEmoji)
+}
+
+func seedDocumentHasAttribute(attrs []domain.DocumentAttribute, kind domain.DocumentAttributeKind) bool {
+	for _, attr := range attrs {
+		if attr.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func makeSeedSyntheticTGStickerPreviewThumbPNG() []byte {
+	var buf bytes.Buffer
+	img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	img.Set(0, 0, color.NRGBA{})
+	_ = png.Encode(&buf, img)
+	return buf.Bytes()
+}
+
 func seedThumbMimeType(data []byte) string {
 	switch {
 	case len(data) >= 12 && data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F' &&
@@ -628,7 +755,7 @@ func seedThumbMimeType(data []byte) string {
 	}
 }
 
-func (s *Service) stickerSetDocumentThumbsNeedInlineCache(ctx context.Context) (bool, error) {
+func (s *Service) stickerSetDocumentsNeedSeedRepair(ctx context.Context) (bool, error) {
 	var ids []int64
 	for _, kind := range []domain.StickerSetKind{
 		domain.StickerSetKindStickers,
@@ -644,10 +771,14 @@ func (s *Service) stickerSetDocumentThumbsNeedInlineCache(ctx context.Context) (
 			ids = append(ids, set.DocumentIDs...)
 		}
 	}
-	return s.documentsNeedInlineCachedThumbs(ctx, ids)
+	return s.documentsNeedSeedRepair(ctx, ids)
 }
 
 func (s *Service) documentsNeedInlineCachedThumbs(ctx context.Context, ids []int64) (bool, error) {
+	return s.documentsNeedSeedRepair(ctx, ids)
+}
+
+func (s *Service) documentsNeedSeedRepair(ctx context.Context, ids []int64) (bool, error) {
 	if len(ids) == 0 {
 		return false, nil
 	}
@@ -668,6 +799,9 @@ func (s *Service) documentsNeedInlineCachedThumbs(ctx context.Context, ids []int
 		return false, err
 	}
 	for _, doc := range docs {
+		if seedDocumentNeedsSyntheticTGStickerPreviewThumb(doc) {
+			return true, nil
+		}
 		for _, thumb := range doc.Thumbs {
 			if thumb.Kind == domain.PhotoSizeKindDefault && thumb.Size > 0 && thumb.Size <= seedInlineCachedDocumentThumbMaxBytes {
 				return true, nil

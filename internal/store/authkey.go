@@ -19,4 +19,7 @@ type AuthKeyStore interface {
 	Save(ctx context.Context, k AuthKeyData) error
 	// Get 按 auth_key_id 查询；不存在时 found=false。
 	Get(ctx context.Context, id [8]byte) (data AuthKeyData, found bool, err error)
+	// Delete 删除一条 auth key 记录（destroy_auth_key）。不存在时静默成功。
+	// 连接层每帧按 auth_key_id 回查本接口，删除后该 key 的入站帧立即失效。
+	Delete(ctx context.Context, id [8]byte) error
 }

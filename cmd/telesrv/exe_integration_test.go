@@ -13,6 +13,7 @@ import (
 
 	"go.uber.org/zap/zaptest"
 
+	"github.com/gotd/log/logzap"
 	tdcrypto "github.com/gotd/td/crypto"
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/mtproxy"
@@ -104,7 +105,7 @@ func TestExecutablePrivateMessageRoundTrip(t *testing.T) {
 			PublicKeys:     []exchange.PublicKey{{RSA: &rsaKey.PublicKey}},
 			Resolver:       noSecretObfuscatedResolver{addr: addr, dc: 2},
 			DCList:         dcs.List{Options: []tg.DCOption{{ID: 2, IPAddress: host, Port: port, Static: true}}},
-			Logger:         zaptest.NewLogger(t).Named("exe-client"),
+			Logger:         logzap.New(zaptest.NewLogger(t).Named("exe-client")),
 			SessionStorage: storage,
 			UpdateHandler:  telegram.UpdateHandlerFunc(func(context.Context, tg.UpdatesClass) error { return nil }),
 		}

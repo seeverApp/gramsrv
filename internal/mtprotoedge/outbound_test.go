@@ -104,6 +104,26 @@ func TestOutboundActorSerializesConcurrentSends(t *testing.T) {
 	}
 }
 
+func TestFrameNeedsAckServiceExceptions(t *testing.T) {
+	cases := []struct {
+		name string
+		id   uint32
+		want bool
+	}{
+		{name: "pong", id: mt.PongTypeID, want: false},
+		{name: "future_salts", id: mt.FutureSaltsTypeID, want: false},
+		{name: "msgs_ack", id: mt.MsgsAckTypeID, want: false},
+		{name: "updatesTooLong", id: tg.UpdatesTooLongTypeID, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := frameNeedsAck(tc.id); got != tc.want {
+				t.Fatalf("frameNeedsAck(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestOutboundResendAndAckState(t *testing.T) {
 	const dc = 2
 	addr, pub, srv := startTestServer(t, Options{DC: dc})

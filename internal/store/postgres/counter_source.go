@@ -43,21 +43,22 @@ func (s *ChannelIDCounterSource) Current(ctx context.Context, _ int64) (int, err
 	return id, nil
 }
 
-// ChannelPtsCounterSource 从 channel_update_events 恢复某 channel 的当前最大 pts。
-type ChannelPtsCounterSource struct {
+// SecretChatIDCounterSource 从 secret_chats 表恢复全局 secret chat id（迁移 0137）。
+type SecretChatIDCounterSource struct {
 	db sqlcgen.DBTX
 }
 
-func NewChannelPtsCounterSource(db sqlcgen.DBTX) *ChannelPtsCounterSource {
-	return &ChannelPtsCounterSource{db: db}
+// NewSecretChatIDCounterSource 创建 Redis SecretChatIDAllocator 的 PG 恢复源。
+func NewSecretChatIDCounterSource(db sqlcgen.DBTX) *SecretChatIDCounterSource {
+	return &SecretChatIDCounterSource{db: db}
 }
 
-func (s *ChannelPtsCounterSource) Current(ctx context.Context, channelID int64) (int, error) {
-	var pts int
-	if err := s.db.QueryRow(ctx, `SELECT COALESCE(MAX(pts), 0) FROM channel_update_events WHERE channel_id = $1`, channelID).Scan(&pts); err != nil {
-		return 0, fmt.Errorf("max channel pts: %w", err)
+func (s *SecretChatIDCounterSource) Current(ctx context.Context, _ int64) (int, error) {
+	var id int
+	if err := s.db.QueryRow(ctx, `SELECT COALESCE(MAX(chat_id), 0) FROM secret_chats`).Scan(&id); err != nil {
+		return 0, fmt.Errorf("max secret chat id: %w", err)
 	}
-	return pts, nil
+	return id, nil
 }
 
 // ChannelMessageIDCounterSource 从 channel_messages 恢复某 channel 的当前最大 message id。

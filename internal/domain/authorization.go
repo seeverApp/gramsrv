@@ -15,6 +15,9 @@ type Authorization struct {
 	APIID         int
 	AppVersion    string
 	IP            string
-	CreatedAt     time.Time
-	ActiveAt      time.Time
+	// PasswordPending 表示该 auth_key 已通过短信验证码、但账号开启了两步验证且尚未通过
+	// auth.checkPassword。此状态下业务鉴权须视其为未登录，仅允许继续完成两步验证。
+	PasswordPending bool
+	CreatedAt       time.Time
+	ActiveAt        time.Time
 }

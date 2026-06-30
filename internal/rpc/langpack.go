@@ -4,28 +4,31 @@ import (
 	"context"
 	"strings"
 
-	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 )
 
-const (
-	legacyLangpackGetLangPackTypeID  uint32 = 0x9ab5c58e
-	legacyLangpackGetStringsTypeID   uint32 = 0x2e1ee318
-	legacyLangpackGetLanguagesTypeID uint32 = 0x800fd57d
-
-	maxLegacyLangpackStringKeys = 512
-)
-
 // registerLangpack 注册 langpack.* RPC handler。
+//
+// 老客户端（DrKLO）发的是不带 lang_pack 参数的旧构造器，已由 layerwire 入站升级为 227
+// 形态并把 lang_pack 置空；故这里 lang_pack 为空时回退到按 client 信息派生（langPackFromClient），
+// 与历史 handleLegacyLangpack* 的行为一致。
 func (r *Router) registerLangpack(d *tg.ServerDispatcher) {
 	d.OnLangpackGetLanguages(func(ctx context.Context, langPack string) ([]tg.LangPackLanguage, error) {
 		return r.langpackLanguages(ctx, langPack), nil
 	})
+	d.OnLangpackGetLanguage(func(ctx context.Context, req *tg.LangpackGetLanguageRequest) (*tg.LangPackLanguage, error) {
+		if req == nil {
+			return nil, inputConstructorInvalidErr()
+		}
+		lang := r.langpackLanguage(ctx, req.LangPack, req.LangCode)
+		return &lang, nil
+	})
 	d.OnLangpackGetLangPack(func(ctx context.Context, req *tg.LangpackGetLangPackRequest) (*tg.LangPackDifference, error) {
+		langPack := langPackOrClient(ctx, req.LangPack)
 		if r.deps.LangPack == nil {
 			return &tg.LangPackDifference{LangCode: req.LangCode}, nil
 		}
-		pack, err := r.deps.LangPack.GetLangPack(ctx, req.LangPack, req.LangCode)
+		pack, err := r.deps.LangPack.GetLangPack(ctx, langPack, req.LangCode)
 		if err != nil {
 			return nil, internalErr()
 		}
@@ -35,7 +38,7 @@ func (r *Router) registerLangpack(d *tg.ServerDispatcher) {
 		if r.deps.LangPack == nil {
 			return &tg.LangPackDifference{LangCode: req.LangCode, FromVersion: req.FromVersion}, nil
 		}
-		pack, err := r.deps.LangPack.GetDifference(ctx, req.LangPack, req.LangCode, req.FromVersion)
+		pack, err := r.deps.LangPack.GetDifference(ctx, langPackOrClient(ctx, req.LangPack), req.LangCode, req.FromVersion)
 		if err != nil {
 			return nil, internalErr()
 		}
@@ -45,7 +48,7 @@ func (r *Router) registerLangpack(d *tg.ServerDispatcher) {
 		if r.deps.LangPack == nil {
 			return nil, nil
 		}
-		pack, err := r.deps.LangPack.GetStrings(ctx, req.LangPack, req.LangCode, req.Keys)
+		pack, err := r.deps.LangPack.GetStrings(ctx, langPackOrClient(ctx, req.LangPack), req.LangCode, req.Keys)
 		if err != nil {
 			return nil, internalErr()
 		}
@@ -53,64 +56,35 @@ func (r *Router) registerLangpack(d *tg.ServerDispatcher) {
 	})
 }
 
-func (r *Router) handleLegacyLangpackGetLangPack(ctx context.Context, b *bin.Buffer) (bin.Encoder, error) {
-	if err := b.ConsumeID(legacyLangpackGetLangPackTypeID); err != nil {
-		return nil, err
+// langPackOrClient 返回请求里的 lang_pack；为空（老客户端经 layerwire 升级而来）时按 client 派生。
+func langPackOrClient(ctx context.Context, langPack string) string {
+	if langPack != "" {
+		return langPack
 	}
-	langCode, err := b.String()
-	if err != nil {
-		return nil, err
-	}
-	langPack := langPackFromClient(ctx)
-	if r.deps.LangPack == nil {
-		return &tg.LangPackDifference{LangCode: langCode}, nil
-	}
-	pack, err := r.deps.LangPack.GetLangPack(ctx, langPack, langCode)
-	if err != nil {
-		return nil, internalErr()
-	}
-	return tgLangPackDifference(pack), nil
+	return langPackFromClient(ctx)
 }
 
-func (r *Router) handleLegacyLangpackGetStrings(ctx context.Context, b *bin.Buffer) (bin.Encoder, error) {
-	if err := b.ConsumeID(legacyLangpackGetStringsTypeID); err != nil {
-		return nil, err
-	}
-	langCode, err := b.String()
-	if err != nil {
-		return nil, err
-	}
-	headerLen, err := b.VectorHeader()
-	if err != nil {
-		return nil, err
-	}
-	if headerLen > maxLegacyLangpackStringKeys {
-		return nil, limitInvalidErr()
-	}
-	keys := make([]string, 0, headerLen)
-	for i := 0; i < headerLen; i++ {
-		key, err := b.String()
-		if err != nil {
-			return nil, err
+func (r *Router) langpackLanguage(ctx context.Context, langPack, langCode string) tg.LangPackLanguage {
+	if langCode == "" {
+		if info, ok := ClientInfoFrom(ctx); ok && info.LangCode != "" {
+			langCode = info.LangCode
+		} else {
+			langCode = "en"
 		}
-		keys = append(keys, key)
 	}
-	langPack := langPackFromClient(ctx)
-	if r.deps.LangPack == nil {
-		return &tg.LangPackStringClassVector{}, nil
+	langCode = strings.ToLower(langCode)
+	languages := r.langpackLanguages(ctx, langPack)
+	for _, lang := range languages {
+		if strings.ToLower(lang.LangCode) == langCode {
+			return lang
+		}
 	}
-	pack, err := r.deps.LangPack.GetStrings(ctx, langPack, langCode, keys)
-	if err != nil {
-		return nil, internalErr()
+	for _, lang := range languages {
+		if strings.ToLower(lang.PluralCode) == langCode {
+			return lang
+		}
 	}
-	return &tg.LangPackStringClassVector{Elems: tgLangPackStrings(pack.Strings)}, nil
-}
-
-func (r *Router) handleLegacyLangpackGetLanguages(ctx context.Context, b *bin.Buffer) (bin.Encoder, error) {
-	if err := b.ConsumeID(legacyLangpackGetLanguagesTypeID); err != nil {
-		return nil, err
-	}
-	return &tg.LangPackLanguageVector{Elems: r.langpackLanguages(ctx, "")}, nil
+	return languages[0]
 }
 
 func (r *Router) langpackLanguages(ctx context.Context, langPack string) []tg.LangPackLanguage {

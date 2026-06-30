@@ -1,6 +1,9 @@
 package domain
 
-import "errors"
+import (
+	"errors"
+	"strings"
+)
 
 var (
 	ErrPasswordHashInvalid   = errors.New("password hash invalid")
@@ -76,7 +79,10 @@ type PasswordSettings struct {
 	Hint                    string
 	EmailUnconfirmedPattern string
 	RecoveryEmail           string
-	LoginEmailPattern       string
+	// LoginEmail 是已确认的登录邮箱地址（服务端私有，永不直接下发；下发的是掩码后的
+	// LoginEmailPattern）。它独立于 2FA 恢复邮箱 RecoveryEmail：账号可只设登录邮箱而无 2FA。
+	LoginEmail        string
+	LoginEmailPattern string
 	NewAlgo                 PasswordKDFAlgo
 	NewSecureAlgo           SecurePasswordKDFAlgo
 	SecureRandom            []byte
@@ -141,4 +147,80 @@ func DefaultAccountReactionSettings() AccountReactionSettings {
 		DefaultReaction: MessageReaction{Type: MessageReactionEmoji, Emoticon: "👍"},
 		PaidPrivacy:     PaidReactionPrivacy{Kind: PaidReactionPrivacyDefault},
 	}
+}
+
+// DefaultAccountTTLDays 是账号自毁默认期限（无显式设置时）。与历史固定回显一致。
+const DefaultAccountTTLDays = 365
+
+// GlobalPrivacy 是 globalPrivacySettings 的业务层表达（账号级隐私开关）。
+// DisallowedGifts 依赖礼物资产模型（当前未实现），故不建模、保持默认。
+type GlobalPrivacy struct {
+	ArchiveAndMuteNewNoncontactPeers bool
+	KeepArchivedUnmuted              bool
+	KeepArchivedFolders              bool
+	HideReadMarks                    bool
+	NewNoncontactPeersRequirePremium bool
+	DisplayGiftsButton               bool
+	// NoncontactPeersPaidStars：非联系人给本人发消息所需 Stars 数。Stars 账本尚未实现，
+	// 此处仅做忠实持久化（往返不丢值），不参与计费逻辑。
+	NoncontactPeersPaidStars int64
+}
+
+// AccountSettings 聚合账号级单例设置（每用户一行）：全局隐私、账号自毁期限、
+// 敏感内容开关、联系人注册通知静音。对应 account.get/set GlobalPrivacySettings、
+// get/set AccountTTL、get/set ContentSettings、get/set ContactSignUpNotification。
+type AccountSettings struct {
+	GlobalPrivacy           GlobalPrivacy
+	AccountTTLDays          int
+	SensitiveContentEnabled bool
+	// ContactSignUpSilent 对应 account.setContactSignUpNotification 的 silent 形参：
+	// true=联系人注册时不通知本人。getContactSignUpNotification 直接返回该值。
+	ContactSignUpSilent bool
+}
+
+// DefaultAccountSettings 是未持久化时的账号设置默认值（与历史回显 stub 行为一致：
+// 全局隐私全关、TTL 365 天、敏感内容关、联系人注册通知开启）。
+func DefaultAccountSettings() AccountSettings {
+	return AccountSettings{
+		AccountTTLDays: DefaultAccountTTLDays,
+	}
+}
+
+// NormalizedTTLDays 返回钳制后的账号自毁期限（0/越界回落默认）。
+func (s AccountSettings) NormalizedTTLDays() int {
+	if s.AccountTTLDays <= 0 {
+		return DefaultAccountTTLDays
+	}
+	return s.AccountTTLDays
+}
+
+// MaskEmail 把邮箱地址按 Telegram pattern 习惯掩码（首尾各保留一位本地名，如
+// a***z@x.com），用于 account.password.login_email_pattern / auth.sentCodeTypeEmailCode
+// 等只能暴露掩码的下发点。空串返回空串。
+func MaskEmail(email string) string {
+	if email == "" {
+		return ""
+	}
+	at := strings.Index(email, "@")
+	if at <= 1 {
+		return email
+	}
+	name := email[:at]
+	return name[:1] + "***" + name[len(name)-1:] + email[at:]
+}
+
+// NormalizePhone 仅保留手机号中的数字（与 users.phone 的存储形态一致）。全部被过滤
+// 掉时返回原串，便于上层做 validPhone 拒绝。auth/account 两域共用同一规则避免漂移。
+func NormalizePhone(phone string) string {
+	var b strings.Builder
+	b.Grow(len(phone))
+	for _, r := range phone {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return phone
+	}
+	return b.String()
 }

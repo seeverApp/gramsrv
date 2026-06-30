@@ -3,11 +3,129 @@ package contacts
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 	"telesrv/internal/store/memory"
 )
+
+type serviceCountingContactStore struct {
+	store.ContactStore
+	listCalls int
+}
+
+func (s *serviceCountingContactStore) ListByUser(ctx context.Context, userID int64) (domain.ContactList, error) {
+	s.listCalls++
+	return s.ContactStore.ListByUser(ctx, userID)
+}
+
+type serviceCountingUserStore struct {
+	store.UserStore
+	byIDsCalls int
+}
+
+func (s *serviceCountingUserStore) ByIDs(ctx context.Context, ids []int64) ([]domain.User, error) {
+	s.byIDsCalls++
+	return s.UserStore.ByIDs(ctx, ids)
+}
+
+type fakeReadModelVersions struct {
+	hash  int64
+	found bool
+}
+
+func (f *fakeReadModelVersions) ReadModelHash(_ context.Context, _ string, _ int64, _ domain.PeerType, _ int64) (int64, bool, error) {
+	return f.hash, f.found, nil
+}
+
+func (f *fakeReadModelVersions) ReadModelHashes(ctx context.Context, keys []store.ReadModelKey) (map[store.ReadModelKey]int64, error) {
+	out := make(map[store.ReadModelKey]int64, len(keys))
+	for _, key := range keys {
+		hash, found, err := f.ReadModelHash(ctx, key.Model, key.OwnerUserID, key.PeerType, key.PeerID)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			out[key] = hash
+		}
+	}
+	return out, nil
+}
+
+func TestGetContactsReturnsNotModifiedFromReadModelHashWithoutLoadingList(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewContactStore()
+	counting := &serviceCountingContactStore{ContactStore: base}
+	versions := &fakeReadModelVersions{hash: 99101, found: true}
+	svc := NewService(counting).Configure(WithReadModelVersions(versions))
+
+	list, notModified, err := svc.GetContacts(ctx, 1, versions.hash)
+	if err != nil {
+		t.Fatalf("GetContacts: %v", err)
+	}
+	if !notModified {
+		t.Fatalf("notModified = false, want true")
+	}
+	if list.Hash != versions.hash {
+		t.Fatalf("notModified list hash = %d, want %d", list.Hash, versions.hash)
+	}
+	if counting.listCalls != 0 {
+		t.Fatalf("ListByUser calls = %d, want 0 on hash hit", counting.listCalls)
+	}
+}
+
+func TestGetContactsCachesProjectedReadModelAndRejectsStaleHash(t *testing.T) {
+	ctx := context.Background()
+	users := memory.NewUserStore()
+	owner, err := users.Create(ctx, domain.User{Phone: "100", FirstName: "Owner"})
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	target, err := users.Create(ctx, domain.User{Phone: "101", FirstName: "Target"})
+	if err != nil {
+		t.Fatalf("create target: %v", err)
+	}
+	base := memory.NewContactStore()
+	if _, err := base.Upsert(ctx, owner.ID, domain.ContactInput{ContactUserID: target.ID, FirstName: "Saved"}); err != nil {
+		t.Fatalf("upsert contact: %v", err)
+	}
+	counting := &serviceCountingContactStore{ContactStore: base}
+	countingUsers := &serviceCountingUserStore{UserStore: users}
+	versions := &fakeReadModelVersions{hash: 12345, found: true}
+	svc := NewService(counting, countingUsers).Configure(WithReadModelVersions(versions))
+
+	first, notModified, err := svc.GetContacts(ctx, owner.ID, 0)
+	if err != nil || notModified {
+		t.Fatalf("first GetContacts notModified=%v err=%v", notModified, err)
+	}
+	if first.Hash != versions.hash || len(first.Contacts) != 1 {
+		t.Fatalf("first result hash=%d contacts=%d, want hash %d and one contact", first.Hash, len(first.Contacts), versions.hash)
+	}
+	second, notModified, err := svc.GetContacts(ctx, owner.ID, 0)
+	if err != nil || notModified {
+		t.Fatalf("second GetContacts notModified=%v err=%v", notModified, err)
+	}
+	if second.Hash != versions.hash || counting.listCalls != 1 {
+		t.Fatalf("second result hash=%d listCalls=%d, want cached hash %d and one load", second.Hash, counting.listCalls, versions.hash)
+	}
+
+	versions.hash = 67890
+	third, notModified, err := svc.GetContacts(ctx, owner.ID, 12345)
+	if err != nil || notModified {
+		t.Fatalf("third GetContacts notModified=%v err=%v", notModified, err)
+	}
+	if third.Hash != versions.hash {
+		t.Fatalf("third hash = %d, want new read-model hash %d", third.Hash, versions.hash)
+	}
+	if counting.listCalls != 2 {
+		t.Fatalf("ListByUser calls after hash change = %d, want 2", counting.listCalls)
+	}
+	if countingUsers.byIDsCalls != 0 {
+		t.Fatalf("Users.ByIDs calls = %d, want 0; presence must stay out of contact read model", countingUsers.byIDsCalls)
+	}
+}
 
 func TestImportContactsBatchesPhonesAndDedupesUpserts(t *testing.T) {
 	ctx := context.Background()
@@ -89,6 +207,73 @@ func TestGetContactsProjectsCurrentProfilePhoto(t *testing.T) {
 	}
 }
 
+func TestEditCloseFriendsReplacesOwnerContactFlags(t *testing.T) {
+	ctx := context.Background()
+	users := memory.NewUserStore()
+	contactsStore := memory.NewContactStore()
+	owner, err := users.Create(ctx, domain.User{Phone: "100", FirstName: "Owner"})
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	bob, err := users.Create(ctx, domain.User{Phone: "101", FirstName: "Bob"})
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	carol, err := users.Create(ctx, domain.User{Phone: "102", FirstName: "Carol"})
+	if err != nil {
+		t.Fatalf("create carol: %v", err)
+	}
+	bot, err := users.Create(ctx, domain.User{Phone: "103", FirstName: "Bot", Bot: true, BotInfoVersion: 1})
+	if err != nil {
+		t.Fatalf("create bot: %v", err)
+	}
+	for _, user := range []domain.User{bob, carol, bot} {
+		if _, err := contactsStore.Upsert(ctx, owner.ID, domain.ContactInput{ContactUserID: user.ID, FirstName: user.FirstName}); err != nil {
+			t.Fatalf("upsert contact %d: %v", user.ID, err)
+		}
+	}
+	svc := NewService(contactsStore, users)
+
+	result, err := svc.EditCloseFriends(ctx, owner.ID, []int64{bob.ID, bob.ID, 0, owner.ID, bot.ID, 999999})
+	if err != nil {
+		t.Fatalf("EditCloseFriends first: %v", err)
+	}
+	if got, want := result.AddedUserIDs, []int64{bob.ID}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("first added = %v, want %v", got, want)
+	}
+	if len(result.RemovedUserIDs) != 0 {
+		t.Fatalf("first removed = %v, want empty", result.RemovedUserIDs)
+	}
+	list, notModified, err := svc.GetContacts(ctx, owner.ID, 0)
+	if err != nil || notModified {
+		t.Fatalf("GetContacts after first edit notModified=%v err=%v", notModified, err)
+	}
+	if !contactByID(t, list, bob.ID).CloseFriend || !contactByID(t, list, bob.ID).User.CloseFriend {
+		t.Fatalf("bob close friend projection = %+v, want true", contactByID(t, list, bob.ID))
+	}
+	if contactByID(t, list, carol.ID).CloseFriend || contactByID(t, list, bot.ID).CloseFriend {
+		t.Fatalf("carol/bot close friend flags = %+v / %+v, want false", contactByID(t, list, carol.ID), contactByID(t, list, bot.ID))
+	}
+
+	result, err = svc.EditCloseFriends(ctx, owner.ID, []int64{carol.ID})
+	if err != nil {
+		t.Fatalf("EditCloseFriends replace: %v", err)
+	}
+	if got, want := result.AddedUserIDs, []int64{carol.ID}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("replace added = %v, want %v", got, want)
+	}
+	if got, want := result.RemovedUserIDs, []int64{bob.ID}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("replace removed = %v, want %v", got, want)
+	}
+	replaced, _, err := svc.GetContacts(ctx, owner.ID, 0)
+	if err != nil {
+		t.Fatalf("GetContacts after replace: %v", err)
+	}
+	if contactByID(t, replaced, bob.ID).CloseFriend || !contactByID(t, replaced, carol.ID).CloseFriend {
+		t.Fatalf("replace flags bob=%+v carol=%+v, want bob false carol true", contactByID(t, replaced, bob.ID), contactByID(t, replaced, carol.ID))
+	}
+}
+
 func TestAcceptContactSharesPhoneAndClearsShareContact(t *testing.T) {
 	ctx := context.Background()
 	users := memory.NewUserStore()
@@ -157,6 +342,55 @@ func TestAcceptContactSharesPhoneAndClearsShareContact(t *testing.T) {
 	}
 }
 
+func TestAddContactNormalizesPhoneToDigits(t *testing.T) {
+	ctx := context.Background()
+	users := memory.NewUserStore()
+	contactsStore := memory.NewContactStore()
+	alice, err := users.Create(ctx, domain.User{Phone: "15550060301", FirstName: "Alice", LastName: "A"})
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	bob, err := users.Create(ctx, domain.User{Phone: "15550060302", FirstName: "Bob", LastName: "B"})
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	svc := NewService(contactsStore, users)
+
+	contact, err := svc.AddContact(ctx, alice.ID, domain.ContactInput{
+		ContactUserID: bob.ID,
+		Phone:         "+1 555-006-0302",
+		FirstName:     "Bob B",
+	})
+	if err != nil {
+		t.Fatalf("AddContact: %v", err)
+	}
+	if contact.Phone != "15550060302" {
+		t.Fatalf("contact phone = %q, want digits-only 15550060302", contact.Phone)
+	}
+	if contact.User.Phone != "15550060302" {
+		t.Fatalf("projected user phone = %q, want digits-only 15550060302", contact.User.Phone)
+	}
+	stored, found, err := contactsStore.Get(ctx, alice.ID, bob.ID)
+	if err != nil || !found {
+		t.Fatalf("stored contact found=%v err=%v", found, err)
+	}
+	if stored.Phone != "15550060302" {
+		t.Fatalf("stored contact phone = %q, want digits-only 15550060302", stored.Phone)
+	}
+
+	emptied, err := svc.AddContact(ctx, alice.ID, domain.ContactInput{
+		ContactUserID: bob.ID,
+		Phone:         "+",
+		FirstName:     "Bob B",
+	})
+	if err != nil {
+		t.Fatalf("AddContact digitless phone: %v", err)
+	}
+	if emptied.Phone != bob.Phone {
+		t.Fatalf("digitless phone contact = %q, want fallback to target phone %q", emptied.Phone, bob.Phone)
+	}
+}
+
 func TestAcceptContactRequiresExistingContactRequest(t *testing.T) {
 	ctx := context.Background()
 	users := memory.NewUserStore()
@@ -174,6 +408,17 @@ func TestAcceptContactRequiresExistingContactRequest(t *testing.T) {
 	if _, err := svc.AcceptContact(ctx, alice.ID, bob.ID); !errors.Is(err, ErrContactReqMissing) {
 		t.Fatalf("AcceptContact without contact err = %v, want ErrContactReqMissing", err)
 	}
+}
+
+func contactByID(t *testing.T, list domain.ContactList, id int64) domain.Contact {
+	t.Helper()
+	for _, contact := range list.Contacts {
+		if contact.User.ID == id {
+			return contact
+		}
+	}
+	t.Fatalf("contact %d not found in %+v", id, list.Contacts)
+	return domain.Contact{}
 }
 
 type contactProfilePhotos map[int64]domain.ProfilePhotoRef

@@ -1,49 +1,124 @@
 package config
 
 import (
-	"net"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
-func TestLoadUsesExplicitAdvertiseIP(t *testing.T) {
-	t.Setenv("TELESRV_ADVERTISE_IP", "10.172.61.102")
+func TestLoadDefaultsAdvertiseIPToLoopback(t *testing.T) {
+	t.Setenv("TELESRV_ADVERTISE_IP", "")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.AdvertiseIP != "10.172.61.102" {
+	if cfg.AdvertiseIP != "127.0.0.1" {
+		t.Fatalf("AdvertiseIP = %q, want loopback default", cfg.AdvertiseIP)
+	}
+}
+
+func TestLoadUsesExplicitAdvertiseIP(t *testing.T) {
+	t.Setenv("TELESRV_ADVERTISE_IP", "203.0.113.10")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AdvertiseIP != "203.0.113.10" {
 		t.Fatalf("AdvertiseIP = %q, want explicit env", cfg.AdvertiseIP)
 	}
 }
 
-func TestPreferredAdvertiseIPPrefersPhysicalLANRanges(t *testing.T) {
-	got := preferredAdvertiseIP([]net.IP{
-		net.IPv4(172, 17, 0, 1),
-		net.IPv4(192, 168, 1, 20),
-		net.IPv4(10, 172, 61, 102),
-	})
-	if got != "10.172.61.102" {
-		t.Fatalf("preferredAdvertiseIP = %q, want 10.172.61.102", got)
-	}
+func TestLoadBusinessAIProvider(t *testing.T) {
+	t.Setenv("TELESRV_BUSINESS_AI_PROVIDER", "echo")
 
-	got = preferredAdvertiseIP([]net.IP{
-		net.IPv4(172, 17, 0, 1),
-		net.IPv4(192, 168, 1, 20),
-	})
-	if got != "192.168.1.20" {
-		t.Fatalf("preferredAdvertiseIP = %q, want 192.168.1.20", got)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.BusinessAIProvider != "echo" {
+		t.Fatalf("BusinessAIProvider = %q, want echo", cfg.BusinessAIProvider)
 	}
 }
 
-func TestPrivateIPv4AndVirtualInterfaceDetection(t *testing.T) {
-	if !isPrivateIPv4(net.IPv4(10, 172, 61, 102)) {
-		t.Fatal("10.172.61.102 should be private")
+func TestLoadBusinessAIProviderDefaultsToEcho(t *testing.T) {
+	t.Setenv("TELESRV_BUSINESS_AI_PROVIDER", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
 	}
-	if isPrivateIPv4(net.IPv4(8, 8, 8, 8)) {
-		t.Fatal("8.8.8.8 should not be private")
+	if cfg.BusinessAIProvider != "echo" {
+		t.Fatalf("BusinessAIProvider = %q, want echo", cfg.BusinessAIProvider)
 	}
-	if !likelyVirtualInterface("vEthernet (WSL)") {
-		t.Fatal("vEthernet (WSL) should be treated as virtual")
+}
+
+func TestLoadReadsEnvStyleConfigFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "telesrv.env")
+	writeConfigFile(t, path, `
+TELESRV_MAPBOX_TOKEN="file-token"
+TELESRV_POSTGRES_MAX_CONNS=77
+TELESRV_WEBSOCKET_ALLOWED_ORIGINS=https://one.example, https://two.example
+TELESRV_CALL_RING_TIMEOUT=2m
+`)
+	t.Setenv("TELESRV_CONFIG", path)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MapboxToken != "file-token" {
+		t.Fatalf("MapboxToken = %q, want file-token", cfg.MapboxToken)
+	}
+	if cfg.PostgresMaxConns != 77 {
+		t.Fatalf("PostgresMaxConns = %d, want 77", cfg.PostgresMaxConns)
+	}
+	if got, want := cfg.WebSocketAllowedOrigins, []string{"https://one.example", "https://two.example"}; len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("WebSocketAllowedOrigins = %#v, want %#v", got, want)
+	}
+	if cfg.CallRingTimeout != 2*time.Minute {
+		t.Fatalf("CallRingTimeout = %v, want 2m", cfg.CallRingTimeout)
+	}
+}
+
+func TestLoadEnvironmentOverridesConfigFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "telesrv.env")
+	writeConfigFile(t, path, `TELESRV_MAPBOX_TOKEN=file-token`)
+	t.Setenv("TELESRV_CONFIG", path)
+	t.Setenv("TELESRV_MAPBOX_TOKEN", "env-token")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MapboxToken != "env-token" {
+		t.Fatalf("MapboxToken = %q, want env-token", cfg.MapboxToken)
+	}
+}
+
+func TestLoadExplicitMissingConfigFileErrors(t *testing.T) {
+	t.Setenv("TELESRV_CONFIG", filepath.Join(t.TempDir(), "missing.env"))
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load succeeded with explicit missing config file, want error")
+	}
+}
+
+func TestLoadRejectsNonTelesrvConfigKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "telesrv.env")
+	writeConfigFile(t, path, `MAPBOX_TOKEN=file-token`)
+	t.Setenv("TELESRV_CONFIG", path)
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load succeeded with unsupported config key, want error")
+	}
+}
+
+func writeConfigFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
 	}
 }

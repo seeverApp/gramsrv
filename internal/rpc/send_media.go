@@ -2,9 +2,11 @@ package rpc
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"strconv"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/gotd/td/tg"
@@ -16,6 +18,8 @@ import (
 // 本文件实现 messages.uploadMedia / sendMedia / sendMultiMedia 的 photo/document/sticker 主路径，
 // 并抽取 sendOutgoing 作为「已校验的一条出站消息（文本或媒体）落地」的共享实现，私聊与频道共用。
 
+const maxContactVcardLength = 8192
+
 // outgoingSend 是 sendOutgoing 的入参：一条已校验的出站消息。
 type outgoingSend struct {
 	randomID     int64
@@ -26,51 +30,87 @@ type outgoingSend struct {
 	noforwards   bool
 	replyToInput tg.InputReplyToClass
 	sendAsInput  tg.InputPeerClass
+	replyTo      *domain.MessageReply
+	replyToReady bool
+	sendAs       *domain.Peer
+	sendAsReady  bool
 	clearDraft   bool
+	// replyMarkup 是 bot inline keyboard（已解析+校验；非 bot 恒 nil）。
+	replyMarkup *domain.MessageReplyMarkup
+	viaBotID    int64
+	// richMessage 是 Layer 227 富文本消息快照（已解析内嵌媒体；普通消息恒 nil）。
+	// Phase 1 仅接入私聊；频道侧留 Phase 2。
+	richMessage *domain.MessageRichMessage
+	// groupedID 是相册分组 id：sendMultiMedia 同组各条共享一个非零值（客户端据此渲染
+	// 成一个相册组）；单条发送恒 0。
+	groupedID int64
+	// effect 是消息特效 id（私聊专属，0 表无特效）。调用方已对 catalog 校验合法性；
+	// 频道侧忽略（官方群/频道不渲染特效）。
+	effect int64
 }
 
 // sendOutgoing 把一条出站消息落地到私聊或频道，返回 *tg.Updates、是否重复、错误。
 // media 为空即纯文本。校验（长度/random_id/限流）由调用方完成。
 func (r *Router) sendOutgoing(ctx context.Context, userID int64, peer domain.Peer, p outgoingSend) (tg.UpdatesClass, bool, error) {
-	sendAs, err := r.resolveSendAsPeer(ctx, userID, peer, p.sendAsInput)
-	if err != nil {
-		return nil, false, err
+	sendAs := p.sendAs
+	if !p.sendAsReady {
+		resolved, err := r.resolveSendAsPeer(ctx, userID, peer, p.sendAsInput)
+		if err != nil {
+			return nil, false, err
+		}
+		sendAs = resolved
 	}
 	if peer.Type == domain.PeerTypeChannel {
 		if r.deps.Channels == nil {
 			return nil, false, peerIDInvalidErr()
 		}
-		replyTo, err := r.messageReplyFromInput(ctx, userID, peer, p.replyToInput)
-		if err != nil {
-			return nil, false, err
+		replyTo := p.replyTo
+		if !p.replyToReady {
+			resolved, err := r.messageReplyFromInput(ctx, userID, peer, p.replyToInput)
+			if err != nil {
+				return nil, false, err
+			}
+			replyTo = resolved
 		}
 		mentionUserIDs, err := r.mentionedUserIDsFromMessage(ctx, userID, p.message, p.entities)
 		if err != nil {
 			return nil, false, err
 		}
 		res, err := r.deps.Channels.SendMessage(ctx, userID, domain.SendChannelMessageRequest{
-			UserID:         userID,
-			ChannelID:      peer.ID,
-			RandomID:       p.randomID,
-			Message:        p.message,
-			Entities:       domainMessageEntities(p.entities),
-			Media:          p.media,
-			MentionUserIDs: mentionUserIDs,
-			Silent:         p.silent,
-			NoForwards:     p.noforwards,
-			ReplyTo:        replyTo,
-			SendAs:         sendAs,
-			Date:           int(r.clock.Now().Unix()),
+			UserID:              userID,
+			ChannelID:           peer.ID,
+			RandomID:            p.randomID,
+			Message:             p.message,
+			Entities:            domainMessageEntitiesForViewer(userID, p.entities),
+			Media:               p.media,
+			MentionUserIDs:      mentionUserIDs,
+			SkipRecipientLookup: true,
+			PostAuthor:          r.channelPostAuthorName(ctx, userID),
+			Silent:              p.silent,
+			NoForwards:          p.noforwards,
+			ReplyTo:             replyTo,
+			ViaBotID:            p.viaBotID,
+			GroupedID:           p.groupedID,
+			ReplyMarkup:         p.replyMarkup,
+			SendAs:              sendAs,
+			Date:                int(r.clock.Now().Unix()),
 		})
 		if err != nil {
 			return nil, false, channelInvalidErr(err)
 		}
-		updates := r.channelMessageUpdates(ctx, userID, res, p.randomID)
+		// 发送者 echo 走 rpc_result（同步，用独立 cache）；其余成员的 fan-out 异步化，
+		// 移出发送者 RPC 同步路径（设计 Phase 0）。echo 与 fan-out 必须用各自独立的
+		// viewerPeerCache——前者在 RPC goroutine、后者在 worker goroutine，共享会数据竞态。
+		// 发送者 echo 走 rpc_result（同步，用独立 cache）；其余成员的 fan-out 异步化。
+		// echo 与 fan-out 必须用各自独立的 viewerPeerCache——前者在 RPC goroutine、后者在
+		// worker goroutine，共享会数据竞态。
+		echoCache := newViewerPeerCache(r)
+		updates := r.channelMessageUpdatesWithPeerCache(ctx, userID, res, p.randomID, echoCache)
 		if !res.Duplicate {
-			r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
-				return r.channelMessageUpdates(ctx, viewerUserID, res, 0)
-			})
+			r.enqueueChannelMessageFanout(ctx, userID, res, nil)
 			r.pushChannelDiscussionUpdate(ctx, userID, res.Discussion)
+			// 频道链接预览 pending 占位：带外解析并就地替换（异步，不阻塞发送 echo）。
+			r.maybeEnqueueWebPageResolve(userID, peer, res.Message.ID, res.Message.Media)
 		}
 		if p.clearDraft {
 			r.clearDraftAfterSend(ctx, userID, peer, replyTo)
@@ -90,9 +130,13 @@ func (r *Router) sendOutgoing(ctx context.Context, userID int64, peer domain.Pee
 			return nil, false, peerIDInvalidErr()
 		}
 	}
-	replyTo, err := r.messageReplyFromInput(ctx, userID, peer, p.replyToInput)
-	if err != nil {
-		return nil, false, err
+	replyTo := p.replyTo
+	if !p.replyToReady {
+		resolved, err := r.messageReplyFromInput(ctx, userID, peer, p.replyToInput)
+		if err != nil {
+			return nil, false, err
+		}
+		replyTo = resolved
 	}
 	recipientBlocked, err := r.peerBlocksUser(ctx, userID, peer.ID)
 	if err != nil {
@@ -105,7 +149,7 @@ func (r *Router) sendOutgoing(ctx context.Context, userID int64, peer domain.Pee
 		RecipientUserID:  peer.ID,
 		RandomID:         p.randomID,
 		Message:          p.message,
-		Entities:         domainMessageEntities(p.entities),
+		Entities:         domainMessageEntitiesForViewer(userID, p.entities),
 		Media:            p.media,
 		Silent:           p.silent,
 		NoForwards:       p.noforwards,
@@ -114,14 +158,35 @@ func (r *Router) sendOutgoing(ctx context.Context, userID int64, peer domain.Pee
 		OriginAuthKeyID:  authKeyID,
 		OriginSessionID:  sessionID,
 		RecipientBlocked: recipientBlocked,
+		ReplyMarkup:      p.replyMarkup,
+		RichMessage:      p.richMessage,
+		ViaBotID:         p.viaBotID,
+		GroupedID:        p.groupedID,
+		Effect:           p.effect,
 	})
 	if err != nil {
+		fields := append(r.contextLogFields(ctx),
+			zap.Error(err),
+			zap.Int64("user_id", userID),
+			zap.Int64("peer_user_id", peer.ID),
+			zap.Int64("random_id", p.randomID),
+			zap.Int("message_len", utf8.RuneCountInString(p.message)),
+			zap.Bool("has_media", p.media != nil && !p.media.IsZero()),
+			zap.Bool("has_reply_to", replyTo != nil),
+			zap.Bool("clear_draft", p.clearDraft),
+			zap.Int64("via_bot_id", p.viaBotID),
+		)
+		r.log.Warn("messages.sendMessage private store failed", fields...)
 		return nil, false, messageSendErr(err)
 	}
 	users := r.usersForMessageUpdate(ctx, userID, res.SenderMessage)
 	chats := r.chatsForMessageUpdate(ctx, userID, res.SenderMessage)
 	if p.clearDraft {
 		r.clearDraftAfterSend(ctx, userID, peer, replyTo)
+	}
+	if !res.Duplicate {
+		// 链接预览 pending 占位：带外解析并就地替换（异步，不阻塞发送 echo）。
+		r.maybeEnqueueWebPageResolve(userID, peer, res.SenderMessage.ID, res.SenderMessage.Media)
 	}
 	return tgPrivateMessageUpdates(res.SenderEvent, res.SenderMessage, p.randomID, true, users, chats), res.Duplicate, nil
 }
@@ -167,17 +232,19 @@ func (r *Router) onMessagesSendMedia(ctx context.Context, req *tg.MessagesSendMe
 	if len(req.Entities) > maxMessageEntityCount {
 		return nil, limitInvalidErr()
 	}
-	if req.ScheduleDate != 0 || req.ScheduleRepeatPeriod != 0 {
+	if req.ScheduleRepeatPeriod != 0 {
 		return nil, scheduleDateInvalidErr()
 	}
 	if req.Media == nil {
 		return nil, mediaInvalidErr()
 	}
-	// InputMediaEmpty / WebPage：退化为纯文本发送（复用 sendMessage 校验与流程）。
+	// InputMediaEmpty / WebPage：退化为纯文本发送（复用 sendMessage 校验与流程，含 url 实体补全）。
 	switch req.Media.(type) {
 	case *tg.InputMediaEmpty, *tg.InputMediaWebPage:
 		return r.onMessagesSendMessage(ctx, sendMessageRequestFromSendMedia(req))
 	}
+	// 媒体 caption 里的链接/@mention/#hashtag 等同样补自动高亮实体（客户端未带时）。
+	req.Entities = augmentAutoEntities(req.Message, req.Entities)
 	userID, _, err := r.currentUserID(ctx)
 	if err != nil {
 		return nil, internalErr()
@@ -185,15 +252,12 @@ func (r *Router) onMessagesSendMedia(ctx context.Context, req *tg.MessagesSendMe
 	if userID == 0 {
 		return nil, peerIDInvalidErr()
 	}
-	if r.deps.Limiter != nil {
-		allowed, retryAfter, err := r.deps.Limiter.Allow(ctx, "messages:send:"+strconv.FormatInt(userID, 10), sendMessageRateLimit, sendMessageRateWindow)
-		if err != nil {
-			return nil, internalErr()
-		}
-		if !allowed {
-			r.metrics().MessageRateLimited(retryAfter)
-			return nil, floodWaitErr(retryAfter)
-		}
+	// 消息特效：仅接受 catalog 内的合法 effect id（非法 id → EFFECT_ID_INVALID，官方行为）。
+	if r.messageEffectInvalid(ctx, req.Effect) {
+		return nil, effectIDInvalidErr()
+	}
+	if err := r.checkSendRateLimit(ctx, userID, 1); err != nil {
+		return nil, err
 	}
 	peer, err := r.checkedDomainPeerFromInputPeer(ctx, userID, req.Peer)
 	if err != nil {
@@ -206,6 +270,27 @@ func (r *Router) onMessagesSendMedia(ctx context.Context, req *tg.MessagesSendMe
 	if media == nil {
 		return nil, mediaInvalidErr()
 	}
+	// reply_markup（bot inline keyboard on media）：仅 bot 接受+校验，非 bot 静默丢弃。
+	var replyMarkup *domain.MessageReplyMarkup
+	if req.ReplyMarkup != nil {
+		replyMarkup, err = domainReplyMarkupForSender(req.ReplyMarkup, r.userIsBot(ctx, userID))
+		if err != nil {
+			return nil, replyMarkupErr(err)
+		}
+	}
+	if req.ScheduleDate != 0 && !scheduleDateIsImmediate(req.ScheduleDate, int(r.clock.Now().Unix())) {
+		return r.scheduleOutgoing(ctx, userID, peer, outgoingSend{
+			randomID:     req.RandomID,
+			message:      req.Message,
+			entities:     req.Entities,
+			media:        media,
+			silent:       req.Silent,
+			noforwards:   req.Noforwards,
+			replyToInput: req.ReplyTo,
+			sendAsInput:  req.SendAs,
+			clearDraft:   req.ClearDraft,
+		}, req.ScheduleDate, req.ScheduleRepeatPeriod)
+	}
 	updates, _, err := r.sendOutgoing(ctx, userID, peer, outgoingSend{
 		randomID:     req.RandomID,
 		message:      req.Message,
@@ -216,6 +301,8 @@ func (r *Router) onMessagesSendMedia(ctx context.Context, req *tg.MessagesSendMe
 		replyToInput: req.ReplyTo,
 		sendAsInput:  req.SendAs,
 		clearDraft:   req.ClearDraft,
+		replyMarkup:  replyMarkup,
+		effect:       req.Effect,
 	})
 	if err != nil {
 		return nil, err
@@ -235,9 +322,6 @@ func (r *Router) onMessagesSendMultiMedia(ctx context.Context, req *tg.MessagesS
 	if len(req.MultiMedia) == 0 || len(req.MultiMedia) > maxSendMultiMediaItems {
 		return nil, limitInvalidErr()
 	}
-	if req.ScheduleDate != 0 {
-		return nil, scheduleDateInvalidErr()
-	}
 	peer, err := r.checkedDomainPeerFromInputPeer(ctx, userID, req.Peer)
 	if err != nil {
 		return nil, err
@@ -256,12 +340,17 @@ func (r *Router) onMessagesSendMultiMedia(ctx context.Context, req *tg.MessagesS
 			return nil, mediaInvalidErr()
 		}
 	}
+	if err := r.checkSendRateLimit(ctx, userID, len(req.MultiMedia)); err != nil {
+		return nil, err
+	}
 
 	combined := make([]tg.UpdateClass, 0, len(req.MultiMedia)*2)
 	usersByID := map[int64]tg.UserClass{}
 	chatsByID := map[int64]tg.ChatClass{}
 	date := 0
-	for _, item := range req.MultiMedia {
+	// 整个 album 共享一个 grouped_id，客户端据此把各条渲染成一个相册组。
+	groupedID := randomNonZeroInt64()
+	for i, item := range req.MultiMedia {
 		media, err := r.resolveInputMedia(ctx, userID, item.Media)
 		if err != nil {
 			return nil, err
@@ -269,16 +358,24 @@ func (r *Router) onMessagesSendMultiMedia(ctx context.Context, req *tg.MessagesS
 		if media == nil {
 			return nil, mediaInvalidErr()
 		}
-		result, _, err := r.sendOutgoing(ctx, userID, peer, outgoingSend{
+		p := outgoingSend{
 			randomID:     item.RandomID,
 			message:      item.Message,
-			entities:     item.Entities,
+			entities:     augmentAutoEntities(item.Message, item.Entities),
 			media:        media,
 			silent:       req.Silent,
 			noforwards:   req.Noforwards,
 			replyToInput: req.ReplyTo,
 			sendAsInput:  req.SendAs,
-		})
+			clearDraft:   req.ClearDraft && i == 0,
+			groupedID:    groupedID,
+		}
+		var result tg.UpdatesClass
+		if req.ScheduleDate != 0 && !scheduleDateIsImmediate(req.ScheduleDate, int(r.clock.Now().Unix())) {
+			result, err = r.scheduleOutgoing(ctx, userID, peer, p, req.ScheduleDate, 0)
+		} else {
+			result, _, err = r.sendOutgoing(ctx, userID, peer, p)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -310,13 +407,30 @@ func (r *Router) onMessagesSendMultiMedia(ctx context.Context, req *tg.MessagesS
 // resolveInputMedia 把 tg.InputMedia 解析为 domain.MessageMedia（上传则落库，引用则加载）。
 // 返回 nil 表示 InputMediaEmpty（调用方退化为纯文本）。
 func (r *Router) resolveInputMedia(ctx context.Context, userID int64, input tg.InputMediaClass) (*domain.MessageMedia, error) {
-	if r.deps.Files == nil {
-		return nil, mediaInvalidErr()
-	}
 	switch in := input.(type) {
 	case *tg.InputMediaEmpty:
 		return nil, nil
+	case *tg.InputMediaContact:
+		if !validContactInput(in.PhoneNumber, in.FirstName, in.LastName, "", 0) || utf8.RuneCountInString(in.Vcard) > maxContactVcardLength {
+			return nil, mediaInvalidErr()
+		}
+		if strings.TrimSpace(in.PhoneNumber) == "" && strings.TrimSpace(in.FirstName) == "" && strings.TrimSpace(in.LastName) == "" && strings.TrimSpace(in.Vcard) == "" {
+			return nil, mediaEmptyErr()
+		}
+		return &domain.MessageMedia{
+			Kind: domain.MessageMediaKindContact,
+			Contact: &domain.MessageContact{
+				PhoneNumber: in.PhoneNumber,
+				FirstName:   in.FirstName,
+				LastName:    in.LastName,
+				Vcard:       in.Vcard,
+				UserID:      r.messageContactUserID(ctx, userID, in.PhoneNumber),
+			},
+		}, nil
 	case *tg.InputMediaUploadedPhoto:
+		if r.deps.Files == nil {
+			return nil, mediaInvalidErr()
+		}
 		if in.File == nil {
 			return nil, mediaInvalidErr()
 		}
@@ -330,6 +444,9 @@ func (r *Router) resolveInputMedia(ctx context.Context, userID int64, input tg.I
 		}
 		return &domain.MessageMedia{Kind: domain.MessageMediaKindPhoto, Photo: &photo, Spoiler: in.Spoiler, TTLSeconds: in.TTLSeconds}, nil
 	case *tg.InputMediaUploadedDocument:
+		if r.deps.Files == nil {
+			return nil, mediaInvalidErr()
+		}
 		if in.File == nil {
 			return nil, mediaInvalidErr()
 		}
@@ -352,7 +469,30 @@ func (r *Router) resolveInputMedia(ctx context.Context, userID int64, input tg.I
 			return nil, mediaUploadErr(err)
 		}
 		return messageMediaFromDocument(doc, in.Spoiler, in.TTLSeconds), nil
+	case *tg.InputMediaPhotoExternal:
+		// 外链图片：服务端 SSRF 安全抓取 URL 并铸造 Photo。未启用/拦截/上游失败统一 MEDIA_INVALID。
+		if r.deps.Files == nil {
+			return nil, mediaInvalidErr()
+		}
+		photo, err := r.deps.Files.CreatePhotoFromURL(ctx, in.URL)
+		if err != nil {
+			return nil, mediaInvalidErr()
+		}
+		return &domain.MessageMedia{Kind: domain.MessageMediaKindPhoto, Photo: &photo, Spoiler: in.Spoiler, TTLSeconds: in.TTLSeconds}, nil
+	case *tg.InputMediaDocumentExternal:
+		// 外链文档：抓取 URL，mime 取 Content-Type、文件名取 URL basename。video_cover/timestamp 暂忽略。
+		if r.deps.Files == nil {
+			return nil, mediaInvalidErr()
+		}
+		doc, err := r.deps.Files.CreateDocumentFromURL(ctx, in.URL)
+		if err != nil {
+			return nil, mediaInvalidErr()
+		}
+		return messageMediaFromDocument(doc, in.Spoiler, in.TTLSeconds), nil
 	case *tg.InputMediaPhoto:
+		if r.deps.Files == nil {
+			return nil, mediaInvalidErr()
+		}
 		photoID, ok := inputPhotoID(in.ID)
 		if !ok {
 			return nil, photoInvalidErr()
@@ -366,6 +506,9 @@ func (r *Router) resolveInputMedia(ctx context.Context, userID int64, input tg.I
 		}
 		return &domain.MessageMedia{Kind: domain.MessageMediaKindPhoto, Photo: &photo, Spoiler: in.Spoiler, TTLSeconds: in.TTLSeconds}, nil
 	case *tg.InputMediaDocument:
+		if r.deps.Files == nil {
+			return nil, mediaInvalidErr()
+		}
 		docIDs, ok := inputDocumentCandidateIDs(in.ID)
 		if !ok {
 			r.log.Warn("sendMedia InputMediaDocument unresolvable id", zap.String("id_type", fmt.Sprintf("%T", in.ID)))
@@ -388,10 +531,289 @@ func (r *Router) resolveInputMedia(ctx context.Context, userID int64, input tg.I
 			return nil, mediaInvalidErr()
 		}
 		return messageMediaFromDocument(doc, in.Spoiler, in.TTLSeconds), nil
+	case *tg.InputMediaGeoPoint:
+		geo, err := domainGeoPointFromInput(in.GeoPoint)
+		if err != nil {
+			return nil, err
+		}
+		return &domain.MessageMedia{Kind: domain.MessageMediaKindGeo, Geo: geo}, nil
+	case *tg.InputMediaVenue:
+		geo, err := domainGeoPointFromInput(in.GeoPoint)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(in.Title) == "" {
+			return nil, mediaEmptyErr()
+		}
+		if utf8.RuneCountInString(in.Title) > maxVenueTitleLength ||
+			utf8.RuneCountInString(in.Address) > maxVenueAddressLength ||
+			utf8.RuneCountInString(in.Provider) > maxVenueProviderLength ||
+			utf8.RuneCountInString(in.VenueID) > maxVenueIDLength ||
+			utf8.RuneCountInString(in.VenueType) > maxVenueIDLength {
+			return nil, mediaInvalidErr()
+		}
+		return &domain.MessageMedia{Kind: domain.MessageMediaKindVenue, Venue: &domain.MessageVenue{
+			Geo:       *geo,
+			Title:     in.Title,
+			Address:   in.Address,
+			Provider:  in.Provider,
+			VenueID:   in.VenueID,
+			VenueType: in.VenueType,
+		}}, nil
+	case *tg.InputMediaDice:
+		emoticon := normalizeDiceEmoticon(in.Emoticon)
+		sides, ok := diceValueSides(emoticon)
+		if !ok {
+			return nil, emoticonInvalidErr()
+		}
+		value, err := randomDiceValue(sides)
+		if err != nil {
+			return nil, internalErr()
+		}
+		return &domain.MessageMedia{Kind: domain.MessageMediaKindDice, Dice: &domain.MessageDice{
+			Emoticon: emoticon,
+			Value:    value,
+		}}, nil
+	case *tg.InputMediaGeoLive:
+		if in.Stopped {
+			// stopped 只在 editMessage 停止共享时有意义，发送即停没有客户端路径。
+			return nil, mediaInvalidErr()
+		}
+		geo, err := domainGeoPointFromInput(in.GeoPoint)
+		if err != nil {
+			return nil, err
+		}
+		live := &domain.MessageGeoLive{Geo: *geo, Period: minLiveLocationPeriod}
+		if period, ok := in.GetPeriod(); ok {
+			if period != foreverLiveLocationPeriod && (period < minLiveLocationPeriod || period > maxLiveLocationPeriod) {
+				return nil, mediaInvalidErr()
+			}
+			live.Period = period
+		}
+		if heading, ok := in.GetHeading(); ok {
+			if heading < 0 || heading > maxLiveLocationHeading {
+				return nil, mediaInvalidErr()
+			}
+			live.Heading = heading
+		}
+		if radius, ok := in.GetProximityNotificationRadius(); ok {
+			if radius < 0 || radius > maxProximityRadiusMeters {
+				return nil, mediaInvalidErr()
+			}
+			live.ProximityNotificationRadius = radius
+		}
+		return &domain.MessageMedia{Kind: domain.MessageMediaKindGeoLive, GeoLive: live}, nil
+	case *tg.InputMediaPoll:
+		if r.deps.Polls == nil {
+			return nil, mediaInvalidErr()
+		}
+		pollID, err := randomPollID()
+		if err != nil {
+			return nil, internalErr()
+		}
+		snapshot, def, err := r.domainPollFromInputMedia(ctx, in, userID, pollID, int(r.clock.Now().Unix()))
+		if err != nil {
+			// compat 诊断：客户端 poll 构造形状多变（flag 默认值/答案构造器随版本漂移），
+			// 拒绝时必须留痕，否则只有一个裸 4xx 无从对账。
+			answerTypes := make([]string, 0, len(in.Poll.Answers))
+			for _, answerClass := range in.Poll.Answers {
+				switch answer := answerClass.(type) {
+				case *tg.PollAnswer:
+					answerTypes = append(answerTypes, fmt.Sprintf("pollAnswer{flags:%#x,text:%d,option:%d,media:%T}",
+						uint32(answer.Flags), len(answer.Text.Text), len(answer.Option), answer.Media))
+				case *tg.InputPollAnswer:
+					media, hasMedia := answer.GetMedia()
+					answerTypes = append(answerTypes, fmt.Sprintf("inputPollAnswer{flags:%#x,text:%d,has_media:%v,media:%T}",
+						uint32(answer.Flags), len(answer.Text.Text), hasMedia, media))
+				default:
+					answerTypes = append(answerTypes, fmt.Sprintf("%T", answerClass))
+				}
+			}
+			closePeriod, hasPeriod := in.Poll.GetClosePeriod()
+			closeDate, hasDate := in.Poll.GetCloseDate()
+			correct, hasCorrect := in.GetCorrectAnswers()
+			solution, hasSolution := in.GetSolution()
+			r.log.Warn("sendMedia poll rejected",
+				zap.Error(err),
+				zap.Int64("user_id", userID),
+				zap.String("input_flags", fmt.Sprintf("%#x", uint32(in.Flags))),
+				zap.String("poll_flags", fmt.Sprintf("%#x", uint32(in.Poll.Flags))),
+				zap.Bool("quiz", in.Poll.Quiz),
+				zap.Bool("multiple_choice", in.Poll.MultipleChoice),
+				zap.Bool("public_voters", in.Poll.PublicVoters),
+				zap.Bool("open_answers", in.Poll.OpenAnswers),
+				zap.Bool("shuffle_answers", in.Poll.ShuffleAnswers),
+				zap.Bool("revoting_disabled", in.Poll.RevotingDisabled),
+				zap.Bool("hide_results", in.Poll.HideResultsUntilClose),
+				zap.Bool("subscribers_only", in.Poll.SubscribersOnly),
+				zap.Int("countries", len(in.Poll.CountriesISO2)),
+				zap.Int("question_len", len(in.Poll.Question.Text)),
+				zap.Int("question_entities", len(in.Poll.Question.Entities)),
+				zap.Strings("answer_types", answerTypes),
+				zap.Bool("has_close_period", hasPeriod), zap.Int("close_period", closePeriod),
+				zap.Bool("has_close_date", hasDate), zap.Int("close_date", closeDate),
+				zap.Bool("has_correct", hasCorrect), zap.Ints("correct", correct),
+				zap.Bool("has_solution", hasSolution), zap.Int("solution_len", len(solution)),
+			)
+			return nil, err
+		}
+		// 权威行先落库（消息发送失败产生的孤儿 poll 无害且可回收）。
+		if err := r.deps.Polls.CreatePoll(ctx, def); err != nil {
+			r.log.Warn("create poll failed", zap.Error(err))
+			return nil, internalErr()
+		}
+		return &domain.MessageMedia{Kind: domain.MessageMediaKindPoll, Poll: snapshot}, nil
+	case *tg.InputMediaTodo:
+		todo, err := domainTodoFromInput(in.Todo)
+		if err != nil {
+			return nil, err
+		}
+		return &domain.MessageMedia{Kind: domain.MessageMediaKindTodo, Todo: todo}, nil
+	case *tg.InputMediaStory:
+		return r.domainMessageStoryFromInput(ctx, userID, in)
 	default:
-		// geo / contact / poll / venue / dice / story / 等本阶段不支持。
+		// poll（独立链路见 messages_polls.go）/ geoLive / todo / game / invoice /
+		// paid media / external 等未接入；范围与 stub 决策见 docs/compatibility-matrix.md。
 		return nil, mediaInvalidErr()
 	}
+}
+
+func (r *Router) domainMessageStoryFromInput(ctx context.Context, userID int64, in *tg.InputMediaStory) (*domain.MessageMedia, error) {
+	if in == nil || in.ID <= 0 || in.ID > domain.MaxStoryID {
+		return nil, storyIDInvalidErr()
+	}
+	peer, err := r.checkedDomainPeerFromInputPeer(ctx, userID, in.Peer)
+	if err != nil {
+		return nil, err
+	}
+	if r.deps.Stories == nil {
+		return nil, storyIDInvalidErr()
+	}
+	now := int(r.clock.Now().Unix())
+	list, err := r.deps.Stories.GetStoriesByID(ctx, userID, peer, []int{in.ID}, now)
+	if err != nil {
+		return nil, storyErr(err)
+	}
+	if len(list.Stories) != 1 || list.Stories[0].Owner != peer || list.Stories[0].ID != in.ID {
+		return nil, storyIDInvalidErr()
+	}
+	story := list.Stories[0]
+	if story.NoForwards {
+		return nil, chatForwardsRestrictedErr()
+	}
+	return &domain.MessageMedia{
+		Kind: domain.MessageMediaKindStory,
+		Story: &domain.MessageStory{
+			Peer:  peer,
+			ID:    in.ID,
+			Story: &story,
+		},
+	}, nil
+}
+
+// domainGeoPointFromInput 校验并转换 InputGeoPoint；空点返回 MEDIA_EMPTY，越界返回 MEDIA_INVALID。
+// access_hash 在此随机生成：客户端会把它原样带回 upload.getWebFile 的地图缩略请求，但
+// 服务端地图渲染不依赖鉴权（详见 upload_webfile.go），故无需持久化校验。
+func domainGeoPointFromInput(input tg.InputGeoPointClass) (*domain.MessageGeoPoint, error) {
+	point, ok := input.(*tg.InputGeoPoint)
+	if !ok || point == nil {
+		return nil, mediaEmptyErr()
+	}
+	if point.Lat < -90 || point.Lat > 90 || point.Long < -180 || point.Long > 180 {
+		return nil, mediaInvalidErr()
+	}
+	accuracy, _ := point.GetAccuracyRadius()
+	if accuracy < 0 || accuracy > maxGeoAccuracyRadiusMeters {
+		accuracy = 0
+	}
+	hash, err := randomGeoAccessHash()
+	if err != nil {
+		return nil, internalErr()
+	}
+	return &domain.MessageGeoPoint{
+		Lat:            point.Lat,
+		Long:           point.Long,
+		AccessHash:     hash,
+		AccuracyRadius: accuracy,
+	}, nil
+}
+
+func randomGeoAccessHash() (int64, error) {
+	var b [8]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		return 0, err
+	}
+	v := int64(binary.LittleEndian.Uint64(b[:]))
+	if v == 0 {
+		v = 1
+	}
+	return v, nil
+}
+
+// randomPollID 生成正的 63 位随机 poll id；polls 主键冲突概率可忽略（冲突时 INSERT 报错重试由客户端承担）。
+func randomPollID() (int64, error) {
+	var b [8]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		return 0, err
+	}
+	v := int64(binary.LittleEndian.Uint64(b[:]) >> 1)
+	if v == 0 {
+		v = 1
+	}
+	return v, nil
+}
+
+// normalizeDiceEmoticon 去掉 emoji 变体选择符（U+FE0F）：TDesktop 的 ⚽️ 与 ⚽ 都允许发送，
+// 但 dice 贴纸系统集 key 与官方回包都是裸码点形态。
+func normalizeDiceEmoticon(emoticon string) string {
+	return strings.ReplaceAll(emoticon, "️", "")
+}
+
+// diceValueSides 返回 emoticon 对应的取值上限（值域 [1, sides]，与官方一致）。
+// 列表必须与 appConfig 的 emojies_send_dice 保持同步（客户端据其决定单 emoji 是否转 dice）。
+func diceValueSides(emoticon string) (int, bool) {
+	switch emoticon {
+	case "\U0001F3B2", "\U0001F3AF", "\U0001F3B3": // 🎲 🎯 🎳
+		return 6, true
+	case "\U0001F3C0", "⚽": // 🏀 ⚽
+		return 5, true
+	case "\U0001F3B0": // 🎰
+		return 64, true
+	default:
+		return 0, false
+	}
+}
+
+func randomDiceValue(sides int) (int, error) {
+	if sides <= 0 {
+		return 0, fmt.Errorf("dice sides must be positive")
+	}
+	// 拒绝采样消除模偏差；sides ≤ 64，单字节足够。
+	max := 256 - 256%sides
+	var b [1]byte
+	for {
+		if _, err := cryptorand.Read(b[:]); err != nil {
+			return 0, err
+		}
+		if int(b[0]) < max {
+			return 1 + int(b[0])%sides, nil
+		}
+	}
+}
+
+func (r *Router) messageContactUserID(ctx context.Context, userID int64, phone string) int64 {
+	if r.deps.Users == nil || strings.TrimSpace(phone) == "" {
+		return 0
+	}
+	identity, ok := r.deps.Users.(UserIdentityService)
+	if !ok {
+		return 0
+	}
+	u, found, err := identity.ResolvePhone(ctx, userID, phone)
+	if err != nil || !found {
+		return 0
+	}
+	return u.ID
 }
 
 // messageMediaFromDocument 由 Document 构造 MessageMedia，并从属性推导 Video/Round/Voice 标志。
@@ -414,21 +836,21 @@ func messageMediaFromDocument(doc domain.Document, spoiler bool, ttl int) *domai
 }
 
 func inputPhotoID(input tg.InputPhotoClass) (int64, bool) {
-	if p, ok := input.(*tg.InputPhoto); ok && p.ID != 0 {
+	if p, ok := input.(*tg.InputPhoto); ok && p != nil && p.ID != 0 {
 		return p.ID, true
 	}
 	return 0, false
 }
 
 func inputDocumentID(input tg.InputDocumentClass) (int64, bool) {
-	if d, ok := input.(*tg.InputDocument); ok && d.ID != 0 {
+	if d, ok := input.(*tg.InputDocument); ok && d != nil && d.ID != 0 {
 		return d.ID, true
 	}
 	return 0, false
 }
 
 func inputDocumentCandidateIDs(input tg.InputDocumentClass) ([]int64, bool) {
-	if d, ok := input.(*tg.InputDocument); ok && d.ID != 0 {
+	if d, ok := input.(*tg.InputDocument); ok && d != nil && d.ID != 0 {
 		return []int64{d.ID}, true
 	}
 	return nil, false
@@ -545,4 +967,18 @@ func mapValuesChats(m map[int64]tg.ChatClass) []tg.ChatClass {
 		out = append(out, v)
 	}
 	return out
+}
+
+// channelPostAuthorName 取当前用户的展示名作为 broadcast post 签名快照；
+// store 层只在 signatures 开启的 post 上落库。
+func (r *Router) channelPostAuthorName(ctx context.Context, userID int64) string {
+	if r.deps.Users == nil || userID == 0 {
+		return ""
+	}
+	self, err := r.deps.Users.Self(ctx, userID)
+	if err != nil {
+		return ""
+	}
+	name := strings.TrimSpace(strings.TrimSpace(self.FirstName) + " " + strings.TrimSpace(self.LastName))
+	return name
 }

@@ -1,46 +1,43 @@
 # gramsrv
 
-`gramsrv` 是一个用 Go 编写的 Telegram-like MTProto server，重点放在真实客户端兼容、可复现协议研究、自建聊天服务实验，以及对 Telegram 客户端新版本行为的持续追踪。
+`gramsrv` 是一个用 Go 编写的开源 Telegram-like MTProto server，面向真实客户端兼容、自建聊天实验、协议研究，以及一条长期可演进的社区 server 路线。
 
-[官网](https://telesrv.net) · [讨论群组](https://t.me/telesrv_chat) · [频道](https://t.me/telesrv) · [English README](README.md)
+[English README](README.md) · [官网](https://telesrv.net) · [讨论群](https://t.me/telesrv_chat) · [频道](https://t.me/telesrv)
 
 `gramsrv` 是独立的非官方项目，与 Telegram 官方及其团队没有关联，也未获得其背书或赞助。
 
-## 演示视频
+## Demo Video
 
 https://github.com/user-attachments/assets/25e651dc-a022-4d60-8b9b-ca3e8bfe216c
 
-## 亮点
+## 项目特性
 
-- **一个 server 程序即可运行。** PostgreSQL 与 Redis 准备好后，Go server 进程会编排 RSA key 准备、数据库 migration、语言包 seed、MTProto edge、RPC router、updates、media/files 和可靠投递 worker。
-- **多设备已实现。** Telegram Desktop 与 Android 客户端可以使用同一套服务端状态，支持 scoped session、在线 fan-out、当前 session 排除，以及通过 updates difference API 做离线恢复。
-- **持续维护并追踪 Telegram 新版本。** 公开基线保持可复现，同时通过真实客户端 trace、兼容记录和后续适配任务持续跟踪 Telegram Desktop 与 Android 新版本行为。
-- **热路径优化是设计的一部分。** 可靠 outbox 批量投递、PostgreSQL 连接池预热、scoped session 查询、有界 RPC 参数和 seek 分页，减少聊天、同步与媒体路径上的重复工作。
-- **Telegram Desktop 是第一兼容目标。** 当前公开版本围绕固定 TDesktop 基线推进，并把兼容性进展写入文档。
-- **Android 兼容正在推进。** 当前公开截图已经包含连接到同一服务端路径的 Android 客户端。
-- **核心聊天主路径可用。** 已覆盖登录、users、contacts、dialogs、私聊消息、超级群/频道、media/files、用户/频道头像、stickers、reactions、语言包与 presence。
-- **生产边界明确。** 大规模公开频道、多 DC / 文件 DC / CDN、Bot API、payments、stories、Premium 商业逻辑、生产风控和生产对象存储不属于当前公开版本范围。
+| 状态 | 特性 | 说明 |
+|---|---|---|
+| ✅ | 一个程序直接启动 | 一个 Go 二进制完成 RSA key、数据库迁移、内置数据导入、MTProto 监听、RPC handlers、updates 分发和后台 worker。 |
+| ✅ | 所有 server 功能开源 | 协议接入、业务服务、存储层、兼容 handlers、媒体链路、updates、管理后台和实验模块都在本仓库。 |
 
-下载、公开说明和当前体验入口见 [telesrv.net](https://telesrv.net)。问题交流、兼容反馈和开发讨论可以加入 [t.me/telesrv_chat](https://t.me/telesrv_chat)。
+## 功能清单
 
-## 持续维护与版本追踪
+下面这些是开源代码里已经实现的 server 侧功能。
 
-`gramsrv` 不会把某一个固定客户端版本当成终点。固定 Telegram Desktop 基线用于保证回归可复现；新的 Telegram Desktop 与 Android 版本会通过真实客户端启动/同步 trace、兼容矩阵更新和聚焦适配任务持续跟进。
+| 状态 | 功能 | 当前已实现 |
+|---|---|---|
+| ✅ | MTProto server 接入层 | TCP transport、RSA key exchange、auth key、加密 session、salt、ack/resend、bad message、RPC dispatch、layer 兼容辅助。 |
+| ✅ | 登录与账号 | 开发验证码登录、sign-in、sign-up、log-out、授权设备、账号设置、SRP/password 状态、email/passkey 相关路径。 |
+| ✅ | 用户与联系人 | 用户资料、username、头像、联系人导入/搜索、block/privacy 状态、presence、last seen。 |
+| ✅ | 会话与同步 | dialog list、置顶、手动未读、folders/filters、草稿、read boundary、durable updates、在线 fan-out、离线 difference 恢复。 |
+| ✅ | 私聊消息 | send、history、read receipts、edit、delete、forward、reply、富文本实体、媒体/相册消息、reactions、scheduled/TTL 相关路径。 |
+| ✅ | 超级群与频道 | create、join、leave、邀请链接、成员、管理员、forum topics、history、send/edit/delete/read、reactions、公开搜索和预览。 |
+| ✅ | 媒体与文件 | upload、download、本地 blob 存储、照片、文档、缩略图、外链媒体抓取、网页预览、地图缩略图缓存、用户/频道头像。 |
+| ✅ | Stickers 与 Reactions | sticker/reaction catalog、seed 支持、recent reactions、top reactions、default reactions、reaction moderation 相关路径。 |
+| ✅ | Gifts 与 Stars | star gifts、本地 stars ledger 基础，用于兼容和后续功能扩展。 |
+| ✅ | Bots 与 Mini Apps | bot 服务基础、callbacks、inline helpers、webview/mini-app 路径、最小 Bot API gateway、demo 工具。 |
+| ✅ | 通话与实时能力 | 私聊通话信令基础、group call 状态、SFU/TURN building blocks、liveness 与 expiry worker。 |
+| ✅ | 管理与运维 | Admin API/UI backend、PostgreSQL migrations、Redis 易失态、retention workers、pprof/debug hooks、load-test helpers。 |
+| ✅ | Desktop、Android 与 Web 兼容 | Telegram Desktop 是第一目标，Android 与 Web 兼容路径也由同一套 server 持续覆盖。 |
 
-当新的 Telegram 客户端路径出现时，推荐流程是先记录调用，约束输入边界，再决定实现、stub 或标记为范围外，并保持仓库文档与实际行为一致。
-
-## 仓库结构
-
-```text
-cmd/telesrv/              server 启动入口
-deploy/                   docker-compose 与 PostgreSQL migrations
-internal/mtprotoedge/     MTProto transport、auth key、session、ack/resend
-internal/rpc/             TL router 与 Telegram Desktop 兼容 handlers
-internal/app/             domain services
-internal/domain/          不依赖协议生成类型的 domain models
-internal/store/           store interfaces 与 memory/postgres/redis 后端
-docs/                     兼容性记录与模块设计文档
-```
+其中一部分能力仍是兼容优先或实验性质，但它们都是真实开放的 server 代码，不是隐藏的产品版功能。下一步希望大家一起把这些路径打磨得更稳、更快、更好用。
 
 ## 快速启动
 
@@ -56,32 +53,34 @@ docs/                     兼容性记录与模块设计文档
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-编译并启动 server：
+编译并启动唯一的 server 程序：
 
 ```powershell
 go build -o bin/gramsrv.exe ./cmd/telesrv
 .\bin\gramsrv.exe
 ```
 
-第一次启动时，`gramsrv` 会创建 `data/server_rsa.pem`，自动执行所有数据库 migrations，导入内置语言包，并监听 `0.0.0.0:2398`。
+第一次启动时，`gramsrv` 会创建 `data/server_rsa.pem`，自动执行数据库 migrations，导入内置语言包，准备可选媒体资源，在 `0.0.0.0:2398` 监听 MTProto，并在同一进程里启动 updates、media、后台调度等 worker。
 
-常用开发环境变量：
+常用本地环境变量：
 
 | 变量 | 默认值 | 说明 |
 |---|---:|---|
 | `TELESRV_LISTEN` | `0.0.0.0:2398` | MTProto 监听地址 |
-| `TELESRV_ADVERTISE_IP` | `127.0.0.1` | 写入 `help.getConfig` 的客户端连接 IP |
+| `TELESRV_ADVERTISE_IP` | `127.0.0.1` | 下发给兼容客户端的连接 IP |
 | `TELESRV_DC` | `2` | 自建 DC id |
 | `TELESRV_DEV_AUTH_CODE` | `12345` | 本地开发固定登录验证码 |
 | `TELESRV_POSTGRES_DSN` | local Compose DSN | PostgreSQL 连接串 |
-| `TELESRV_REDIS_ADDR` | `localhost:6399` | Redis 地址 |
-| `TELESRV_STICKER_SEED_DIR` | `data/sticker-seed` | 可选的 sticker/reaction 导出种子目录 |
+| `TELESRV_REDIS_ADDR` | `127.0.0.1:6399` | Redis 地址 |
+| `TELESRV_LANGPACK_SEED_DIR` | `data/langpack` | 内置语言包种子目录 |
+| `TELESRV_BLOB_DIR` | `data/blobs` | 本地媒体 blob 目录 |
+| `TELESRV_STICKER_SEED_DIR` | `data/sticker-seed` | 可选 sticker/reaction 种子目录 |
 
 如果 sticker seed 目录不存在，启动时会自动跳过。
 
 ## 客户端兼容
 
-官方 Telegram 客户端不能直接连接 `gramsrv`，因为它们信任的是 Telegram 官方 DC 列表和 RSA keys。你可以从 [官网](https://telesrv.net) 获取体验客户端，或者自己编译带最小协议 patch 的客户端。
+官方 Telegram 客户端不能直接连接 `gramsrv`，因为它们信任的是 Telegram 官方 DC 列表和 RSA keys。你可以使用 [官网](https://telesrv.net) 提供的体验客户端，也可以自己做最小协议 patch。
 
 当前 Telegram Desktop 基线：
 
@@ -101,11 +100,11 @@ openssl rsa -in data/server_rsa.pem -RSAPublicKey_out -out data/server_rsa.pub
 2. 把 `kPublicRSAKeys` 和 `kTestPublicRSAKeys` 都替换为 `data/server_rsa.pub`。
 3. 给 built-in DC flags 加上 `Flag::f_tcpo_only`。
 
-客户端 patch 应保持最小：只改 endpoint、RSA key 和 TCP-only flags。
+客户端 patch 应保持最小：只改 endpoint、RSA key 和 TCP-only flags，不要把 UI 改动混入协议兼容 patch。
 
-## 多设备冒烟验证
+## 多端冒烟验证
 
-使用不同的客户端工作目录，避免多个 session 共用本地 `tdata`：
+用不同的 TDesktop working directory，避免 Alice 和 Bob 共用同一个 `tdata`：
 
 ```powershell
 $tdesktop = "C:\path\to\tdesktop\out\Debug\Telegram.exe"
@@ -113,26 +112,49 @@ Start-Process $tdesktop -ArgumentList @("-workdir", "$PWD\.tdata-alice")
 Start-Process $tdesktop -ArgumentList @("-workdir", "$PWD\.tdata-bob")
 ```
 
-用不同手机号登录。本地开发默认验证码是 `12345`，除非你修改了 `TELESRV_DEV_AUTH_CODE`。
+用两个不同手机号登录。本地开发默认验证码是 `12345`，除非你修改了 `TELESRV_DEV_AUTH_CODE`。
 
 推荐检查：
 
-- 在两个用户之间发送私聊消息、贴纸、媒体、回复、转发、编辑、删除和已读回执。
-- 保持一个设备在线，重启另一个设备，验证离线 `updates.getDifference` 恢复。
-- 同一账号打开多个 session，确认当前 session 不重复收到 echo，其它在线 session 能收到更新。
+- 两个用户之间发送私聊消息、sticker、媒体、reply、forward、edit、delete 和 read receipts。
+- 一个设备保持在线，另一个设备重启，验证离线 `updates.getDifference` 恢复。
+- 同一账号多 session 登录，确认当前 session 不重复 echo，其它在线 session 能收到 updates。
 - 检查 server 日志没有新增 `NOT_IMPLEMENTED`、`Unhandled RPC`、`bad_msg`、panic 或 internal error。
 
-## 文档
+## 仓库结构
 
-- [兼容矩阵](docs/compatibility-matrix.md)
-- [Telegram Desktop patch notes](docs/tdesktop-patch-notes.md)
-- [持久化层设计](docs/persistence-layer.md)
-- [消息模块](docs/message-module.md)
-- [频道模块](docs/channel-module.md)
-- [性能审计](docs/performance-audit.md)
+```text
+cmd/telesrv/              server 启动入口
+cmd/telesrv-admin/        管理后台 backend 与 web UI
+deploy/                   docker-compose、migrations、部署辅助
+data/                     内置语言包与可选种子数据
+internal/mtprotoedge/     MTProto transport、auth key、session、ack/resend
+internal/rpc/             TL router 与客户端兼容 handlers
+internal/app/             domain services
+internal/domain/          不依赖协议生成类型的 domain models
+internal/store/           memory/postgres/redis 存储后端
+internal/seed/            内置 seed catalog 加载器
+internal/sfu/             SFU 实验模块
+internal/turnsrv/         TURN/STUN building blocks
+```
 
-## 参与贡献
+## 一起优化
 
-欢迎围绕兼容性目标参与贡献。现在最有价值的方向包括 Telegram Desktop / Android 兼容反馈、新 Telegram 客户端版本反馈、可复现 RPC trace、聚焦的小 bug fix、多设备 update 测试、已实现路径的性能优化，以及让本地启动更顺滑的文档改进。
+`gramsrv` 非常欢迎大家一起跑、一起测、一起拆问题、一起优化。尤其欢迎这些贡献：
 
-如果改动会影响客户端可见行为，请写清客户端版本/commit、验证过的 RPC 路径，以及 server 日志结果。
+- Telegram Desktop 和 Android 兼容性报告，最好带可复现步骤。
+- 启动、同步、聊天、媒体、通话、bots 或边界场景的 RPC trace。
+- 围绕已实现路径的小而准的 bug fix。
+- 在线/离线 updates、多端 session、read state、媒体、频道行为的测试。
+- fan-out、分页、存储查询、媒体上传/下载、连接层等热点路径的性能优化。
+- 让“一个程序直接启动”的本地体验更顺滑的改进。
+
+如果改动会影响客户端可见行为，请说明客户端版本/commit、验证过的 RPC 路径，以及 server 日志是否没有新增 `NOT_IMPLEMENTED`、`Unhandled RPC`、`bad_msg`、panic 或 internal error。
+
+## 授权协议
+
+`gramsrv` 使用 [Apache License 2.0](LICENSE) 发布。你可以在 Apache-2.0 条款下使用、修改、分发，也可以商用。
+
+## 付费定制开发
+
+如需付费定制开发功能，可以通过讨论群或官网联系作者。定制范围不限于某一端，可覆盖 server 功能、Telegram Desktop、Android、Web、部署、兼容适配，或围绕本项目的其它客户端/服务端路径。

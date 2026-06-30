@@ -14,6 +14,8 @@ import (
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/mt"
 	"github.com/gotd/td/proto"
+
+	"telesrv/internal/compat/layerwire"
 )
 
 var (
@@ -115,6 +117,16 @@ func (c *Conn) Close() {
 			<-c.outboundDone
 		}
 	})
+}
+
+// ForceClose 停止连接并关闭底层 transport。
+// 仅用于授权撤销 / destroy_auth_key 这类“必须让对端立即断线”的路径；普通生命周期仍由
+// serveConn 统一关闭 transport，避免正常 push/索引清理把长连接误伤成硬断。
+func (c *Conn) ForceClose() {
+	if c.transport != nil {
+		_ = c.transport.Close()
+	}
+	c.Close()
 }
 
 // Send 加密并发送一条 server 消息。
@@ -424,7 +436,9 @@ func (c *Conn) handleOutboundSend(state *outboundState, op outboundOp) {
 	if err == nil {
 		err = c.writeFrame(op.ctx, frame)
 	}
-	if err == nil && frameNeedsAck(frame.typeID) {
+	if err == nil && frame != nil && frameNeedsAck(frame.typeID) {
+		// 写成功后才提交 content seq_no 递增（peekSeqNo 已按当前计数算好本帧 seq_no）。
+		c.commitContentSeqNo()
 		if dropped := state.add(frame); dropped > 0 {
 			for i := 0; i < dropped; i++ {
 				c.metrics.OutboundDropped("tracked_queue_overflow")
@@ -502,15 +516,53 @@ func (c *Conn) buildFrame(t proto.MessageType, msg bin.Encoder, encoded *encoded
 			return nil, err
 		}
 	}
+	// 出站统一在此按本连接协商 layer 降级：
+	//   - push fan-out 用 onceEncodedOutbound 把更新编码一次(canonical)再 SendEncoded 给多条
+	//     连接共享，故必须在此**逐连接**降级，且**绝不改共享 encoded**(downgradedClone 拷贝)。
+	//   - rpc_result 的内层对象已在 encodeRPCResult 按 layer 降级，其 mt.* 外壳在此为顶层直通(no-op)。
+	//   - 控制消息(mt.*)顶层直通。layer>=227 整条零开销。
+	encoded = c.downgradedClone(encoded)
 	content := frameNeedsAck(encoded.typeID)
 	msgID := c.msgID.New(t)
 	return &outboundFrame{
 		msgID:    msgID,
-		seqNo:    c.nextSeqNo(content),
+		seqNo:    c.peekSeqNo(content),
 		typeID:   encoded.typeID,
 		body:     encoded.body,
 		reqMsgID: encoded.reqMsgID,
 	}, nil
+}
+
+// downgradedClone 返回按本连接协商 layer 降级后的消息，**绝不修改入参**——push fan-out
+// 多条连接共享同一 encoded，逐连接降级必须各自拷贝，否则会污染其他连接的字节。
+// layer>=227 或 Transcode 直通(mt.* / 无变化)时原样返回入参，零拷贝。降级失败 fail-safe：
+// 返回 canonical 并计 metrics（宁可老客户端对个别长尾对象渲染异常，也不让连接/流崩）。
+func (c *Conn) downgradedClone(encoded *encodedOutboundMessage) *encodedOutboundMessage {
+	if encoded == nil {
+		return nil
+	}
+	if c.ClientLayer() >= layerwire.CanonicalLayer {
+		return encoded
+	}
+	down, err := layerwire.Transcode(encoded.body, c.ClientLayer())
+	if err != nil {
+		c.metrics.OutboundDropped("layerwire_downgrade_failed")
+		return encoded
+	}
+	if sameBacking(down, encoded.body) {
+		return encoded // 直通：未变(mt.*/顶层未知)，无需拷贝或重算 typeID
+	}
+	out := &encodedOutboundMessage{body: down, typeID: encoded.typeID, reqMsgID: encoded.reqMsgID}
+	if id, e := (&bin.Buffer{Buf: down}).PeekID(); e == nil {
+		out.typeID = id
+	}
+	return out
+}
+
+// sameBacking reports whether a and b share the same backing array (Transcode
+// returns its input unchanged for passthrough cases).
+func sameBacking(a, b []byte) bool {
+	return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0])
 }
 
 func encodeOutboundMessage(msg bin.Encoder) (*encodedOutboundMessage, error) {
@@ -532,13 +584,20 @@ func encodeOutboundMessage(msg bin.Encoder) (*encodedOutboundMessage, error) {
 	}, nil
 }
 
-func (c *Conn) nextSeqNo(content bool) int32 {
+// peekSeqNo 计算本帧的 seq_no，但不提交 content 计数递增——递增延到 writeFrame 成功后
+// （commitContentSeqNo）。这样写失败（超时/连接关）但连接存活时，下一条 content 帧会复用
+// 同一 seq_no 而非留下间隙，避免严格校验的客户端把间隙误判为丢帧。只由 outbound actor 调用。
+func (c *Conn) peekSeqNo(content bool) int32 {
 	seqNo := c.sentContentMessages * 2
 	if content {
 		seqNo++
-		c.sentContentMessages++
 	}
 	return seqNo
+}
+
+// commitContentSeqNo 在一条 content 帧成功写出后提交 seq_no 递增。只由 outbound actor 调用。
+func (c *Conn) commitContentSeqNo() {
+	c.sentContentMessages++
 }
 
 func (c *Conn) writeFrame(ctx context.Context, frame *outboundFrame) error {
@@ -628,6 +687,8 @@ func growBinBufferLen(b *bin.Buffer, n int) {
 func frameNeedsAck(typeID uint32) bool {
 	switch typeID {
 	case mt.MsgsAckTypeID,
+		mt.PongTypeID,
+		mt.FutureSaltsTypeID,
 		mt.BadMsgNotificationTypeID,
 		mt.BadServerSaltTypeID,
 		mt.MsgsStateInfoTypeID,

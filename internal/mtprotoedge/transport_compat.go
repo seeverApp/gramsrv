@@ -45,6 +45,38 @@ func newCompatTransportListener(codec func() transport.Codec, listener net.Liste
 	return &compatTransportListener{listener: listener}
 }
 
+// singleConnListener 是一个只产出一条「已接受」连接、随后阻塞到关闭的 net.Listener。
+// 它让单条裸连接可以走 listener 形态的去混淆/codec 管线（ObfuscatedListener +
+// compatTransportListener），从而把这部分阻塞读取从 accept 循环挪到每连接 goroutine。
+type singleConnListener struct {
+	addr net.Addr
+	ch   chan net.Conn
+	once sync.Once
+}
+
+func newSingleConnListener(c net.Conn) *singleConnListener {
+	ch := make(chan net.Conn, 1)
+	ch <- c
+	return &singleConnListener{addr: c.LocalAddr(), ch: ch}
+}
+
+func (l *singleConnListener) Accept() (net.Conn, error) {
+	c, ok := <-l.ch
+	if !ok {
+		return nil, net.ErrClosed
+	}
+	return c, nil
+}
+
+func (l *singleConnListener) Close() error {
+	l.once.Do(func() { close(l.ch) })
+	return nil
+}
+
+func (l *singleConnListener) Addr() net.Addr {
+	return l.addr
+}
+
 func (l *compatTransportListener) Accept() (_ transport.Conn, rErr error) {
 	conn, err := l.listener.Accept()
 	if err != nil {
@@ -409,9 +441,9 @@ func validateOutgoingCompatMessage(b *bin.Buffer) error {
 }
 
 func writeCompatPacket(w io.Writer, header, payload []byte) error {
-	packet := make([]byte, len(header)+len(payload))
-	copy(packet, header)
-	copy(packet[len(header):], payload)
+	packet := make([]byte, 0, len(header)+len(payload))
+	packet = append(packet, header...)
+	packet = append(packet, payload...)
 	return writeAll(w, packet)
 }
 

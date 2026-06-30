@@ -12,12 +12,21 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5" // 注册 pgx5:// migrate driver
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"telesrv/deploy"
+	"telesrv/internal/store/postgres/sqlcgen"
 )
 
 const defaultMinConns = 16
+
+// MigrationStatus 是启动迁移后的 schema 状态。
+type MigrationStatus struct {
+	Version uint
+	Dirty   bool
+	Empty   bool
+}
 
 // PoolOption 调整 pgxpool 连接池配置。
 type PoolOption func(*pgxpool.Config)
@@ -63,6 +72,7 @@ func Open(ctx context.Context, dsn string, opts ...PoolOption) (*pgxpool.Pool, e
 			opt(cfg)
 		}
 	}
+	cfg.ConnConfig.Tracer = queryStatsTracer{}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("pgxpool new: %w", err)
@@ -99,21 +109,59 @@ func warmMinConns(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
+func withTx(ctx context.Context, db sqlcgen.DBTX, op string, fn func(pgx.Tx) error) error {
+	beginner, ok := db.(txBeginner)
+	if !ok {
+		return fmt.Errorf("%s: db does not support transactions", op)
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin %s: %w", op, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit %s: %w", op, err)
+	}
+	committed = true
+	return nil
+}
+
 // Migrate 用嵌入的迁移脚本将数据库迁移到最新版本。幂等：已最新时返回 nil。
 func Migrate(dsn string) error {
+	_, err := MigrateAndStatus(dsn)
+	return err
+}
+
+// MigrateAndStatus 用嵌入迁移脚本迁移数据库，并返回迁移后的 schema 版本。
+func MigrateAndStatus(dsn string) (MigrationStatus, error) {
 	src, err := iofs.New(deploy.Migrations, "migrations")
 	if err != nil {
-		return fmt.Errorf("iofs source: %w", err)
+		return MigrationStatus{}, fmt.Errorf("iofs source: %w", err)
 	}
 	m, err := migrate.NewWithSourceInstance("iofs", src, toPgx5DSN(dsn))
 	if err != nil {
-		return fmt.Errorf("migrate new: %w", err)
+		return MigrationStatus{}, fmt.Errorf("migrate new: %w", err)
 	}
 	defer m.Close()
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		return fmt.Errorf("migrate up: %w", err)
+		return MigrationStatus{}, fmt.Errorf("migrate up: %w", err)
 	}
-	return nil
+	version, dirty, err := m.Version()
+	if errors.Is(err, migrate.ErrNilVersion) {
+		return MigrationStatus{Empty: true}, nil
+	}
+	if err != nil {
+		return MigrationStatus{}, fmt.Errorf("migrate version: %w", err)
+	}
+	return MigrationStatus{Version: version, Dirty: dirty}, nil
 }
 
 // toPgx5DSN 把 pgxpool 用的 postgres:// DSN 转成 golang-migrate pgx5 driver 所需的 pgx5:// scheme。

@@ -32,24 +32,29 @@ func (r *Router) onPhotosUploadProfilePhoto(ctx context.Context, req *tg.PhotosU
 	if bot, hasBot := req.GetBot(); hasBot && bot != nil {
 		return nil, inputConstructorInvalidErr()
 	}
-	file, hasFile := req.GetFile()
-	if !hasFile {
-		// video / emoji markup 等头像变体本阶段不支持。
-		return nil, photoInvalidErr()
+	upload, mediaFlags, err := parseProfilePhotoUpload(req)
+	if err != nil {
+		return nil, err
 	}
-	ref, ok := uploadedFileRef(userID, file)
-	if !ok {
-		return nil, fileReferenceInvalidErr()
+	if mediaFlags == 0 {
+		return nil, photoInvalidErr()
 	}
 	kind := domain.ProfilePhotoKindProfile
 	if req.GetFallback() {
 		kind = domain.ProfilePhotoKindFallback
 	}
-	photo, err := r.deps.Files.UploadProfilePhotoKind(ctx, domain.PeerTypeUser, userID, kind, ref, int(r.clock.Now().Unix()))
+	photo, err := r.createProfilePhoto(ctx, userID, upload)
 	if err != nil {
-		return nil, photoUploadErr(err)
+		return nil, err
 	}
-	return r.photosPhotoForSelf(ctx, userID, photo), nil
+	photo, found, err := r.deps.Files.SetCurrentProfilePhotoKind(ctx, domain.PeerTypeUser, userID, kind, photo.ID, int(r.clock.Now().Unix()))
+	if err != nil {
+		return nil, internalErr()
+	}
+	if !found {
+		return nil, photoInvalidErr()
+	}
+	return r.photosPhotoForSelf(ctx, userID, photo, kind), nil
 }
 
 func (r *Router) onPhotosUpdateProfilePhoto(ctx context.Context, req *tg.PhotosUpdateProfilePhotoRequest) (*tg.PhotosPhoto, error) {
@@ -79,18 +84,18 @@ func (r *Router) onPhotosUpdateProfilePhoto(ctx context.Context, req *tg.PhotosU
 		if !found {
 			return nil, photoInvalidErr()
 		}
-		return r.photosPhotoForSelf(ctx, userID, photo), nil
+		return r.photosPhotoForSelf(ctx, userID, photo, kind), nil
 	default:
 		// InputPhotoEmpty：移除当前头像（停用现有当前照片）。
 		if cur, found, err := r.deps.Files.CurrentProfilePhotoKind(ctx, domain.PeerTypeUser, userID, kind); err == nil && found {
 			_, _ = r.deps.Files.DeleteProfilePhotosKind(ctx, domain.PeerTypeUser, userID, kind, []int64{cur.ID})
 		}
-		return r.photosPhotoForSelf(ctx, userID, domain.Photo{}), nil
+		return r.photosPhotoForSelf(ctx, userID, domain.Photo{}, kind), nil
 	}
 }
 
 func (r *Router) onPhotosUploadContactProfilePhoto(ctx context.Context, req *tg.PhotosUploadContactProfilePhotoRequest) (*tg.PhotosPhoto, error) {
-	if r.deps.Files == nil || r.deps.Contacts == nil {
+	if r.deps.Files == nil || r.deps.Users == nil {
 		return nil, notImplementedErr()
 	}
 	userID, ok, err := r.currentUserID(ctx)
@@ -107,33 +112,255 @@ func (r *Router) onPhotosUploadContactProfilePhoto(ctx context.Context, req *tg.
 	if !found || target.ID == 0 || target.ID == userID {
 		return nil, userIDInvalidErr()
 	}
-	file, hasFile := req.GetFile()
-	if !hasFile {
-		if req.GetSave() {
-			if _, err := r.deps.Contacts.ClearPersonalPhoto(ctx, userID, target.ID, int(r.clock.Now().Unix())); err != nil {
-				return nil, contactErr(err)
-			}
-			return r.photosPhotoForUser(ctx, userID, target.ID, domain.Photo{}), nil
+	upload, mediaFlags, err := parseProfilePhotoUpload(req)
+	if err != nil {
+		return nil, err
+	}
+	if mediaFlags == 0 && req.GetSave() {
+		if r.deps.Contacts == nil {
+			return nil, notImplementedErr()
 		}
+		if _, err := r.deps.Contacts.ClearPersonalPhoto(ctx, userID, target.ID, int(r.clock.Now().Unix())); err != nil {
+			return nil, contactErr(err)
+		}
+		r.invalidateRPCProjectionForPeer(userID, domain.Peer{Type: domain.PeerTypeUser, ID: target.ID})
+		return r.photosPhotoForUser(ctx, userID, target.ID, domain.Photo{}), nil
+	}
+	if mediaFlags == 0 {
 		return nil, photoInvalidErr()
 	}
-	ref, ok := uploadedFileRef(userID, file)
-	if !ok {
-		return nil, fileReferenceInvalidErr()
-	}
-	photo, err := r.deps.Files.CreateAvatarFromUpload(ctx, ref)
+	photo, err := r.createProfilePhoto(ctx, userID, upload)
 	if err != nil {
-		return nil, photoUploadErr(err)
+		return nil, err
 	}
 	if req.GetSuggest() {
-		// TODO: add private MessageActionSuggestProfilePhoto once private service-message
-		// actions exist in the domain message model.
+		if r.deps.Messages == nil {
+			return nil, notImplementedErr()
+		}
+		res, err := r.sendSuggestedProfilePhotoMessage(ctx, userID, target.ID, photo)
+		if err != nil {
+			return nil, err
+		}
+		r.pushSuggestedProfilePhotoCurrentSession(ctx, userID, res)
 		return r.photosPhotoForUser(ctx, userID, target.ID, photo), nil
+	}
+	if r.deps.Contacts == nil {
+		return nil, notImplementedErr()
 	}
 	if _, err := r.deps.Contacts.SetPersonalPhoto(ctx, userID, target.ID, photo, int(r.clock.Now().Unix())); err != nil {
 		return nil, contactErr(err)
 	}
-	return r.photosPhotoForUser(ctx, userID, target.ID, photo), nil
+	r.invalidateRPCProjectionForPeer(userID, domain.Peer{Type: domain.PeerTypeUser, ID: target.ID})
+	return r.photosPhotoForUserWithPersonalPhoto(ctx, userID, target.ID, photo), nil
+}
+
+type profilePhotoUploadRequest interface {
+	GetFile() (tg.InputFileClass, bool)
+	GetVideo() (tg.InputFileClass, bool)
+	GetVideoStartTs() (float64, bool)
+	GetVideoEmojiMarkup() (tg.VideoSizeClass, bool)
+}
+
+type profilePhotoUpload struct {
+	file         tg.InputFileClass
+	hasFile      bool
+	video        tg.InputFileClass
+	hasVideo     bool
+	videoStartTs float64
+	markup       tg.VideoSizeClass
+	hasMarkup    bool
+}
+
+func parseProfilePhotoUpload(req profilePhotoUploadRequest) (profilePhotoUpload, int, error) {
+	file, hasFile := req.GetFile()
+	video, hasVideo := req.GetVideo()
+	videoStartTs, hasVideoStartTs := req.GetVideoStartTs()
+	markup, hasMarkup := req.GetVideoEmojiMarkup()
+	if hasFile && file == nil {
+		return profilePhotoUpload{}, 0, photoInvalidErr()
+	}
+	if hasVideo && video == nil {
+		return profilePhotoUpload{}, 0, photoInvalidErr()
+	}
+	if hasMarkup && markup == nil {
+		return profilePhotoUpload{}, 0, photoInvalidErr()
+	}
+	if hasFile && (hasVideo || hasMarkup) {
+		return profilePhotoUpload{}, 0, photoInvalidErr()
+	}
+	if hasVideoStartTs && !hasVideo {
+		return profilePhotoUpload{}, 0, photoInvalidErr()
+	}
+	mediaFlags := 0
+	if hasFile || hasVideo || hasMarkup {
+		mediaFlags = 1
+	}
+	return profilePhotoUpload{
+		file:         file,
+		hasFile:      hasFile,
+		video:        video,
+		hasVideo:     hasVideo,
+		videoStartTs: videoStartTs,
+		markup:       markup,
+		hasMarkup:    hasMarkup,
+	}, mediaFlags, nil
+}
+
+func (r *Router) createProfilePhoto(ctx context.Context, userID int64, upload profilePhotoUpload) (domain.Photo, error) {
+	switch {
+	case upload.hasFile:
+		ref, ok := uploadedFileRef(userID, upload.file)
+		if !ok {
+			return domain.Photo{}, fileReferenceInvalidErr()
+		}
+		photo, err := r.deps.Files.CreateAvatarFromUpload(ctx, ref)
+		if err != nil {
+			return domain.Photo{}, photoUploadErr(err)
+		}
+		return photo, nil
+	case upload.hasVideo && upload.hasMarkup:
+		ref, ok := uploadedFileRef(userID, upload.video)
+		if !ok {
+			return domain.Photo{}, fileReferenceInvalidErr()
+		}
+		size, ok := domainPhotoVideoMarkup(upload.markup)
+		if !ok {
+			return domain.Photo{}, photoInvalidErr()
+		}
+		photo, err := r.deps.Files.CreateAvatarVideoMarkupFromUpload(ctx, ref, upload.videoStartTs, size)
+		if err != nil {
+			return domain.Photo{}, photoUploadErr(err)
+		}
+		return photo, nil
+	case upload.hasVideo:
+		ref, ok := uploadedFileRef(userID, upload.video)
+		if !ok {
+			return domain.Photo{}, fileReferenceInvalidErr()
+		}
+		photo, err := r.deps.Files.CreateAvatarVideoFromUpload(ctx, ref, upload.videoStartTs)
+		if err != nil {
+			return domain.Photo{}, photoUploadErr(err)
+		}
+		return photo, nil
+	case upload.hasMarkup:
+		size, ok := domainPhotoVideoMarkup(upload.markup)
+		if !ok {
+			return domain.Photo{}, photoInvalidErr()
+		}
+		photo, err := r.deps.Files.CreateAvatarMarkup(ctx, size)
+		if err != nil {
+			return domain.Photo{}, photoUploadErr(err)
+		}
+		return photo, nil
+	default:
+		return domain.Photo{}, photoInvalidErr()
+	}
+}
+
+func domainPhotoVideoMarkup(markup tg.VideoSizeClass) (domain.PhotoSize, bool) {
+	switch v := markup.(type) {
+	case *tg.VideoSizeEmojiMarkup:
+		if v.EmojiID == 0 || len(v.BackgroundColors) == 0 {
+			return domain.PhotoSize{}, false
+		}
+		return domain.PhotoSize{
+			Kind:             domain.PhotoSizeKindVideoEmojiMarkup,
+			EmojiID:          v.EmojiID,
+			BackgroundColors: append([]int(nil), v.BackgroundColors...),
+		}, true
+	case *tg.VideoSizeStickerMarkup:
+		if v.StickerID == 0 || len(v.BackgroundColors) == 0 {
+			return domain.PhotoSize{}, false
+		}
+		size := domain.PhotoSize{
+			Kind:             domain.PhotoSizeKindVideoStickerMarkup,
+			StickerID:        v.StickerID,
+			BackgroundColors: append([]int(nil), v.BackgroundColors...),
+		}
+		setRef, ok := stickerSetRefFromInput(v.Stickerset)
+		if !ok {
+			return domain.PhotoSize{}, false
+		}
+		switch setRef.Kind {
+		case domain.StickerSetRefByID:
+			if setRef.ID == 0 {
+				return domain.PhotoSize{}, false
+			}
+			size.StickerSetID = setRef.ID
+			size.StickerSetAccessHash = setRef.AccessHash
+		case domain.StickerSetRefByShortName:
+			if setRef.ShortName == "" {
+				return domain.PhotoSize{}, false
+			}
+			size.StickerSetShortName = setRef.ShortName
+		case domain.StickerSetRefBySystem:
+			if setRef.SystemKey == "" {
+				return domain.PhotoSize{}, false
+			}
+			size.StickerSetSystemKey = setRef.SystemKey
+		default:
+			return domain.PhotoSize{}, false
+		}
+		return size, true
+	default:
+		return domain.PhotoSize{}, false
+	}
+}
+
+func (r *Router) sendSuggestedProfilePhotoMessage(ctx context.Context, userID, targetUserID int64, photo domain.Photo) (domain.SendPrivateTextResult, error) {
+	if photo.ID == 0 {
+		return domain.SendPrivateTextResult{}, photoInvalidErr()
+	}
+	recipientBlocked, err := r.peerBlocksUser(ctx, userID, targetUserID)
+	if err != nil {
+		return domain.SendPrivateTextResult{}, err
+	}
+	authKeyID, _ := AuthKeyIDFrom(ctx)
+	sessionID, _ := SessionIDFrom(ctx)
+	photoCopy := photo
+	res, err := r.deps.Messages.SendPrivateText(ctx, userID, domain.SendPrivateTextRequest{
+		SenderUserID:    userID,
+		RecipientUserID: targetUserID,
+		RandomID:        contactProfilePhotoSuggestRandomID(userID, targetUserID, photo.ID, r.clock.Now().UnixNano()),
+		Media: &domain.MessageMedia{
+			Kind: domain.MessageMediaKindService,
+			ServiceAction: &domain.MessageServiceAction{
+				Kind:  domain.MessageServiceActionSuggestProfilePhoto,
+				Photo: &photoCopy,
+			},
+		},
+		Date:             int(r.clock.Now().Unix()),
+		OriginAuthKeyID:  authKeyID,
+		OriginSessionID:  sessionID,
+		RecipientBlocked: recipientBlocked,
+	})
+	if err != nil {
+		return domain.SendPrivateTextResult{}, messageSendErr(err)
+	}
+	return res, nil
+}
+
+func contactProfilePhotoSuggestRandomID(userID, targetUserID, photoID, nowNano int64) int64 {
+	id := nowNano ^ (userID << 17) ^ (targetUserID << 7) ^ photoID
+	if id == 0 {
+		return photoID
+	}
+	return id
+}
+
+func (r *Router) pushSuggestedProfilePhotoCurrentSession(ctx context.Context, userID int64, res domain.SendPrivateTextResult) {
+	if res.SenderMessage.ID == 0 || res.SenderEvent.Pts == 0 {
+		return
+	}
+	updates := tgPrivateMessageUpdates(
+		res.SenderEvent,
+		res.SenderMessage,
+		0,
+		false,
+		r.usersForMessageUpdate(ctx, userID, res.SenderMessage),
+		r.chatsForMessageUpdate(ctx, userID, res.SenderMessage),
+	)
+	r.pushCurrentSessionMessage(ctx, "push suggested profile photo service message", updates)
 }
 
 func (r *Router) onPhotosGetUserPhotos(ctx context.Context, req *tg.PhotosGetUserPhotosRequest) (tg.PhotosPhotosClass, error) {
@@ -155,7 +382,10 @@ func (r *Router) onPhotosGetUserPhotos(ctx context.Context, req *tg.PhotosGetUse
 		return nil, userIDInvalidErr()
 	}
 	offset := req.Offset
-	if offset < 0 {
+	if offset < -1 {
+		offset = -1
+	}
+	if offset < 0 && req.MaxID <= 0 {
 		offset = 0
 	}
 	limit := req.Limit
@@ -170,8 +400,19 @@ func (r *Router) onPhotosGetUserPhotos(ctx context.Context, req *tg.PhotosGetUse
 	for _, p := range photos {
 		tgPhotos = append(tgPhotos, tgPhoto(p))
 	}
-	users := []tg.UserClass{r.tgUser(target)}
-	if total > len(photos)+offset {
+	// 打开自己的头像相册（inputUserSelf 或显式自己 ID）时 target 即 viewer，须带 self
+	// 标志，否则 self=false 的自己 user 会污染 DrKLO 账号缓存（Saved Messages 变身）。
+	selfUser := r.tgUser(target)
+	if target.ID == currentUserID {
+		selfUser = r.tgSelfUser(target)
+	}
+	users := []tg.UserClass{selfUser}
+	r.applyStoryMaxIDsToPeerObjects(ctx, currentUserID, users, nil)
+	countOffset := offset
+	if countOffset < 0 {
+		countOffset = 0
+	}
+	if total > len(photos)+countOffset {
 		return &tg.PhotosPhotosSlice{Count: total, Photos: tgPhotos, Users: users}, nil
 	}
 	return &tg.PhotosPhotos{Photos: tgPhotos, Users: users}, nil
@@ -200,20 +441,25 @@ func (r *Router) onPhotosDeletePhotos(ctx context.Context, id []tg.InputPhotoCla
 	if _, err := r.deps.Files.DeleteProfilePhotos(ctx, domain.PeerTypeUser, userID, ids); err != nil {
 		return nil, internalErr()
 	}
+	r.invalidateRPCProjectionForUser(userID)
 	return ids, nil
 }
 
 // photosPhotoForSelf 组装 photos.photo 响应（新照片 + 带头像的 self user），并在头像变更后
 // 向该账号其它在线设备推送，使其即时刷新头像。仅由 uploadProfilePhoto / updateProfilePhoto
 // 等头像变更路径调用（只读路径不得使用，否则会误触发推送）。
-func (r *Router) photosPhotoForSelf(ctx context.Context, userID int64, photo domain.Photo) *tg.PhotosPhoto {
+func (r *Router) photosPhotoForSelf(ctx context.Context, userID int64, photo domain.Photo, kind domain.ProfilePhotoKind) *tg.PhotosPhoto {
 	out := &tg.PhotosPhoto{Photo: tgPhoto(photo), Users: []tg.UserClass{}}
+	r.invalidateRPCProjectionForUser(userID)
 	if r.deps.Users == nil {
 		return out
 	}
 	self, err := r.deps.Users.Self(ctx, userID)
 	if err != nil {
 		return out
+	}
+	if kind == domain.ProfilePhotoKindProfile {
+		applyProfilePhotoToUser(&self, photo)
 	}
 	out.Users = append(out.Users, r.tgSelfUser(self))
 	r.pushSelfPhotoUpdate(ctx, self)
@@ -233,20 +479,62 @@ func (r *Router) photosPhotoForUser(ctx context.Context, viewerUserID, targetUse
 	return out
 }
 
+func (r *Router) photosPhotoForUserWithPersonalPhoto(ctx context.Context, viewerUserID, targetUserID int64, photo domain.Photo) *tg.PhotosPhoto {
+	out := r.photosPhotoForUser(ctx, viewerUserID, targetUserID, photo)
+	if photo.ID == 0 || len(out.Users) == 0 {
+		return out
+	}
+	user, ok := out.Users[0].(*tg.User)
+	if !ok || user == nil {
+		return out
+	}
+	user.Photo = &tg.UserProfilePhoto{PhotoID: photo.ID, DCID: photo.DCID, Personal: true}
+	if domain.PhotoHasVideo(photo.Sizes) {
+		user.Photo.(*tg.UserProfilePhoto).SetHasVideo(true)
+	}
+	if stripped := domain.StrippedFromSizes(photo.Sizes); len(stripped) > 0 {
+		user.Photo.(*tg.UserProfilePhoto).SetStrippedThumb(stripped)
+	}
+	return out
+}
+
+func applyProfilePhotoToUser(user *domain.User, photo domain.Photo) {
+	if user == nil {
+		return
+	}
+	if photo.ID == 0 {
+		user.PhotoID = 0
+		user.PhotoDCID = 0
+		user.PhotoStripped = nil
+		user.PhotoPersonal = false
+		user.PhotoHasVideo = false
+		return
+	}
+	user.PhotoID = photo.ID
+	user.PhotoDCID = photo.DCID
+	user.PhotoStripped = domain.StrippedFromSizes(photo.Sizes)
+	user.PhotoPersonal = false
+	user.PhotoHasVideo = domain.PhotoHasVideo(photo.Sizes)
+}
+
 // pushSelfPhotoUpdate 向该账号其它在线设备推送头像变更。updateUserName 不含 photo 无法刷新
 // 头像；updateUser 只是「该 user 变了」的信号（TDesktop 仅当 peer 已 full-loaded 时才
 // forceFull 重拉）；最可靠是在 Updates.Users 带上含新 userProfilePhoto 的完整 self user，
-// TDesktop 经 processUser→setPhoto→peerUpdated(Photo) 即时刷新。当前设备同时经 RPC 返回更新，
-// 重复推送对 TDesktop 幂等（setUserpicChecked 比对 photo_id，相同则 no-op）。
+// TDesktop 经 processUser→setPhoto→peerUpdated(Photo) 即时刷新。当前设备同时经 RPC 返回更新。
 func (r *Router) pushSelfPhotoUpdate(ctx context.Context, self domain.User) {
 	if self.ID == 0 {
 		return
 	}
-	r.pushUserUpdates(ctx, self.ID, &tg.Updates{
+	updates := selfPhotoUpdates(self, int(r.clock.Now().Unix()), r.tgSelfUser(self))
+	r.pushUserUpdates(ctx, self.ID, updates)
+}
+
+func selfPhotoUpdates(self domain.User, date int, user tg.UserClass) *tg.Updates {
+	return &tg.Updates{
 		Updates: []tg.UpdateClass{&tg.UpdateUser{UserID: self.ID}},
-		Users:   []tg.UserClass{r.tgSelfUser(self)},
-		Date:    int(r.clock.Now().Unix()),
-	})
+		Users:   []tg.UserClass{user},
+		Date:    date,
+	}
 }
 
 // uploadedFileRef 把 tg.InputFile / InputFileBig 转成 domain.UploadedFileRef。

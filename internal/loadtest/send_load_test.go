@@ -87,14 +87,13 @@ func TestMessageSendBaseline(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = rdb.Close() })
 
-	// 装配与 main.go 一致的消息热路径：Redis 分配器 + PG 消息存储 + transactional outbox。
+	// 装配与 main.go 一致的消息热路径：Redis box_id 分配器 + PG 消息存储 + transactional outbox。
 	userStore := postgres.NewUserStore(pool)
 	updateEventStore := postgres.NewUpdateEventStore(pool)
 	dispatchOutboxStore := postgres.NewDispatchOutboxStore(pool, postgres.WithLeaseTimeout(leaseTimeout))
 	dialogStore := postgres.NewDialogStore(pool)
-	ptsAllocator := redisstore.NewPtsAllocator(rdb, updateEventStore)
 	boxIDAllocator := redisstore.NewBoxIDAllocator(rdb, postgres.NewMessageBoxCounterSource(pool))
-	messageStore := postgres.NewMessageStore(pool, postgres.WithMessageAllocators(boxIDAllocator, ptsAllocator))
+	messageStore := postgres.NewMessageStore(pool, postgres.WithMessageAllocators(boxIDAllocator))
 	svc := messageapp.NewService(messageStore, dialogStore)
 
 	// 创建独立的测试用户池；用随机 salt 隔离历史残留，结束按 FK 依赖序清理。
@@ -359,7 +358,7 @@ func seedUsers(t *testing.T, ctx context.Context, store *postgres.UserStore, n i
 }
 
 // cleanup 按 FK 依赖序删除测试数据：outbox→events→boxes→private_messages→dialogs→users，
-// 再清 Redis pts/box_id 计数。message_boxes.from_user_id 为 ON DELETE RESTRICT，必须先删盒子。
+// 再清 Redis box_id 计数。message_boxes.from_user_id 为 ON DELETE RESTRICT，必须先删盒子。
 // cleanup 在断言之后运行，出错只告警不影响已得结果。
 func cleanup(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client, ids []int64) {
 	t.Helper()
@@ -377,12 +376,9 @@ func cleanup(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client, ids []int64) {
 			t.Logf("cleanup %q: %v", sql, err)
 		}
 	}
-	keys := make([]string, 0, len(ids)*2)
+	keys := make([]string, 0, len(ids))
 	for _, id := range ids {
-		keys = append(keys,
-			fmt.Sprintf("counter:pts:{%d}", id),
-			fmt.Sprintf("counter:box_id:{%d}", id),
-		)
+		keys = append(keys, fmt.Sprintf("counter:box_id:{%d}", id))
 	}
 	if err := rdb.Del(ctx, keys...).Err(); err != nil {
 		t.Logf("cleanup redis counters: %v", err)

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"time"
 
@@ -19,6 +20,8 @@ import (
 	"github.com/gotd/td/tgerr"
 	"github.com/gotd/td/transport"
 
+	"telesrv/internal/compat/layerwire"
+	"telesrv/internal/observability/dbtrace"
 	"telesrv/internal/store"
 )
 
@@ -69,22 +72,34 @@ const (
 
 // handleEncrypted 解密加密消息，按需注册连接，处理服务消息并分发明文 payload。
 // 返回（可能新建/更新的）当前连接对象，供 serveConn 维护生命周期。
-func (s *Server) handleEncrypted(ctx context.Context, tc transport.Conn, cs *connState, current *Conn, keyData store.AuthKeyData, b *bin.Buffer) (*Conn, error) {
-	key := crypto.AuthKey{Value: crypto.Key(keyData.Value), ID: keyData.ID}
+// fetchedKey 非 nil 表示本帧的 auth key 是刚从 AuthKeyStore 查出的（首帧/换 auth key/被销毁
+// 后回落）；为 nil 表示走快路径——serveConn 判定 current 仍持同一未销毁的 auth key，直接复用
+// current.key/current.salt 解密，既不回查 AuthKeyStore 也不重建 store.AuthKeyData。
+func (s *Server) handleEncrypted(ctx context.Context, tc transport.Conn, cs *connState, current *Conn, fetchedKey *store.AuthKeyData, b *bin.Buffer) (*Conn, error) {
+	var key crypto.AuthKey
+	var serverSalt int64
+	if fetchedKey != nil {
+		key = crypto.AuthKey{Value: crypto.Key(fetchedKey.Value), ID: fetchedKey.ID}
+		serverSalt = fetchedKey.ServerSalt
+	} else {
+		// 快路径：复用已建立连接缓存的密钥与盐（同一 auth key 的后续帧，含同连接换 session）。
+		key = current.key
+		serverSalt = current.salt
+	}
 
 	data, err := s.cipher.DecryptFromBuffer(key, b)
 	if err != nil {
 		return current, fmt.Errorf("decrypt: %w", err)
 	}
 
-	if data.Salt != keyData.ServerSalt {
+	if data.Salt != serverSalt {
 		c := current
 		temp := false
 		if c == nil || c.sessionID != data.SessionID {
-			c = s.newConn(tc, key, data.SessionID, keyData.ServerSalt)
+			c = s.newConn(tc, key, data.SessionID, serverSalt)
 			temp = true
 		}
-		err := s.sendBadServerSalt(ctx, c, data.MessageID, data.SeqNo, keyData.ServerSalt)
+		err := s.sendBadServerSalt(ctx, c, data.MessageID, data.SeqNo, serverSalt)
 		if temp {
 			c.Close()
 		}
@@ -100,18 +115,11 @@ func (s *Server) handleEncrypted(ctx context.Context, tc transport.Conn, cs *con
 			s.conns.Unregister(current)
 			current.Close()
 		}
-		current = s.newConn(tc, key, data.SessionID, keyData.ServerSalt)
+		current = s.newConn(tc, key, data.SessionID, serverSalt)
 		s.conns.Register(current)
 	}
 
-	if err := s.sessions.Save(ctx, store.SessionData{
-		ID:        data.SessionID,
-		AuthKeyID: key.ID,
-		Salt:      keyData.ServerSalt,
-		LastSeen:  s.clock.Now().Unix(),
-	}); err != nil {
-		return current, fmt.Errorf("save session: %w", err)
-	}
+	s.maybePersistSession(ctx, current, data.SessionID, key.ID, serverSalt)
 
 	body := data.Data()
 	typeID, err := (&bin.Buffer{Buf: body}).PeekID()
@@ -133,11 +141,9 @@ func (s *Server) handleEncrypted(ctx context.Context, tc transport.Conn, cs *con
 
 	content := clientMessageNeedsAck(typeID)
 	if record, ok := cs.seenRecord(data.MessageID); ok {
-		s.log.Debug("Duplicate msg_id; re-ack only", zap.Int64("msg_id", data.MessageID))
-		if resent, err := current.ResendByRequest(ctx, data.MessageID); err != nil {
+		s.log.Debug("Duplicate msg_id; replay cached result if available", zap.Int64("msg_id", data.MessageID))
+		if err := s.replayRPCResultByRequest(ctx, current, data.MessageID); err != nil {
 			return current, err
-		} else if resent {
-			s.log.Debug("Resent cached rpc_result for duplicate msg_id", zap.Int64("msg_id", data.MessageID))
 		}
 		if !record.content {
 			return current, nil
@@ -173,6 +179,34 @@ func (s *Server) handleEncrypted(ctx context.Context, tc transport.Conn, cs *con
 		}
 	}
 	return current, nil
+}
+
+// sessionSaveMinInterval 是单连接持久化 session 记录的最小间隔。把原本「每帧一次 Redis SET」
+// 去抖到固定间隔——session 是软状态（生产无热读路径），只需周期刷新 last_seen/续 TTL。
+const sessionSaveMinInterval = 30 * time.Second
+
+// maybePersistSession 按 sessionSaveMinInterval 去抖持久化 session，失败只告警不断连。
+// 原实现每帧同步 Save 且失败即断连：N 连接×帧率的 Redis 写放大 + Redis 抖动级联断连。
+func (s *Server) maybePersistSession(ctx context.Context, c *Conn, sessionID int64, authKeyID [8]byte, salt int64) {
+	if c == nil {
+		return
+	}
+	now := s.clock.Now().Unix()
+	if last := c.lastSessionSaveUnix.Load(); last != 0 && now-last < int64(sessionSaveMinInterval/time.Second) {
+		return
+	}
+	c.lastSessionSaveUnix.Store(now)
+	if err := s.sessions.Save(ctx, store.SessionData{
+		ID:        sessionID,
+		AuthKeyID: authKeyID,
+		Salt:      salt,
+		LastSeen:  now,
+	}); err != nil {
+		s.log.Warn("Persist session failed (non-fatal)",
+			zap.Int64("session_id", sessionID),
+			zap.Error(err),
+		)
+	}
 }
 
 func sendQuickAckIfRequested(ctx context.Context, tc transport.Conn, key crypto.AuthKey, data *crypto.EncryptedMessageData) error {
@@ -236,6 +270,9 @@ func (s *Server) dispatch(ctx context.Context, cs *connState, c *Conn, msgID int
 			}
 			content := clientMessageNeedsAck(typeID)
 			if record, ok := cs.seenRecord(m.ID); ok {
+				if err := s.replayRPCResultByRequest(ctx, c, m.ID); err != nil {
+					return err
+				}
 				if record.content {
 					*acks = append(*acks, m.ID)
 				}
@@ -360,6 +397,19 @@ func (s *Server) dispatch(ctx context.Context, cs *connState, c *Conn, msgID int
 		}
 		ackContent()
 		s.log.Debug("Received destroy_auth_key", zap.String("auth_key_id", hex.EncodeToString(c.authKeyID[:])))
+		// 真正销毁：删密钥库记录（每帧回查，删除后该 key 的入站帧立即失效）并主动
+		// 断开同 key 的其他连接——出站推送用连接持有的密钥副本加密、不回查密钥库，
+		// 不断开的话被销毁 key 的空闲连接仍能持续收到推送。发起连接除外：响应要
+		// 先送达，它的下一帧会因密钥缺失自然断开。授权（authorizations）不在此清理，
+		// destroy_auth_key 是 PFS 密钥轮换的清理动作，不等于登出。
+		if err := s.authKeys.Delete(ctx, c.authKeyID); err != nil {
+			s.log.Warn("Delete auth key failed", zap.String("auth_key_id", hex.EncodeToString(c.authKeyID[:])), zap.Error(err))
+			return c.SendAsync(ctx, proto.MessageServerResponse, &destroyAuthKeyFail{})
+		}
+		// 标记密钥已销毁：发起连接被 CloseSessionsForRawAuthKeyExcept 排除（响应需先送达），
+		// 它下一帧不能再走 serveConn 的密钥复用快路径，须回落到 Get→AuthKeyNotFound 自然失效。
+		c.keyDestroyed.Store(true)
+		s.conns.CloseSessionsForRawAuthKeyExcept(c.authKeyID, c.sessionID)
 		return c.SendAsync(ctx, proto.MessageServerResponse, &destroyAuthKeyOk{})
 
 	default:
@@ -389,6 +439,15 @@ func mergeStateInfo(primary, fallback []byte) []byte {
 func (s *Server) enqueueRPC(ctx context.Context, c *Conn, msgID int64, body []byte) error {
 	id, _ := (&bin.Buffer{Buf: body}).PeekID()
 	method := s.typeName(id)
+	if cached, ok := s.cachedRPCResult(c, msgID); ok {
+		s.log.Info("RPC duplicate replay from session cache",
+			zap.String("method", method),
+			zap.Int64("msg_id", msgID),
+			zap.String("auth_key_id", hex.EncodeToString(c.authKeyID[:])),
+			zap.Int64("session_id", c.sessionID),
+		)
+		return c.SendEncoded(ctx, proto.MessageServerResponse, cached)
+	}
 	err := c.enqueueInboundRPC(ctx, inboundRPC{
 		method: method,
 		size:   len(body),
@@ -431,10 +490,18 @@ func (s *Server) handleRPC(ctx context.Context, c *Conn, msgID int64, b *bin.Buf
 		return nil
 	}
 
+	ctx, dbStats := dbtrace.WithStats(ctx)
 	start := s.clock.Now()
 	result, err := s.rpc.Dispatch(ctx, c.authKeyID, c.sessionID, b)
 	dur := s.clock.Now().Sub(start)
 	s.metrics.RPCHandled(method, dur, err)
+	// 刷新本连接协商 layer（invokeWithLayer/initConnection 已被 Dispatch 处理并登记），
+	// 供 rpc_result 与后续 push 出站降级使用。仅在确实观测到 layer 时更新——缓存被驱逐
+	// 时 NegotiatedLayer 返回 ok=false，此时必须保留连接已记住的 layer，绝不覆盖成默认值，
+	// 否则长连接老客户端的条目被驱逐后会被误降回 227。
+	if layer, ok := s.rpc.NegotiatedLayer(c.authKeyID, c.sessionID); ok {
+		c.SetClientLayer(layer)
+	}
 
 	fields := []zap.Field{
 		zap.String("method", method),
@@ -449,6 +516,7 @@ func (s *Server) handleRPC(ctx context.Context, c *Conn, msgID int64, b *bin.Buf
 	if userID := c.UserID(); userID != 0 {
 		fields = append(fields, zap.Int64("user_id", userID))
 	}
+	fields = dbtrace.AppendZapFields(fields, "", dbStats.Snapshot())
 
 	if err != nil {
 		var rpcErr *tgerr.Error
@@ -472,14 +540,72 @@ func (s *Server) handleRPC(ctx context.Context, c *Conn, msgID int64, b *bin.Buf
 
 // sendResult 把 RPC 结果包成 rpc_result 并加密回发。
 func (s *Server) sendResult(ctx context.Context, c *Conn, reqMsgID int64, result bin.Encoder) error {
+	encoded, err := s.encodeRPCResult(c, reqMsgID, result)
+	if err != nil {
+		return err
+	}
+	s.storeRPCResult(c, reqMsgID, encoded)
+	return c.SendEncoded(ctx, proto.MessageServerResponse, encoded)
+}
+
+// encodeRPCResult 编码 rpc_result。proto.Result.Result 是裸 boxed 对象字节，故在包入
+// rpc_result 之前对其按连接协商 layer 降级（layer==227 直通，零开销）。降级失败 fail-safe：
+// 记日志并发送 canonical 字节——宁可老客户端对个别长尾对象渲染异常，也不让连接/流崩。
+func (s *Server) encodeRPCResult(c *Conn, reqMsgID int64, result bin.Encoder) (*encodedOutboundMessage, error) {
 	var buf bin.Buffer
 	if err := result.Encode(&buf); err != nil {
-		return fmt.Errorf("encode rpc result: %w", err)
+		return nil, fmt.Errorf("encode rpc result: %w", err)
 	}
-	return c.Send(ctx, proto.MessageServerResponse, &proto.Result{
+	inner := buf.Raw()
+	if layer := c.ClientLayer(); layer < layerwire.CanonicalLayer {
+		if down, err := layerwire.Transcode(inner, layer); err != nil {
+			s.log.Warn("layerwire downgrade failed; sending canonical rpc_result",
+				zap.Int("layer", layer), zap.Int64("req_msg_id", reqMsgID), zap.Error(err))
+		} else {
+			inner = down
+		}
+	}
+	encoded, err := encodeOutboundMessage(&proto.Result{
 		RequestMessageID: reqMsgID,
-		Result:           buf.Raw(),
+		Result:           inner,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return encoded, nil
+}
+
+func (s *Server) cachedRPCResult(c *Conn, reqMsgID int64) (*encodedOutboundMessage, bool) {
+	if s == nil || s.rpcResults == nil || c == nil {
+		return nil, false
+	}
+	return s.rpcResults.Get(c.authKeyID, c.sessionID, reqMsgID)
+}
+
+func (s *Server) replayRPCResultByRequest(ctx context.Context, c *Conn, reqMsgID int64) error {
+	if c == nil {
+		return nil
+	}
+	if resent, err := c.ResendByRequest(ctx, reqMsgID); err != nil {
+		return err
+	} else if resent {
+		s.log.Debug("Resent connection cached rpc_result for duplicate msg_id", zap.Int64("msg_id", reqMsgID))
+		return nil
+	}
+	if cached, ok := s.cachedRPCResult(c, reqMsgID); ok {
+		if err := c.SendEncoded(ctx, proto.MessageServerResponse, cached); err != nil {
+			return err
+		}
+		s.log.Debug("Resent session cached rpc_result for duplicate msg_id", zap.Int64("msg_id", reqMsgID))
+	}
+	return nil
+}
+
+func (s *Server) storeRPCResult(c *Conn, reqMsgID int64, encoded *encodedOutboundMessage) {
+	if s == nil || s.rpcResults == nil || c == nil {
+		return
+	}
+	s.rpcResults.Put(c.authKeyID, c.sessionID, reqMsgID, encoded)
 }
 
 // sendPong 回复 mt.PingRequest / mt.PingDelayDisconnectRequest。
@@ -515,12 +641,23 @@ func (s *Server) sendFutureSalts(ctx context.Context, c *Conn, reqMsgID int64, n
 }
 
 // sendNewSessionCreated 在连接首个加密消息后通知客户端新 session 已建立。
+// unique_id 必须每个 server session 实例独立：客户端按 unique_id 去重，
+// 复用同一值会让断线重连后的 new_session_created 被吞掉，错过的差分补拉
+// （Android 收到后才调 getDifference）随之丢失。
 func (s *Server) sendNewSessionCreated(ctx context.Context, c *Conn, firstMsgID int64) error {
 	return c.SendAsync(ctx, proto.MessageFromServer, &mt.NewSessionCreated{
 		FirstMsgID: firstMsgID,
-		UniqueID:   s.sessionUID,
+		UniqueID:   s.newServerSessionUID(),
 		ServerSalt: c.salt,
 	})
+}
+
+func (s *Server) newServerSessionUID() int64 {
+	var b [8]byte
+	if _, err := io.ReadFull(s.rand, b[:]); err == nil {
+		return int64(binary.LittleEndian.Uint64(b[:]))
+	}
+	return s.clock.Now().UnixNano()
 }
 
 // sendAck 确认收到客户端 content-related 消息。
@@ -640,7 +777,11 @@ func validateClientContainerEnvelope(msgID int64, seqNo int32, typeID uint32) in
 
 func clientMessageAllowsEitherSeqParity(typeID uint32) bool {
 	switch typeID {
-	case mt.PingDelayDisconnectRequestTypeID:
+	case mt.PingDelayDisconnectRequestTypeID,
+		// get_future_salts 的 seqno 奇偶在客户端间不一致：部分客户端按内容消息发奇数，
+		// gotd 按服务消息发偶数。两者都合法（官方服务器都接受），故不在此卡奇偶，避免
+		// 误判 bad_msg 触发客户端重连风暴。ack/content 行为仍由 clientMessageNeedsAck 决定。
+		mt.GetFutureSaltsRequestTypeID:
 		return true
 	default:
 		return false

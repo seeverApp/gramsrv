@@ -12,13 +12,17 @@ INSERT INTO user_update_events (
   dialog_filter,
   filter_order,
   folder_peers,
+  story_payload,
+  reaction_payload,
   message_box_id,
   peer_type,
   peer_id,
   filter_id,
   max_id,
   still_unread_count,
-  tags_enabled
+  channel_pts,
+  tags_enabled,
+  folder_id
 ) VALUES (
   $1,
   $2,
@@ -32,15 +36,18 @@ INSERT INTO user_update_events (
   sqlc.arg(dialog_filter)::jsonb,
   sqlc.arg(filter_order)::jsonb,
   sqlc.arg(folder_peers)::jsonb,
+  sqlc.arg(story_payload)::jsonb,
+  sqlc.arg(reaction_payload)::jsonb,
   sqlc.narg(message_box_id),
   sqlc.narg(peer_type)::text,
   sqlc.narg(peer_id)::bigint,
   sqlc.arg(filter_id)::int,
   sqlc.arg(max_id)::int,
   sqlc.arg(still_unread_count)::int,
-  sqlc.arg(tags_enabled)::boolean
-)
-ON CONFLICT (user_id, pts) DO NOTHING;
+  sqlc.arg(channel_pts)::int,
+  sqlc.arg(tags_enabled)::boolean,
+  sqlc.arg(folder_id)::int
+);
 
 -- name: ListUserUpdateEventsAfter :many
 SELECT
@@ -56,12 +63,16 @@ SELECT
   COALESCE(e.dialog_filter::text, '{}')::text AS dialog_filter_json,
   COALESCE(e.filter_order::text, '[]')::text AS filter_order_json,
   COALESCE(e.folder_peers::text, '[]')::text AS folder_peers_json,
+  COALESCE(e.story_payload::text, '{}')::text AS story_payload_json,
+  COALESCE(e.reaction_payload::text, '{}')::text AS reaction_payload_json,
   COALESCE(e.peer_type, '')::text AS event_peer_type,
   COALESCE(e.peer_id, 0)::bigint AS event_peer_id,
   e.filter_id,
   e.max_id,
   e.still_unread_count,
+  e.channel_pts,
   e.tags_enabled,
+  e.folder_id,
   COALESCE(m.box_id, 0)::int AS message_id,
   COALESCE(m.private_message_id, 0)::bigint AS private_message_id,
   COALESCE(m.owner_user_id, 0)::bigint AS owner_user_id,
@@ -69,6 +80,8 @@ SELECT
   COALESCE(m.peer_id, 0)::bigint AS peer_id,
   COALESCE(m.from_user_id, 0)::bigint AS from_user_id,
   COALESCE(m.message_date, 0)::int AS message_date,
+  COALESCE(m.ttl_period, 0)::int AS ttl_period,
+  COALESCE(m.expires_at, 0)::int AS expires_at,
   COALESCE(m.edit_date, 0)::int AS edit_date,
   COALESCE(m.outgoing, false)::boolean AS outgoing,
   COALESCE(m.body, '')::text AS body,
@@ -79,6 +92,7 @@ SELECT
   COALESCE(m.reply_to_peer_type, '')::text AS reply_to_peer_type,
   COALESCE(m.reply_to_peer_id, 0)::bigint AS reply_to_peer_id,
   COALESCE(m.reply_to_top_id, 0)::int AS reply_to_top_id,
+  COALESCE(m.reply_to_story_id, 0)::int AS reply_to_story_id,
   COALESCE(m.quote_text, '')::text AS quote_text,
   COALESCE(m.quote_entities::text, '[]')::text AS quote_entities_json,
   COALESCE(m.quote_offset, 0)::int AS quote_offset,
@@ -86,9 +100,20 @@ SELECT
   COALESCE(m.fwd_from_peer_id, 0)::bigint AS fwd_from_peer_id,
   COALESCE(m.fwd_from_name, '')::text AS fwd_from_name,
   COALESCE(m.fwd_date, 0)::int AS fwd_date,
+  COALESCE(m.fwd_saved_from_peer_type, '')::text AS fwd_saved_from_peer_type,
+  COALESCE(m.fwd_saved_from_peer_id, 0)::bigint AS fwd_saved_from_peer_id,
+  COALESCE(m.fwd_saved_from_msg_id, 0)::int AS fwd_saved_from_msg_id,
+  COALESCE(m.saved_peer_type, '')::text AS saved_peer_type,
+  COALESCE(m.saved_peer_id, 0)::bigint AS saved_peer_id,
   COALESCE(m.media::text, '{}')::text AS media_json,
   COALESCE(m.media_unread, false)::boolean AS media_unread,
   COALESCE(m.reaction_unread, false)::boolean AS reaction_unread,
+  COALESCE(m.pinned, false)::boolean AS pinned,
+  COALESCE(m.via_bot_id, 0)::bigint AS via_bot_id,
+  COALESCE(m.grouped_id, 0)::bigint AS grouped_id,
+  COALESCE(m.effect, 0)::bigint AS effect,
+  COALESCE(m.reply_markup::text, '{}')::text AS reply_markup_json,
+  COALESCE(m.rich_message::text, '{}')::text AS rich_message_json,
   COALESCE(peer_u.id, 0)::bigint AS peer_user_id,
   COALESCE(peer_u.access_hash, 0)::bigint AS peer_access_hash,
   COALESCE(peer_u.phone, '')::text AS peer_phone,
@@ -98,6 +123,11 @@ SELECT
   COALESCE(peer_u.country_code, '')::text AS peer_country_code,
   COALESCE(peer_u.verified, false)::boolean AS peer_verified,
   COALESCE(peer_u.support, false)::boolean AS peer_support,
+  COALESCE(peer_u.is_bot, false)::boolean AS peer_is_bot,
+  COALESCE(peer_u.bot_info_version, 0)::int AS peer_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM peer_u.premium_expires_at), 0)::bigint AS peer_premium_until,
+  COALESCE(peer_u.emoji_status_document_id, 0)::bigint AS peer_emoji_status_document_id,
+  COALESCE(peer_u.emoji_status_until, 0)::bigint AS peer_emoji_status_until,
   COALESCE(from_u.id, 0)::bigint AS from_user_user_id,
   COALESCE(from_u.access_hash, 0)::bigint AS from_user_access_hash,
   COALESCE(from_u.phone, '')::text AS from_user_phone,
@@ -107,6 +137,11 @@ SELECT
   COALESCE(from_u.country_code, '')::text AS from_user_country_code,
   COALESCE(from_u.verified, false)::boolean AS from_user_verified,
   COALESCE(from_u.support, false)::boolean AS from_user_support,
+  COALESCE(from_u.is_bot, false)::boolean AS from_user_is_bot,
+  COALESCE(from_u.bot_info_version, 0)::int AS from_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM from_u.premium_expires_at), 0)::bigint AS from_user_premium_until,
+  COALESCE(from_u.emoji_status_document_id, 0)::bigint AS from_user_emoji_status_document_id,
+  COALESCE(from_u.emoji_status_until, 0)::bigint AS from_user_emoji_status_until,
   COALESCE(fwd_u.id, 0)::bigint AS fwd_user_id,
   COALESCE(fwd_u.access_hash, 0)::bigint AS fwd_user_access_hash,
   COALESCE(fwd_u.phone, '')::text AS fwd_user_phone,
@@ -116,6 +151,11 @@ SELECT
   COALESCE(fwd_u.country_code, '')::text AS fwd_user_country_code,
   COALESCE(fwd_u.verified, false)::boolean AS fwd_user_verified,
   COALESCE(fwd_u.support, false)::boolean AS fwd_user_support,
+  COALESCE(fwd_u.is_bot, false)::boolean AS fwd_user_is_bot,
+  COALESCE(fwd_u.bot_info_version, 0)::int AS fwd_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM fwd_u.premium_expires_at), 0)::bigint AS fwd_user_premium_until,
+  COALESCE(fwd_u.emoji_status_document_id, 0)::bigint AS fwd_user_emoji_status_document_id,
+  COALESCE(fwd_u.emoji_status_until, 0)::bigint AS fwd_user_emoji_status_until,
   COALESCE(reply_u.id, 0)::bigint AS reply_user_id,
   COALESCE(reply_u.access_hash, 0)::bigint AS reply_user_access_hash,
   COALESCE(reply_u.phone, '')::text AS reply_user_phone,
@@ -125,62 +165,17 @@ SELECT
   COALESCE(reply_u.country_code, '')::text AS reply_user_country_code,
   COALESCE(reply_u.verified, false)::boolean AS reply_user_verified,
   COALESCE(reply_u.support, false)::boolean AS reply_user_support,
-  COALESCE(fwd_ch.id, 0)::bigint AS fwd_channel_id,
-  COALESCE(fwd_ch.access_hash, 0)::bigint AS fwd_channel_access_hash,
-  COALESCE(fwd_ch.creator_user_id, 0)::bigint AS fwd_channel_creator_user_id,
-  COALESCE(fwd_ch.title, '')::text AS fwd_channel_title,
-  COALESCE(fwd_ch.about, '')::text AS fwd_channel_about,
-  COALESCE(fwd_ch.username, '')::text AS fwd_channel_username,
-  COALESCE(fwd_ch.broadcast, false)::boolean AS fwd_channel_broadcast,
-  COALESCE(fwd_ch.megagroup, false)::boolean AS fwd_channel_megagroup,
-  COALESCE(fwd_ch.forum, false)::boolean AS fwd_channel_forum,
-  COALESCE(fwd_ch.noforwards, false)::boolean AS fwd_channel_noforwards,
-  COALESCE(fwd_ch.signatures, false)::boolean AS fwd_channel_signatures,
-  COALESCE(fwd_ch.pre_history_hidden, false)::boolean AS fwd_channel_pre_history_hidden,
-  COALESCE(fwd_ch.slowmode_seconds, 0)::int AS fwd_channel_slowmode_seconds,
-  COALESCE(fwd_ch.default_banned_rights::text, '{}')::text AS fwd_channel_default_banned_rights,
-  COALESCE(fwd_ch.participants_count, 0)::int AS fwd_channel_participants_count,
-  COALESCE(fwd_ch.admins_count, 0)::int AS fwd_channel_admins_count,
-  COALESCE(fwd_ch.kicked_count, 0)::int AS fwd_channel_kicked_count,
-  COALESCE(fwd_ch.banned_count, 0)::int AS fwd_channel_banned_count,
-  COALESCE(fwd_ch.top_message_id, 0)::int AS fwd_channel_top_message_id,
-  COALESCE(fwd_ch.pinned_message_id, 0)::int AS fwd_channel_pinned_message_id,
-  COALESCE(fwd_ch.pts, 0)::int AS fwd_channel_pts,
-  COALESCE(fwd_ch.ttl_period, 0)::int AS fwd_channel_ttl_period,
-  COALESCE(fwd_ch.date, 0)::int AS fwd_channel_date,
-  COALESCE(fwd_ch.deleted, false)::boolean AS fwd_channel_deleted,
-  COALESCE(reply_ch.id, 0)::bigint AS reply_channel_id,
-  COALESCE(reply_ch.access_hash, 0)::bigint AS reply_channel_access_hash,
-  COALESCE(reply_ch.creator_user_id, 0)::bigint AS reply_channel_creator_user_id,
-  COALESCE(reply_ch.title, '')::text AS reply_channel_title,
-  COALESCE(reply_ch.about, '')::text AS reply_channel_about,
-  COALESCE(reply_ch.username, '')::text AS reply_channel_username,
-  COALESCE(reply_ch.broadcast, false)::boolean AS reply_channel_broadcast,
-  COALESCE(reply_ch.megagroup, false)::boolean AS reply_channel_megagroup,
-  COALESCE(reply_ch.forum, false)::boolean AS reply_channel_forum,
-  COALESCE(reply_ch.noforwards, false)::boolean AS reply_channel_noforwards,
-  COALESCE(reply_ch.signatures, false)::boolean AS reply_channel_signatures,
-  COALESCE(reply_ch.pre_history_hidden, false)::boolean AS reply_channel_pre_history_hidden,
-  COALESCE(reply_ch.slowmode_seconds, 0)::int AS reply_channel_slowmode_seconds,
-  COALESCE(reply_ch.default_banned_rights::text, '{}')::text AS reply_channel_default_banned_rights,
-  COALESCE(reply_ch.participants_count, 0)::int AS reply_channel_participants_count,
-  COALESCE(reply_ch.admins_count, 0)::int AS reply_channel_admins_count,
-  COALESCE(reply_ch.kicked_count, 0)::int AS reply_channel_kicked_count,
-  COALESCE(reply_ch.banned_count, 0)::int AS reply_channel_banned_count,
-  COALESCE(reply_ch.top_message_id, 0)::int AS reply_channel_top_message_id,
-  COALESCE(reply_ch.pinned_message_id, 0)::int AS reply_channel_pinned_message_id,
-  COALESCE(reply_ch.pts, 0)::int AS reply_channel_pts,
-  COALESCE(reply_ch.ttl_period, 0)::int AS reply_channel_ttl_period,
-  COALESCE(reply_ch.date, 0)::int AS reply_channel_date,
-  COALESCE(reply_ch.deleted, false)::boolean AS reply_channel_deleted
+  COALESCE(reply_u.is_bot, false)::boolean AS reply_user_is_bot,
+  COALESCE(reply_u.bot_info_version, 0)::int AS reply_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM reply_u.premium_expires_at), 0)::bigint AS reply_user_premium_until,
+  COALESCE(reply_u.emoji_status_document_id, 0)::bigint AS reply_user_emoji_status_document_id,
+  COALESCE(reply_u.emoji_status_until, 0)::bigint AS reply_user_emoji_status_until
 FROM user_update_events e
 LEFT JOIN message_boxes m ON m.owner_user_id = e.user_id AND m.box_id = e.message_box_id
 LEFT JOIN users peer_u ON m.peer_type = 'user' AND peer_u.id = m.peer_id
 LEFT JOIN users from_u ON from_u.id = m.from_user_id
 LEFT JOIN users fwd_u ON m.fwd_from_peer_type = 'user' AND fwd_u.id = m.fwd_from_peer_id
 LEFT JOIN users reply_u ON m.reply_to_peer_type = 'user' AND reply_u.id = m.reply_to_peer_id
-LEFT JOIN channels fwd_ch ON m.fwd_from_peer_type = 'channel' AND fwd_ch.id = m.fwd_from_peer_id
-LEFT JOIN channels reply_ch ON m.reply_to_peer_type = 'channel' AND reply_ch.id = m.reply_to_peer_id
 WHERE e.user_id = $1
   AND e.pts > $2
 ORDER BY e.pts ASC
@@ -191,45 +186,10 @@ SELECT COALESCE(MAX(pts), 0)::int AS max_pts
 FROM user_update_events
 WHERE user_id = $1;
 
--- name: RecentUserPts :many
--- 取某 user 最近的一段 pts（降序），供计算「最大连续已提交 pts」用。
--- 只看顶部窗口：瞬时空洞只可能出现在最近在途事务区，窗口足够大即可覆盖其下方连续。
-SELECT pts, pts_count
-FROM user_update_events
-WHERE user_id = $1
-ORDER BY pts DESC
-LIMIT sqlc.arg(window_size);
-
--- name: EnsureUserUpdateWatermark :exec
-INSERT INTO user_update_watermarks (user_id, contiguous_pts)
-VALUES ($1, 0)
-ON CONFLICT (user_id) DO NOTHING;
-
 -- name: GetUserUpdateWatermark :one
 SELECT contiguous_pts
 FROM user_update_watermarks
 WHERE user_id = $1;
-
--- name: LockUserUpdateWatermark :one
-SELECT contiguous_pts
-FROM user_update_watermarks
-WHERE user_id = $1
-FOR UPDATE;
-
--- name: NextUserPtsAfter :many
-SELECT pts, pts_count
-FROM user_update_events
-WHERE user_id = $1
-  AND pts > $2
-ORDER BY pts ASC
-LIMIT sqlc.arg(limit_count);
-
--- name: SaveUserUpdateWatermark :exec
-INSERT INTO user_update_watermarks (user_id, contiguous_pts, updated_at)
-VALUES ($1, $2, now())
-ON CONFLICT (user_id) DO UPDATE SET
-  contiguous_pts = GREATEST(user_update_watermarks.contiguous_pts, EXCLUDED.contiguous_pts),
-  updated_at = now();
 
 -- name: EnqueueDispatch :exec
 INSERT INTO dispatch_outbox (
@@ -245,17 +205,17 @@ ON CONFLICT DO NOTHING;
 
 -- name: ClaimDispatchOutbox :many
 WITH picked AS (
-  SELECT target_user_id, id
-  FROM dispatch_outbox
+  SELECT d.target_user_id, d.id
+  FROM dispatch_outbox d
   WHERE (
-      status = 'pending'
-      AND next_attempt_at <= now()
+      d.status = 'pending'
+      AND d.next_attempt_at <= now()
     )
     OR (
-      status = 'dispatching'
-      AND updated_at < now() - make_interval(secs => sqlc.arg(lease_seconds)::int)
+      d.status = 'dispatching'
+      AND d.updated_at < now() - make_interval(secs => sqlc.arg(lease_seconds)::int)
     )
-  ORDER BY next_attempt_at ASC, target_user_id ASC, id ASC
+  ORDER BY d.next_attempt_at ASC, d.target_user_id ASC, d.pts ASC, d.id ASC
   LIMIT sqlc.arg(limit_count)
   FOR UPDATE SKIP LOCKED
 )
@@ -312,12 +272,16 @@ SELECT
   COALESCE(e.dialog_filter::text, '{}')::text AS dialog_filter_json,
   COALESCE(e.filter_order::text, '[]')::text AS filter_order_json,
   COALESCE(e.folder_peers::text, '[]')::text AS folder_peers_json,
+  COALESCE(e.story_payload::text, '{}')::text AS story_payload_json,
+  COALESCE(e.reaction_payload::text, '{}')::text AS reaction_payload_json,
   COALESCE(e.peer_type, '')::text AS event_peer_type,
   COALESCE(e.peer_id, 0)::bigint AS event_peer_id,
   e.filter_id,
   e.max_id,
   e.still_unread_count,
+  e.channel_pts,
   e.tags_enabled,
+  e.folder_id,
   COALESCE(m.box_id, 0)::int AS message_id,
   COALESCE(m.private_message_id, 0)::bigint AS private_message_id,
   COALESCE(m.owner_user_id, 0)::bigint AS owner_user_id,
@@ -325,6 +289,8 @@ SELECT
   COALESCE(m.peer_id, 0)::bigint AS peer_id,
   COALESCE(m.from_user_id, 0)::bigint AS from_user_id,
   COALESCE(m.message_date, 0)::int AS message_date,
+  COALESCE(m.ttl_period, 0)::int AS ttl_period,
+  COALESCE(m.expires_at, 0)::int AS expires_at,
   COALESCE(m.edit_date, 0)::int AS edit_date,
   COALESCE(m.outgoing, false)::boolean AS outgoing,
   COALESCE(m.body, '')::text AS body,
@@ -335,6 +301,7 @@ SELECT
   COALESCE(m.reply_to_peer_type, '')::text AS reply_to_peer_type,
   COALESCE(m.reply_to_peer_id, 0)::bigint AS reply_to_peer_id,
   COALESCE(m.reply_to_top_id, 0)::int AS reply_to_top_id,
+  COALESCE(m.reply_to_story_id, 0)::int AS reply_to_story_id,
   COALESCE(m.quote_text, '')::text AS quote_text,
   COALESCE(m.quote_entities::text, '[]')::text AS quote_entities_json,
   COALESCE(m.quote_offset, 0)::int AS quote_offset,
@@ -342,9 +309,20 @@ SELECT
   COALESCE(m.fwd_from_peer_id, 0)::bigint AS fwd_from_peer_id,
   COALESCE(m.fwd_from_name, '')::text AS fwd_from_name,
   COALESCE(m.fwd_date, 0)::int AS fwd_date,
+  COALESCE(m.fwd_saved_from_peer_type, '')::text AS fwd_saved_from_peer_type,
+  COALESCE(m.fwd_saved_from_peer_id, 0)::bigint AS fwd_saved_from_peer_id,
+  COALESCE(m.fwd_saved_from_msg_id, 0)::int AS fwd_saved_from_msg_id,
+  COALESCE(m.saved_peer_type, '')::text AS saved_peer_type,
+  COALESCE(m.saved_peer_id, 0)::bigint AS saved_peer_id,
   COALESCE(m.media::text, '{}')::text AS media_json,
   COALESCE(m.media_unread, false)::boolean AS media_unread,
   COALESCE(m.reaction_unread, false)::boolean AS reaction_unread,
+  COALESCE(m.pinned, false)::boolean AS pinned,
+  COALESCE(m.via_bot_id, 0)::bigint AS via_bot_id,
+  COALESCE(m.grouped_id, 0)::bigint AS grouped_id,
+  COALESCE(m.effect, 0)::bigint AS effect,
+  COALESCE(m.reply_markup::text, '{}')::text AS reply_markup_json,
+  COALESCE(m.rich_message::text, '{}')::text AS rich_message_json,
   COALESCE(peer_u.id, 0)::bigint AS peer_user_id,
   COALESCE(peer_u.access_hash, 0)::bigint AS peer_access_hash,
   COALESCE(peer_u.phone, '')::text AS peer_phone,
@@ -354,6 +332,11 @@ SELECT
   COALESCE(peer_u.country_code, '')::text AS peer_country_code,
   COALESCE(peer_u.verified, false)::boolean AS peer_verified,
   COALESCE(peer_u.support, false)::boolean AS peer_support,
+  COALESCE(peer_u.is_bot, false)::boolean AS peer_is_bot,
+  COALESCE(peer_u.bot_info_version, 0)::int AS peer_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM peer_u.premium_expires_at), 0)::bigint AS peer_premium_until,
+  COALESCE(peer_u.emoji_status_document_id, 0)::bigint AS peer_emoji_status_document_id,
+  COALESCE(peer_u.emoji_status_until, 0)::bigint AS peer_emoji_status_until,
   COALESCE(from_u.id, 0)::bigint AS from_user_user_id,
   COALESCE(from_u.access_hash, 0)::bigint AS from_user_access_hash,
   COALESCE(from_u.phone, '')::text AS from_user_phone,
@@ -363,6 +346,11 @@ SELECT
   COALESCE(from_u.country_code, '')::text AS from_user_country_code,
   COALESCE(from_u.verified, false)::boolean AS from_user_verified,
   COALESCE(from_u.support, false)::boolean AS from_user_support,
+  COALESCE(from_u.is_bot, false)::boolean AS from_user_is_bot,
+  COALESCE(from_u.bot_info_version, 0)::int AS from_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM from_u.premium_expires_at), 0)::bigint AS from_user_premium_until,
+  COALESCE(from_u.emoji_status_document_id, 0)::bigint AS from_user_emoji_status_document_id,
+  COALESCE(from_u.emoji_status_until, 0)::bigint AS from_user_emoji_status_until,
   COALESCE(fwd_u.id, 0)::bigint AS fwd_user_id,
   COALESCE(fwd_u.access_hash, 0)::bigint AS fwd_user_access_hash,
   COALESCE(fwd_u.phone, '')::text AS fwd_user_phone,
@@ -372,6 +360,11 @@ SELECT
   COALESCE(fwd_u.country_code, '')::text AS fwd_user_country_code,
   COALESCE(fwd_u.verified, false)::boolean AS fwd_user_verified,
   COALESCE(fwd_u.support, false)::boolean AS fwd_user_support,
+  COALESCE(fwd_u.is_bot, false)::boolean AS fwd_user_is_bot,
+  COALESCE(fwd_u.bot_info_version, 0)::int AS fwd_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM fwd_u.premium_expires_at), 0)::bigint AS fwd_user_premium_until,
+  COALESCE(fwd_u.emoji_status_document_id, 0)::bigint AS fwd_user_emoji_status_document_id,
+  COALESCE(fwd_u.emoji_status_until, 0)::bigint AS fwd_user_emoji_status_until,
   COALESCE(reply_u.id, 0)::bigint AS reply_user_id,
   COALESCE(reply_u.access_hash, 0)::bigint AS reply_user_access_hash,
   COALESCE(reply_u.phone, '')::text AS reply_user_phone,
@@ -381,54 +374,11 @@ SELECT
   COALESCE(reply_u.country_code, '')::text AS reply_user_country_code,
   COALESCE(reply_u.verified, false)::boolean AS reply_user_verified,
   COALESCE(reply_u.support, false)::boolean AS reply_user_support,
-  COALESCE(fwd_ch.id, 0)::bigint AS fwd_channel_id,
-  COALESCE(fwd_ch.access_hash, 0)::bigint AS fwd_channel_access_hash,
-  COALESCE(fwd_ch.creator_user_id, 0)::bigint AS fwd_channel_creator_user_id,
-  COALESCE(fwd_ch.title, '')::text AS fwd_channel_title,
-  COALESCE(fwd_ch.about, '')::text AS fwd_channel_about,
-  COALESCE(fwd_ch.username, '')::text AS fwd_channel_username,
-  COALESCE(fwd_ch.broadcast, false)::boolean AS fwd_channel_broadcast,
-  COALESCE(fwd_ch.megagroup, false)::boolean AS fwd_channel_megagroup,
-  COALESCE(fwd_ch.forum, false)::boolean AS fwd_channel_forum,
-  COALESCE(fwd_ch.noforwards, false)::boolean AS fwd_channel_noforwards,
-  COALESCE(fwd_ch.signatures, false)::boolean AS fwd_channel_signatures,
-  COALESCE(fwd_ch.pre_history_hidden, false)::boolean AS fwd_channel_pre_history_hidden,
-  COALESCE(fwd_ch.slowmode_seconds, 0)::int AS fwd_channel_slowmode_seconds,
-  COALESCE(fwd_ch.default_banned_rights::text, '{}')::text AS fwd_channel_default_banned_rights,
-  COALESCE(fwd_ch.participants_count, 0)::int AS fwd_channel_participants_count,
-  COALESCE(fwd_ch.admins_count, 0)::int AS fwd_channel_admins_count,
-  COALESCE(fwd_ch.kicked_count, 0)::int AS fwd_channel_kicked_count,
-  COALESCE(fwd_ch.banned_count, 0)::int AS fwd_channel_banned_count,
-  COALESCE(fwd_ch.top_message_id, 0)::int AS fwd_channel_top_message_id,
-  COALESCE(fwd_ch.pinned_message_id, 0)::int AS fwd_channel_pinned_message_id,
-  COALESCE(fwd_ch.pts, 0)::int AS fwd_channel_pts,
-  COALESCE(fwd_ch.ttl_period, 0)::int AS fwd_channel_ttl_period,
-  COALESCE(fwd_ch.date, 0)::int AS fwd_channel_date,
-  COALESCE(fwd_ch.deleted, false)::boolean AS fwd_channel_deleted,
-  COALESCE(reply_ch.id, 0)::bigint AS reply_channel_id,
-  COALESCE(reply_ch.access_hash, 0)::bigint AS reply_channel_access_hash,
-  COALESCE(reply_ch.creator_user_id, 0)::bigint AS reply_channel_creator_user_id,
-  COALESCE(reply_ch.title, '')::text AS reply_channel_title,
-  COALESCE(reply_ch.about, '')::text AS reply_channel_about,
-  COALESCE(reply_ch.username, '')::text AS reply_channel_username,
-  COALESCE(reply_ch.broadcast, false)::boolean AS reply_channel_broadcast,
-  COALESCE(reply_ch.megagroup, false)::boolean AS reply_channel_megagroup,
-  COALESCE(reply_ch.forum, false)::boolean AS reply_channel_forum,
-  COALESCE(reply_ch.noforwards, false)::boolean AS reply_channel_noforwards,
-  COALESCE(reply_ch.signatures, false)::boolean AS reply_channel_signatures,
-  COALESCE(reply_ch.pre_history_hidden, false)::boolean AS reply_channel_pre_history_hidden,
-  COALESCE(reply_ch.slowmode_seconds, 0)::int AS reply_channel_slowmode_seconds,
-  COALESCE(reply_ch.default_banned_rights::text, '{}')::text AS reply_channel_default_banned_rights,
-  COALESCE(reply_ch.participants_count, 0)::int AS reply_channel_participants_count,
-  COALESCE(reply_ch.admins_count, 0)::int AS reply_channel_admins_count,
-  COALESCE(reply_ch.kicked_count, 0)::int AS reply_channel_kicked_count,
-  COALESCE(reply_ch.banned_count, 0)::int AS reply_channel_banned_count,
-  COALESCE(reply_ch.top_message_id, 0)::int AS reply_channel_top_message_id,
-  COALESCE(reply_ch.pinned_message_id, 0)::int AS reply_channel_pinned_message_id,
-  COALESCE(reply_ch.pts, 0)::int AS reply_channel_pts,
-  COALESCE(reply_ch.ttl_period, 0)::int AS reply_channel_ttl_period,
-  COALESCE(reply_ch.date, 0)::int AS reply_channel_date,
-  COALESCE(reply_ch.deleted, false)::boolean AS reply_channel_deleted
+  COALESCE(reply_u.is_bot, false)::boolean AS reply_user_is_bot,
+  COALESCE(reply_u.bot_info_version, 0)::int AS reply_user_bot_info_version,
+  COALESCE(EXTRACT(EPOCH FROM reply_u.premium_expires_at), 0)::bigint AS reply_user_premium_until,
+  COALESCE(reply_u.emoji_status_document_id, 0)::bigint AS reply_user_emoji_status_document_id,
+  COALESCE(reply_u.emoji_status_until, 0)::bigint AS reply_user_emoji_status_until
 FROM unnest(@user_ids::bigint[]) WITH ORDINALITY AS u(user_id, ord)
 JOIN unnest(@pts_list::int[]) WITH ORDINALITY AS p(pts, ord) USING (ord)
 JOIN user_update_events e ON e.user_id = u.user_id AND e.pts = p.pts
@@ -436,12 +386,10 @@ LEFT JOIN message_boxes m ON m.owner_user_id = e.user_id AND m.box_id = e.messag
 LEFT JOIN users peer_u ON m.peer_type = 'user' AND peer_u.id = m.peer_id
 LEFT JOIN users from_u ON from_u.id = m.from_user_id
 LEFT JOIN users fwd_u ON m.fwd_from_peer_type = 'user' AND fwd_u.id = m.fwd_from_peer_id
-LEFT JOIN users reply_u ON m.reply_to_peer_type = 'user' AND reply_u.id = m.reply_to_peer_id
-LEFT JOIN channels fwd_ch ON m.fwd_from_peer_type = 'channel' AND fwd_ch.id = m.fwd_from_peer_id
-LEFT JOIN channels reply_ch ON m.reply_to_peer_type = 'channel' AND reply_ch.id = m.reply_to_peer_id;
+LEFT JOIN users reply_u ON m.reply_to_peer_type = 'user' AND reply_u.id = m.reply_to_peer_id;
 
 -- name: MarkDispatchDeliveredBatch :exec
--- 批量删除一批已投递的 (target_user_id, id)；target_user_id 入 WHERE 保证分区裁剪。
+-- 批量删除一批已投递的 (target_user_id, id)；target_user_id 入 WHERE 命中唯一索引并避免串删。
 DELETE FROM dispatch_outbox d
 USING unnest(@target_user_ids::bigint[]) WITH ORDINALITY AS tu(target_user_id, ord)
 JOIN unnest(@ids::bigint[]) WITH ORDINALITY AS di(id, ord) USING (ord)

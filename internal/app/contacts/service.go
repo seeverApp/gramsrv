@@ -18,6 +18,7 @@ var (
 )
 
 const maxSearchLimit = 50
+const maxCloseFriendsCount = 5000
 
 type phonePrivacyService interface {
 	userprojection.PrivacyEvaluator
@@ -31,6 +32,8 @@ type Service struct {
 	photos    userprojection.ProfilePhotoProvider
 	privacy   phonePrivacyService
 	projector *userprojection.Projector
+	versions  store.ReadModelVersionStore
+	cache     *contactListReadModelCache
 }
 
 // Option adjusts optional contacts service dependencies.
@@ -46,9 +49,14 @@ func WithPrivacyEvaluator(p phonePrivacyService) Option {
 	return func(s *Service) { s.privacy = p }
 }
 
+// WithReadModelVersions enables durable hash-token fast paths for NotModified RPCs.
+func WithReadModelVersions(v store.ReadModelVersionStore) Option {
+	return func(s *Service) { s.versions = v }
+}
+
 // NewService 创建 contacts 服务。
 func NewService(contacts store.ContactStore, users ...store.UserStore) *Service {
-	s := &Service{contacts: contacts}
+	s := &Service{contacts: contacts, cache: newContactListReadModelCache(defaultContactListReadModelTTL)}
 	if len(users) > 0 {
 		s.users = users[0]
 	}
@@ -84,56 +92,21 @@ func (s *Service) GetContacts(ctx context.Context, userID int64, hash int64) (do
 	if s == nil || s.contacts == nil || userID == 0 {
 		return domain.ContactList{}, false, nil
 	}
-	list, err := s.contacts.ListByUser(ctx, userID)
+	currentHash, hasHash, err := s.contactAccountHash(ctx, userID)
 	if err != nil {
 		return domain.ContactList{}, false, err
 	}
-	if s.users != nil && len(list.Contacts) > 0 {
-		if err := s.attachCurrentLastSeen(ctx, &list); err != nil {
-			return domain.ContactList{}, false, err
-		}
+	if hash != 0 && hasHash && hash == currentHash {
+		return domain.ContactList{Hash: currentHash}, true, nil
 	}
-	if err := s.projectContactUsers(ctx, userID, &list); err != nil {
+	list, err := s.contactListReadModel(ctx, userID, currentHash, hasHash)
+	if err != nil {
 		return domain.ContactList{}, false, err
 	}
 	if hash != 0 && hash == list.Hash {
 		return list, true, nil
 	}
 	return list, false, nil
-}
-
-func (s *Service) attachCurrentLastSeen(ctx context.Context, list *domain.ContactList) error {
-	ids := make([]int64, 0, len(list.Contacts))
-	seen := make(map[int64]struct{}, len(list.Contacts))
-	for _, contact := range list.Contacts {
-		id := contact.User.ID
-		if id == 0 {
-			continue
-		}
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
-		ids = append(ids, id)
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	users, err := s.users.ByIDs(ctx, ids)
-	if err != nil {
-		return err
-	}
-	current := make(map[int64]domain.User, len(users))
-	for _, u := range users {
-		current[u.ID] = u
-	}
-	for i := range list.Contacts {
-		if u, ok := current[list.Contacts[i].User.ID]; ok {
-			list.Contacts[i].User.LastSeenAt = u.LastSeenAt
-			list.Contacts[i].User.Status = u.Status
-		}
-	}
-	return nil
 }
 
 func (s *Service) AddContact(ctx context.Context, userID int64, input domain.ContactInput) (domain.Contact, error) {
@@ -143,6 +116,9 @@ func (s *Service) AddContact(ctx context.Context, userID int64, input domain.Con
 	if input.FirstName == "" && input.LastName == "" {
 		return domain.Contact{}, ErrContactNameEmpty
 	}
+	// Android 的 contacts.addContact 会提交带 "+" 前缀的号码（TDesktop 传纯数字或空），
+	// 归一成纯数字；无数字时落空串，走下方 target.Phone 回填。
+	input.Phone = digitsOnly(input.Phone)
 	if s.users != nil {
 		target, found, err := s.users.ByID(ctx, input.ContactUserID)
 		if err != nil {
@@ -159,6 +135,7 @@ func (s *Service) AddContact(ctx context.Context, userID int64, input domain.Con
 	if err != nil {
 		return domain.Contact{}, err
 	}
+	s.InvalidateViewers(userID, input.ContactUserID)
 	if input.AddPhonePrivacyException && s.privacy != nil {
 		if _, _, err := s.privacy.AddAllowUser(ctx, userID, domain.PrivacyKeyPhoneNumber, input.ContactUserID); err != nil {
 			return domain.Contact{}, err
@@ -205,6 +182,7 @@ func (s *Service) AcceptContact(ctx context.Context, userID, contactUserID int64
 	if err != nil {
 		return domain.Contact{}, err
 	}
+	s.InvalidateViewers(userID, contactUserID)
 	if s.privacy != nil {
 		if _, _, err := s.privacy.AddAllowUser(ctx, userID, domain.PrivacyKeyPhoneNumber, contactUserID); err != nil {
 			return domain.Contact{}, err
@@ -288,6 +266,12 @@ func (s *Service) ImportContacts(ctx context.Context, userID int64, inputs []dom
 	if err != nil {
 		return domain.ImportContactsResult{}, err
 	}
+	changedIDs := make([]int64, 0, len(upserts)+1)
+	changedIDs = append(changedIDs, userID)
+	for _, input := range upserts {
+		changedIDs = append(changedIDs, input.ContactUserID)
+	}
+	s.InvalidateViewers(changedIDs...)
 	if s.privacy != nil {
 		for _, input := range upserts {
 			if !input.AddPhonePrivacyException || input.ContactUserID == 0 {
@@ -331,7 +315,45 @@ func (s *Service) DeleteContacts(ctx context.Context, userID int64, contactUserI
 	if s == nil || s.contacts == nil || userID == 0 {
 		return 0, nil
 	}
-	return s.contacts.Delete(ctx, userID, contactUserIDs)
+	count, err := s.contacts.Delete(ctx, userID, contactUserIDs)
+	if err == nil {
+		ids := make([]int64, 0, len(contactUserIDs)+1)
+		ids = append(ids, userID)
+		ids = append(ids, contactUserIDs...)
+		s.InvalidateViewers(ids...)
+	}
+	return count, err
+}
+
+func (s *Service) EditCloseFriends(ctx context.Context, userID int64, contactUserIDs []int64) (domain.CloseFriendsEditResult, error) {
+	if s == nil || s.contacts == nil || userID == 0 || len(contactUserIDs) > maxCloseFriendsCount {
+		return domain.CloseFriendsEditResult{}, ErrContactIDInvalid
+	}
+	ids := normalizeCloseFriendIDs(userID, contactUserIDs)
+	if s.users != nil && len(ids) > 0 {
+		users, err := s.users.ByIDs(ctx, ids)
+		if err != nil {
+			return domain.CloseFriendsEditResult{}, err
+		}
+		exists := make(map[int64]struct{}, len(users))
+		for _, user := range users {
+			if user.ID != 0 && !user.Bot {
+				exists[user.ID] = struct{}{}
+			}
+		}
+		filtered := ids[:0]
+		for _, id := range ids {
+			if _, ok := exists[id]; ok {
+				filtered = append(filtered, id)
+			}
+		}
+		ids = filtered
+	}
+	result, err := s.contacts.SetCloseFriends(ctx, userID, ids)
+	if err == nil {
+		s.InvalidateViewers(userID)
+	}
+	return result, err
 }
 
 func (s *Service) UpdateContactNote(ctx context.Context, userID, contactUserID int64, note string, entities []domain.MessageEntity) (domain.Contact, error) {
@@ -345,6 +367,7 @@ func (s *Service) UpdateContactNote(ctx context.Context, userID, contactUserID i
 	if !found {
 		return domain.Contact{}, ErrContactIDInvalid
 	}
+	s.InvalidateViewers(userID)
 	return contact, nil
 }
 
@@ -359,6 +382,7 @@ func (s *Service) SetPersonalPhoto(ctx context.Context, userID, contactUserID in
 	if !found {
 		return domain.Contact{}, ErrContactReqMissing
 	}
+	s.InvalidateViewers(userID)
 	return s.projectContact(ctx, userID, contact)
 }
 
@@ -373,6 +397,7 @@ func (s *Service) ClearPersonalPhoto(ctx context.Context, userID, contactUserID 
 	if !found {
 		return domain.Contact{}, ErrContactReqMissing
 	}
+	s.InvalidateViewers(userID)
 	return s.projectContact(ctx, userID, contact)
 }
 
@@ -422,7 +447,11 @@ func (s *Service) BlockContact(ctx context.Context, userID, peerUserID int64, da
 			return false, ErrContactIDInvalid
 		}
 	}
-	return s.contacts.Block(ctx, userID, peerUserID, date)
+	changed, err := s.contacts.Block(ctx, userID, peerUserID, date)
+	if err == nil {
+		s.InvalidateViewers(userID, peerUserID)
+	}
+	return changed, err
 }
 
 // UnblockContact removes peer from the current user's blocklist.
@@ -430,7 +459,11 @@ func (s *Service) UnblockContact(ctx context.Context, userID, peerUserID int64) 
 	if s == nil || s.contacts == nil || userID == 0 || peerUserID == 0 || peerUserID == userID {
 		return false, ErrContactIDInvalid
 	}
-	return s.contacts.Unblock(ctx, userID, peerUserID)
+	changed, err := s.contacts.Unblock(ctx, userID, peerUserID)
+	if err == nil {
+		s.InvalidateViewers(userID, peerUserID)
+	}
+	return changed, err
 }
 
 // IsBlocked reports whether owner has blocked peer.
@@ -509,10 +542,10 @@ func (s *Service) projectSearchResult(ctx context.Context, userID int64, res dom
 	return res, nil
 }
 
-func normalizePhone(phone string) string {
-	if !utf8.ValidString(phone) {
-		return ""
-	}
+// digitsOnly 只保留数字字符。保存进 contacts.contact_phone 的号码必须与 users.phone
+// 一样是不带 "+" 的纯数字：下发时 contact_phone 优先充当 TL user.phone，而客户端展示
+// user.phone 时会自行补 "+"，任何非数字前缀都会变成 "++<号码>" 这类坏显示。
+func digitsOnly(phone string) string {
 	var b strings.Builder
 	b.Grow(len(phone))
 	for _, r := range phone {
@@ -520,8 +553,31 @@ func normalizePhone(phone string) string {
 			b.WriteRune(r)
 		}
 	}
-	if b.Len() == 0 {
-		return phone
-	}
 	return b.String()
+}
+
+func normalizePhone(phone string) string {
+	if !utf8.ValidString(phone) {
+		return ""
+	}
+	if digits := digitsOnly(phone); digits != "" {
+		return digits
+	}
+	return phone
+}
+
+func normalizeCloseFriendIDs(userID int64, ids []int64) []int64 {
+	out := make([]int64, 0, len(ids))
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id <= 0 || id == userID {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
 }
